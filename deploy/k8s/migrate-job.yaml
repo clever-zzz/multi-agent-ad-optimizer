@@ -1,0 +1,59 @@
+# Schema migrations run as a Job before the API rolls out, so replicas never
+# race each other to alter the database.
+#
+#   kubectl -n adoptimizer create job adoptimizer-migrate-$(date +%s) \
+#     --from=cronjob/adoptimizer-migrate
+#
+# Or apply this manifest directly with a unique name during a deploy pipeline.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: adoptimizer-migrate
+  namespace: adoptimizer
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: migrate
+spec:
+  schedule: "0 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 600
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: backend
+            app.kubernetes.io/component: migrate
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: migrate
+              image: adoptimizer/backend:latest
+              command: ["alembic", "upgrade", "head"]
+              envFrom:
+                - configMapRef:
+                    name: adoptimizer-config
+                - secretRef:
+                    name: adoptimizer-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]

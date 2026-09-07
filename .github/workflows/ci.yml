@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push for the same branch supersedes the in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  # Keep in sync with deploy/compose/docker-compose.yml.
+  POSTGRES_VERSION: "16.6-alpine"
+
+jobs:
+  backend:
+    name: Backend · lint, types, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,analytics]"
+
+      - name: Ruff format check
+        run: ruff format --check src tests
+
+      - name: Ruff lint
+        run: ruff check src tests
+
+      - name: Mypy
+        run: mypy src
+
+      # Proves the revision chain applies and reverses on the development
+      # dialect. Dialect-sensitive parity is checked against PostgreSQL in the
+      # dedicated `migrations` job below.
+      - name: Migrations apply on SQLite
+        env:
+          APP__ENVIRONMENT: test
+          DATABASE__URL: sqlite+aiosqlite:///./ci_migrations.db
+          LLM__PROVIDER: mock
+          DATA_MODE: mock
+          REDIS__ENABLED: "false"
+          CLICKHOUSE__ENABLED: "false"
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Pytest with coverage
+        run: pytest --cov=src/adoptimizer --cov-report=xml --cov-report=term-missing --junitxml=junit.xml
+        env:
+          # Belt and braces: the suite builds its own Settings, but a stray
+          # repository .env must never leak into CI.
+          APP__ENVIRONMENT: test
+          LLM__PROVIDER: mock
+          DATA_MODE: mock
+          REDIS__ENABLED: "false"
+          CLICKHOUSE__ENABLED: "false"
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          if-no-files-found: warn
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-junit
+          path: backend/junit.xml
+          if-no-files-found: warn
+
+  migrations:
+    name: Migrations · apply, reverse, parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:${{ env.POSTGRES_VERSION }}
+        env:
+          POSTGRES_USER: adoptimizer
+          POSTGRES_PASSWORD: adoptimizer-ci
+          POSTGRES_DB: adoptimizer_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adoptimizer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP__ENVIRONMENT: test
+      DATABASE__URL: postgresql+asyncpg://adoptimizer:adoptimizer-ci@localhost:5432/adoptimizer_ci
+      LLM__PROVIDER: mock
+      DATA_MODE: mock
+      REDIS__ENABLED: "false"
+      CLICKHOUSE__ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,postgres]"
+
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      # The initial revision is hand-written. It must stay equivalent to what
+      # the ORM metadata describes, otherwise `Base.metadata.create_all` (dev
+      # and tests) and Alembic (staging and production) would build two
+      # different schemas and only one of them would be covered by tests.
+      - name: Assert no autogenerate drift
+        run: alembic check
+
+      - name: Reverse migrations
+        run: alembic downgrade base
+
+      - name: Re-apply migrations
+        run: alembic upgrade head
+
+      - name: Report revision
+        run: alembic current --verbose
+
+  frontend:
+    name: Frontend · lint, types, tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` only. A lockfile that has drifted from package.json must fail
+      # the build instead of silently resolving a different dependency tree.
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: /api/v1
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+
+  images:
+    name: Container images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [backend, frontend, migrations]
+    # Only build images on the default branch and on tags; PRs just prove the
+    # Dockerfiles parse.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.backend
+          push: false
+          tags: ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.frontend
+          push: false
+          build-args: |
+            VITE_API_BASE_URL=/api/v1
+          tags: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+  manifests:
+    name: Deployment manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose
+        working-directory: deploy/compose
+        env:
+          SECURITY__JWT_SECRET: ci-only-placeholder-secret-0123456789abcdef
+          SECURITY__BOOTSTRAP_ADMIN_PASSWORD: ci-only-placeholder
+          APP__CORS_ALLOW_ORIGINS: '["https://ci.example.com"]'
+          IMAGE_TAG: ci
+          REDIS_PASSWORD: ci-only-placeholder
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
+
+      # --validate=false: client-side dry run must not need a live cluster to
+      # fetch OpenAPI schemas, otherwise this job only passes on a runner that
+      # happens to have a kubeconfig.
+      - name: Validate kustomize
+        run: kubectl apply --dry-run=client --validate=false -k deploy/k8s
+
+      - name: Validate Kubernetes manifests
+        run: |
+          for f in deploy/k8s/*.yaml; do
+            [ "$(basename "$f")" = "kustomization.yaml" ] && continue
+            [ "$(basename "$f")" = "secret.example.yaml" ] && continue
+            kubectl apply --dry-run=client --validate=false -f "$f"
+          done

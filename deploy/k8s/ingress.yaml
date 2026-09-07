@@ -1,0 +1,90 @@
+# Two Ingress resources share the host.
+#
+# ingress-nginx merges every path for a host into one server block and nginx
+# picks the longest matching prefix, so /api/v1/runs can carry its own timeouts
+# without affecting the rest of the API. Annotations are per-Ingress, which is
+# exactly why the SSE route lives in a separate object: a run timeline is a
+# long-lived Server-Sent Event stream and must not inherit a 60s read timeout.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: adoptimizer
+  namespace: adoptimizer
+  labels:
+    app.kubernetes.io/part-of: adoptimizer
+  annotations:
+    # TLS termination happens here; the backend trusts X-Forwarded-Proto.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains";
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ads.example.com
+      secretName: adoptimizer-tls
+  rules:
+    - host: ads.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+---
+# SSE route for the live run timeline. Buffering would batch every event until
+# the response finished; the long read timeout covers a run that goes quiet
+# between agent steps. The backend also emits a keep-alive comment every 15s.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: adoptimizer-sse
+  namespace: adoptimizer
+  labels:
+    app.kubernetes.io/part-of: adoptimizer
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Optional but recommended while runs are dispatched in-process: pin a
+    # client to the replica that is executing its run so the timeline stays
+    # live instead of catching up from the durable log every ~60s.
+    # See docs/adr/0002-in-process-run-dispatch.md.
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "adoptimizer_route"
+    nginx.ingress.kubernetes.io/session-cookie-hash: "sha1"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ads.example.com
+      secretName: adoptimizer-tls
+  rules:
+    - host: ads.example.com
+      http:
+        paths:
+          - path: /api/v1/runs
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 80

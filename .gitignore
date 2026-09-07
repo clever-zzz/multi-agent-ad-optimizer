@@ -46,6 +46,22 @@ golang/vendor/
 .DS_Store
 Thumbs.db
 
+# Node
+node_modules/
+frontend/dist/
+coverage/
+*.tsbuildinfo
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+coverage.xml
+
+# Local databases
+*.db
+*.db-journal
+*.sqlite3
+
 # Docker
 docker-data/
 

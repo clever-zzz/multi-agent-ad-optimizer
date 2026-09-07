@@ -1,0 +1,167 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adoptimizer"
+version = "1.0.0"
+description = "Production-grade multi-agent advertising optimization platform"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Ad Optimizer Team" }]
+keywords = ["advertising", "multi-agent", "langgraph", "fastapi", "rtb"]
+
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "email-validator>=2.2",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "alembic>=1.14",
+  "aiosqlite>=0.20",
+  "greenlet>=3.1",
+  "structlog>=24.4",
+  "python-dotenv>=1.0",
+  "orjson>=3.10",
+  "httpx>=0.27",
+  "tenacity>=9.0",
+  "numpy>=1.26",
+  "pyjwt>=2.9",
+  "argon2-cffi>=23.1",
+  "prometheus-client>=0.21",
+  "sse-starlette>=2.1",
+  "redis>=5.2",
+  "python-multipart>=0.0.12",
+  "langgraph>=0.2",
+  "langchain-core>=0.3",
+  "typer>=0.15",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.30"]
+analytics = ["cvxpy>=1.5"]
+clickhouse = ["clickhouse-connect>=0.7"]
+openai = ["langchain-openai>=0.2"]
+worker = ["arq>=0.26"]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "respx>=0.21",
+  "ruff>=0.8",
+  "mypy>=1.13",
+]
+
+[project.scripts]
+adoptimizer = "adoptimizer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/adoptimizer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "SIM",
+  "RUF", "S", "PTH", "DTZ", "ASYNC", "RET", "ARG",
+]
+# TCH (flake8-type-checking) is deliberately not enabled. Three parts of this
+# codebase resolve the stringified annotations produced by
+# `from __future__ import annotations` against the module namespace at runtime:
+# Pydantic models, SQLAlchemy 2.0 `Mapped[...]` mappers, and FastAPI route
+# signatures (`Annotated[int, Query(ge=1)]`). Moving those imports under
+# TYPE_CHECKING breaks model construction and dependency injection, which is why
+# ruff classifies the fix as unsafe. The import-time saving is nil for a service
+# that loads these frameworks on every boot anyway.
+ignore = [
+  "S101",  # assert is fine in tests
+  "ARG002",
+  "B008",  # FastAPI Depends() in defaults
+  "DTZ005",
+  "RUF012",
+  # PEP 695 type-parameter syntax is not adopted on purpose. Pydantic generic
+  # models and FastAPI's `response_model` resolution are still more predictable
+  # with an explicit TypeVar plus Generic, and the classic form reads the same on
+  # the 3.12 floor without depending on newer tooling behaviour.
+  "UP046",
+  "UP047",
+  # Domain exceptions are named after the condition they represent
+  # (ValidationFailure, RunCancelled), not after the word "Error". N818 would
+  # force a rename across the whole codebase for a naming preference.
+  "N818",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Every query in the warehouse is ClickHouse SQL that binds all user input
+# server-side through typed placeholders ({db:Identifier}, {ids:Array(String)},
+# {days:UInt16}); the only concatenated fragments come from module constants.
+# S608 pattern-matches the SQL keyword and cannot see the binding.
+"src/adoptimizer/infra/warehouse.py" = ["S608"]
+# Fixtures arrive as unused-looking parameters (ARG), and test data uses literal
+# credentials and seeded randomness deliberately (S105/S106/S107/S311).
+"tests/**" = [
+  "S101", "S105", "S106", "S107", "S311",
+  "ARG001", "ARG002",
+]
+"migrations/**" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["adoptimizer"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+exclude = ["migrations/"]
+
+[[tool.mypy.overrides]]
+# Optional adapters and the convex solver. `follow_imports = "skip"` keeps their
+# symbols as Any: cvxpy ships annotations that omit atoms which exist at runtime
+# (cp.sum, cp.error.SolverError), so following them produces attr-defined noise
+# for correct code.
+module = ["clickhouse_connect.*", "cvxpy", "cvxpy.*", "arq.*", "langchain_openai.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# Tests keep type annotations but are exempt from the strictest decorator and
+# Any rules, which pytest fixtures cannot satisfy by design.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_decorators = false
+disallow_any_decorated = false
+disallow_subclassing_any = false
+warn_return_any = false
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::DeprecationWarning:adoptimizer.*"]
+markers = [
+  "integration: requires external services (postgres/redis/clickhouse)",
+  "slow: long running tests",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/adoptimizer"]
+omit = ["*/migrations/*"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = false
+# A ratchet, not a target. It is set below the measured total (80.8% as of the
+# action-execution / warehouse / LLM / CLI test work) so the suite has room to
+# move, but a large untested module cannot land without the gate going red.
+# Raise it whenever the measured total climbs more than ~3 points above it.
+fail_under = 78

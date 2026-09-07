@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: adoptimizer
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: adoptimizer
+      app.kubernetes.io/managed-by: kustomize
+
+# secret.example.yaml is deliberately NOT listed here. Applying placeholder
+# credentials would either fail the production hardening check or, worse, boot a
+# cluster with a published secret. Create it out of band instead:
+#
+#   kubectl -n adoptimizer create secret generic adoptimizer-secrets \
+#     --from-literal=SECURITY__JWT_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')" \
+#     --from-literal=SECURITY__BOOTSTRAP_ADMIN_PASSWORD='<strong>' \
+#     --from-literal=POSTGRES_PASSWORD='<strong>' \
+#     --from-literal=DATABASE__URL='postgresql+asyncpg://adoptimizer:<strong>@postgres:5432/adoptimizer'
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - postgres.yaml
+  - redis.yaml
+  - migrate-job.yaml
+  - backend.yaml
+  - frontend.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+
+# Pin the release from the command line:
+#   kustomize edit set image adoptimizer/backend=registry.example.com/adoptimizer/backend:v1.2.3
+images:
+  - name: adoptimizer/backend
+    newTag: latest
+  - name: adoptimizer/frontend
+    newTag: latest

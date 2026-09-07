@@ -1,0 +1,405 @@
+# 07 测试与 CI
+
+---
+
+## 1. 测试策略
+
+```
+              ┌────────────────────────┐
+              │  端到端（浏览器 + 真实栈）│   手工，见 §6
+              ├────────────────────────┤
+              │  集成测试 259 个          │   httpx ASGITransport + 临时 SQLite
+              ├────────────────────────┤   全链路：中间件 → RBAC → service → repo → DB
+              │  单元测试 332 个          │   纯函数，零 I/O
+              ├────────────────────────┤
+              │  前端单测（vitest+jsdom）  │   lib/ 与 components/ 的纯逻辑
+              └────────────────────────┘
+```
+
+**核心原则：整个后端测试套件是 hermetic 的。**
+
+- 每个测试一个临时 SQLite 文件（`tmp_path`）
+- `LLM__PROVIDER=mock`（确定性、离线、免费）
+- `DATA_MODE=mock`（模拟广告平台适配器）
+- `REDIS__ENABLED=false`（进程内缓存）
+- `CLICKHOUSE__ENABLED=false`
+- `RATE_LIMIT__ENABLED=false`（避免测试之间互相限流）
+- Argon2 参数降到 `time_cost=1, memory_cost=8192`（否则每个认证测试都要付 64 MiB × 3 轮的代价）
+
+结果：**不需要 Docker、不需要网络、不需要任何外部服务**，`pytest` 直接跑完 591 个测试。
+
+---
+
+## 2. 后端测试
+
+### 2.1 布局
+
+```
+backend/tests/
+  conftest.py                       fixture：settings / app / client / admin_headers / make_user / snapshot_factory
+  unit/                             纯业务规则，不碰 HTTP 也不碰数据库，332 个
+    test_statistics.py        (25)   A/B 显著性检验、样本量估算
+    test_kpi.py               (28)   CTR/CVR/CPA/ROAS、健康分
+    test_pricing.py           (25)   eCPM、竞价上限、出价推导
+    test_budget.py            (17)   预算重分配（贪心路径）
+    test_anomaly.py           (23)   阈值 + 统计异常检测、去重
+    test_scoring.py           (17)   创意评分
+    test_state.py             (25)   AgentState reducer 语义
+    test_security.py          (38)   Argon2、JWT、角色→权限矩阵
+    test_config.py            (31)   配置校验，含生产硬化拒绝路径
+    test_llm_provider.py      (39)   OpenAI 兼容 provider：端点、鉴权、失败映射（httpx MockTransport）
+    test_llm_gateway.py       (42)   网关：预算护栏、重试退避、缓存、降级、并发信号量、指标
+    test_cli.py               (22)   typer CLI 每条命令（副作用用桩替换）
+  integration/                      走完整 HTTP 栈，259 个
+    test_health.py            (25)   探针、安全响应头、限流
+    test_auth_api.py          (41)   登录/刷新/登出/改密/锁定/轮换/最后一个 admin 护栏
+    test_rbac_api.py          (19)   端点 × 角色权限矩阵（参数化展开成大量用例）
+    test_campaigns_api.py     (36)   活动与创意 CRUD、校验、审计
+    test_optimization_flow.py (33)   完整闭环：触发 → 事件 → 动作 → 审批门 → 批量 → 幂等 → 告警 → 分析
+    test_action_execution.py  (55)   执行器每条 _apply 分支、审批门、批量批准、参数解析
+    test_run_stream.py        (20)   SSE 回放/续传/终止、取消、RBAC
+    test_warehouse.py         (30)   SQL 与 ClickHouse 两个后端（假驱动）：查询构造、绑定参数、降级
+```
+
+### 2.2 fixture 设计
+
+```python
+settings   → make_settings("sqlite+aiosqlite:///<tmp_path>/adoptimizer-test.db")
+app        → create_app(settings) + 进入 lifespan_context（建容器、建表、灌 admin）
+client     → httpx.AsyncClient(transport=ASGITransport(app))   # 不开真实 socket
+admin_headers → 登录引导管理员
+make_user(role) → 建账号并返回其 headers，用于 RBAC 测试
+snapshot_factory → 造 PerformanceSnapshot，省掉重复样板
+```
+
+`app` fixture 走的是**真实的 lifespan**，所以容器构造、SQLite 建表、admin 种子、`reap_stale_runs` 全都被覆盖到了。这是集成测试有价值的关键——它测的是真的启动路径，不是一个拼装出来的假 app。
+
+`client` 用 `ASGITransport`，因此中间件栈（request_id、安全头、限流、CORS）也都在链路里。
+
+### 2.3 运行
+
+```bash
+cd backend
+.venv/Scripts/pytest                                  # Windows
+.venv/bin/pytest                                      # macOS/Linux
+
+pytest -q                                             # 简短输出
+pytest --cov                                          # 带覆盖率（<78% 失败）
+pytest tests/unit -q                                  # 只跑单元测试
+pytest tests/integration/test_optimization_flow.py -q # 只跑一个文件
+pytest -k "last_admin" -q                             # 按名字筛
+pytest -x --lf                                        # 遇到第一个失败就停，只跑上次失败的
+pytest --maxfail=3 -n auto                            # 装了 pytest-xdist 可并行
+```
+
+标记（`--strict-markers`，写错名字会直接报错）：
+
+| 标记 | 含义 |
+|---|---|
+| `integration` | 需要外部服务（postgres/redis/clickhouse）。默认套件里**没有**用到，预留给未来的真实依赖测试 |
+| `slow` | 长耗时 |
+
+```bash
+pytest -m "not integration and not slow"
+```
+
+### 2.4 覆盖率
+
+`pyproject.toml`：
+
+```toml
+[tool.coverage.run]
+branch = true
+source = ["src/adoptimizer"]
+
+[tool.coverage.report]
+fail_under = 78
+show_missing = true
+```
+
+**分支覆盖**，不是行覆盖。78% 是**棘轮式的下限而非目标**——`domain/` 与 `core/security.py` 接近 100%，而 `infra/ads/google.py` 这类需要真实凭据的适配器天然覆盖不到，所以整体数字被拉低。当前实测约 81%，门禁设在 78%：留出正常改动的余量，但一个新的大模块如果完全没测试就会把 CI 弄红。实测值往上爬超过 3 个点时，就把 `fail_under` 跟着提上去，别让覆盖率悄悄回落。
+
+看哪些行没覆盖：
+
+```bash
+pytest --cov --cov-report=term-missing
+pytest --cov --cov-report=html && start htmlcov/index.html    # Windows
+```
+
+### 2.5 写新测试
+
+**改 `domain/` 里的业务规则** → 加单元测试。这些是纯函数，测试应该只断言输入输出：
+
+```python
+def test_bid_never_exceeds_the_target_cpa_cap() -> None:
+    snapshot = snapshot_factory("camp_1", impressions=10_000, clicks=100, conversions=5)
+    decision = recommend_bid(snapshot, target_cpa=50.0, cap_ratio=0.8)
+    assert decision.recommended_cpm <= 50.0 * 0.8 * <expected factor>
+```
+
+**改 API 行为** → 加集成测试，覆盖三件事：happy path、权限不足、状态冲突。
+
+```python
+async def test_viewer_cannot_update_a_campaign(client, make_user) -> None:
+    viewer = await make_user("viewer")
+    response = await client.patch(
+        API + "/campaigns/camp_x", json={"daily_budget": 1.0}, headers=viewer["headers"]
+    )
+    assert response.status_code == 403
+    body = response.json()
+    assert body["code"] == "permission_denied"
+    assert body["type"] == "https://adoptimizer.dev/errors/permission_denied"
+```
+
+**改配置校验** → `test_config.py` 里的模式是**驱动真实环境变量**再 `reload_settings()`，因为配置是从环境读的，直接构造对象测不到解析路径。
+
+约定：
+
+- 测试函数名描述**行为**，不描述实现：`test_last_admin_cannot_be_deactivated` 而不是 `test_set_active_2`
+- 断言错误时带上 `response.text`，失败时能直接看到 body
+- 不要在测试里 `sleep`。run 执行用 `wait_for` 或轮询状态
+- 不要依赖测试执行顺序
+
+---
+
+## 3. 前端测试
+
+```
+src/lib/api.test.ts                  HTTP 客户端：token 注入、401→refresh 重试、problem document 解析
+src/lib/format.test.ts               数字/百分比/货币/日期格式化
+src/lib/passwordPolicy.test.ts       口令强度校验（与后端 policy 对齐）
+src/components/charts/chartUtils.test.ts   图表几何计算（scale、path、边界情况）
+src/components/ui/components.test.tsx      基础组件渲染与交互
+src/stores/auth.test.ts              认证状态机
+```
+
+```bash
+cd frontend
+npm run test            # vitest run
+npm run test:watch
+npm run coverage
+```
+
+配置在 `vite.config.ts` 的 `test` 段：`environment: jsdom`、`globals: true`、`setupFiles: ./src/test/setup.ts`（引入 `@testing-library/jest-dom` 的匹配器）、`css: false`。
+
+**前端测什么、不测什么**
+
+- 测：纯函数（格式化、图表几何、口令策略）、HTTP 客户端行为、状态机
+- 不测：整页渲染、路由跳转、视觉样式。这些用 §6 的手工端到端清单覆盖，性价比更高
+- 图表**组件**本身不测，测的是 `chartUtils.ts` 里的几何计算——这正是 [ADR-0001](../adr/0001-custom-svg-charts.md) 里"把计算抽成纯函数"的收益
+
+---
+
+## 4. 静态检查
+
+### 4.1 后端
+
+**ruff**（同时负责格式与 lint）
+
+```bash
+ruff format --check src tests     # CI 用的检查形式
+ruff format src tests             # 本地直接格式化
+ruff check src tests
+ruff check --fix src tests        # 自动修可修的
+```
+
+启用的规则集：
+
+```
+E, W      pycodestyle
+F         pyflakes（未使用导入/变量等）
+I         isort（导入排序）
+N         命名规范
+UP        pyupgrade（消灭 typing.List 这类弃用写法）
+B         bugbear（真实 bug 模式）
+A         builtins 遮蔽
+C4        推导式简化
+SIM       可简化的控制流
+TCH       类型检查专用导入
+RUF       ruff 自有规则
+S         bandit（安全）
+PTH       用 pathlib 而不是 os.path
+DTZ       时区感知的 datetime
+ASYNC     异步误用
+RET       返回值风格
+ARG       未使用的函数参数
+```
+
+忽略项及其理由都写在 `pyproject.toml` 的注释里（`B008` 是 FastAPI 的 `Depends()` 惯用法，`S101` 是测试里的 assert，等等）。`tests/**` 额外放宽 `ARG` 与 `TCH`——pytest fixture 天然是"看起来没用的参数"。
+
+**mypy**（`strict = true`）
+
+```bash
+mypy src
+```
+
+- 启用 pydantic 插件，模型字段类型能被真正检查
+- `warn_unreachable = true`
+- `migrations/` 排除（Alembic 生成的代码不符合 strict）
+- `tests.*` 放宽 `disallow_untyped_decorators` 等——pytest 的装饰器签名 strict 模式过不了，这是设计使然
+- 第三方无存根的模块（`cvxpy`、`arq`、`clickhouse_connect`、`langchain_openai`）单独 `ignore_missing_imports`
+
+**目标是 `mypy src` 零错误**，不是"大部分文件通过"。
+
+### 4.2 前端
+
+```bash
+npm run lint        # eslint --max-warnings 0
+npm run typecheck   # tsc -p tsconfig.app.json && tsc -p tsconfig.node.json
+```
+
+`tsconfig.app.json` 的关键项：`strict`、`noUnusedLocals`、`noUnusedParameters`、`noImplicitOverride`、`noFallthroughCasesInSwitch`。
+
+ESLint 规则要点：
+
+- `@typescript-eslint/no-unused-vars` 为 **error**，但 `^_` 前缀的变量/参数/捕获异常放行（这是"我知道它没用，故意留着"的约定）
+- `@typescript-eslint/no-explicit-any` 为 warn（配合 `--max-warnings 0`，等价于禁止）
+- `no-console` 只允许 `warn` 与 `error`
+- `eqeqeq: ["error", "smart"]`
+- `react-hooks` 推荐规则
+- `react-refresh/only-export-components`：测试文件里关掉
+
+---
+
+## 5. CI 流水线
+
+`.github/workflows/ci.yml`，触发条件：`push` 到 main/master、所有 `pull_request`、手动 `workflow_dispatch`。
+
+`concurrency` 配置让同一分支的新 push 取消在跑的旧 run，省 CI 时间。顶层 `permissions: contents: read` 是最小权限。
+
+```
+┌─────────── backend (ubuntu, py3.12, 20min) ───────────┐
+│  checkout → setup-python(cache: pip)                  │
+│  pip install -e ".[dev,analytics]"                    │
+│  ruff format --check src tests                        │
+│  ruff check src tests                                 │
+│  mypy src                                             │
+│  alembic upgrade → downgrade base → upgrade (SQLite)  │
+│  pytest --cov --cov-report=xml --junitxml=junit.xml   │
+│  upload: coverage.xml + junit.xml                     │
+└───────────────────────────────────────────────────────┘
+┌─────────── migrations (ubuntu, py3.12, 15min) ────────┐
+│  service: postgres:16.6-alpine（healthcheck 后才开跑）│
+│  pip install -e ".[dev,postgres]"                     │
+│  alembic upgrade head                                 │
+│  alembic check          ← 断言无 autogenerate 漂移     │
+│  alembic downgrade base → alembic upgrade head        │
+└───────────────────────────────────────────────────────┘
+┌─────────── frontend (ubuntu, node22, 20min) ──────────┐   三个 job 并行
+│  checkout → setup-node（cache: npm）                  │
+│  npm ci（lockfile 已提交，漂移即失败）                │
+│  npm run lint → typecheck → test → build              │
+│  upload: frontend/dist                                │
+└───────────────────────────────────────────────────────┘
+              │ needs: [backend, frontend, migrations]
+              ▼
+┌─────────── images (30min, 非 PR 才跑) ────────────────┐
+│  buildx + GHA 层缓存                                   │
+│  build Dockerfile.backend  (push: false)              │
+│  build Dockerfile.frontend (push: false)              │
+└───────────────────────────────────────────────────────┘
+┌─────────── manifests (10min) ─────────────────────────┐
+│  docker compose config --quiet（dev 与 prod 两层）      │
+│  kubectl apply --dry-run=client --validate=false -k    │
+│  逐个 manifest dry-run                                 │
+└───────────────────────────────────────────────────────┘
+```
+
+几个设计决定：
+
+**测试环境变量在 CI 里再设一遍**（`APP__ENVIRONMENT=test`、`LLM__PROVIDER=mock`、`REDIS__ENABLED=false` 等）。测试套件自己会构造 Settings，但仓库里万一有人留了个 `.env`，不该渗进 CI。双保险。
+
+**`images` job 在 PR 上不跑**（`if: github.event_name != 'pull_request'`）。PR 只需要证明 Dockerfile 能构建——但构建镜像慢且吃缓存，所以留到 push。如果你希望 PR 也验证，去掉那个 `if`。
+
+**`manifests` job 用 `--validate=false`**。`--dry-run=client` 若开启服务端校验，就需要 runner 上有可用的 kubeconfig，那样这个 job 只在特定环境能过。关掉之后仍然验证 YAML 结构、字段类型与 kustomize 组装是否正确。
+
+**`secret.example.yaml` 被 CI 显式跳过**。它不参与 kustomize 组装，也不该被 apply。
+
+**`migrations` job 连的是真的 PostgreSQL 服务容器**，不是 SQLite。初始 revision 是手写的，`alembic check` 在 upgrade 之后跑一次 autogenerate，只要产出任何 diff 就让 CI 红。这挡住的是最难查的一类事故：开发与测试走 `Base.metadata.create_all`、预发与生产走 Alembic，两套 schema 悄悄分叉，而分叉的那一半从来没被测过。`backend` job 里另外用一次性 SQLite 跑 `upgrade → downgrade base → upgrade`，保证链路在开发方言上同样可逆。
+
+**列上的 `unique=True` + `index=True` 组合被禁掉了**。那个组合会让 SQLAlchemy 同时产出 UNIQUE 约束和唯一索引，而 autogenerate 只复现其中一个，于是 `alembic check` 永远报漂移。`users.email` 因此改成在 `__table_args__` 里显式声明 `Index("ix_users_email", "email", unique=True)`。以后新增唯一列照这个写法。
+
+**前端只走 `npm ci`。** `frontend/package-lock.json` 已提交，`setup-node` 打开了 `cache: npm` + `cache-dependency-path`。不再保留 `npm install` 回退分支——lockfile 与 `package.json` 一旦漂移，构建立刻红，而不是悄悄解析出另一棵依赖树。`Dockerfile.frontend` 同样优先 `npm ci`。**改了依赖就把 lockfile 一起提交**，否则 CI 会替你发现。
+
+### 5.1 本地跑同一套
+
+```powershell
+.\scripts\check.ps1              # 全部
+.\scripts\check.ps1 -Only backend
+.\scripts\check.ps1 -Skip build,vitest
+.\scripts\check.ps1 -Only backend -Skip migrations   # 不碰数据库，只跑静态检查与单测
+```
+
+```bash
+make check        # = lint types test build，顺序与 CI 一致
+```
+
+`check.ps1` 最后打印一张 pass/FAIL/skipped 汇总表，有失败时退出码 1。
+
+### 5.2 还没接上但应该接的
+
+| 项 | 说明 | 优先级 |
+|---|---|---|
+| `pip-audit` / `npm audit` | 依赖漏洞扫描 | 高 |
+| 镜像漏洞扫描（Trivy/Grype） | 基础镜像层 CVE | 中 |
+| 覆盖率门禁分模块 | 让 `domain/` 要求 95%+，`infra/ads/` 放宽 | 中 |
+| 真实 PostgreSQL 上的业务集成测试 | 迁移链路已由 `migrations` job 覆盖；仍缺在 PG 上验证 JSON 字段查询与 `daily_metrics` 部分唯一索引行为的业务用例 | 中 |
+| Playwright 端到端 | 覆盖登录→触发 run→审批的完整路径 | 中 |
+| 负载测试 | `k6`/`locust` 打 `/analytics/*` 与 `/runs`，拿到真实容量数字 | 低（当前无生产流量） |
+
+---
+
+## 6. 手工端到端验收清单
+
+CI 覆盖不到的部分。每次发布前在 staging 走一遍（约 15 分钟）。
+
+**认证与账号**
+- [ ] 用引导管理员登录成功
+- [ ] 修改密码后，旧密码不能登录，新密码可以
+- [ ] 修改密码后其他设备的会话被踢下线
+- [ ] 连续输错 5 次口令后账号被锁，15 分钟内正确口令也被拒
+- [ ] 登出后浏览器后退，页面不能继续调接口
+
+**权限**
+- [ ] 建一个 viewer 账号，登录后「活动」页的编辑/删除按钮不可见
+- [ ] 用 viewer 的 token 直接 `PATCH /campaigns/{id}` → 403 `permission_denied`
+- [ ] 用 optimizer 账号访问 `/admin/audit` → 403
+- [ ] 把某账号角色从 optimizer 改为 analyst，该账号**必须重新登录**才能继续（旧会话已吊销）
+- [ ] 尝试停用最后一个 admin → 409
+
+**优化闭环**
+- [ ] 「运行」页点【新建运行】，选 2–3 个活动，`max_iterations=2`
+- [ ] 运行详情页的时间线**实时**逐条出现（不是等结束后一次性刷出）
+- [ ] 中途刷新页面，时间线能从 `lastSeq` 续上，不丢事件
+- [ ] 运行结束后状态为 `succeeded`，summary 里的 `action_counts` 非空
+- [ ] 触发一个长运行，中途点【取消】→ 状态变为 `cancelled`，且**不会**在几秒后又变成 `succeeded`
+
+**审批门**
+- [ ] 「动作」页有 `proposed` 提案
+- [ ] 未审批直接调 `POST /actions/{id}/execute` → 409 `approval_required`
+- [ ] 【批准】后【执行】→ 状态变 `executed`，`executed_at` 有值
+- [ ] 重复执行同一动作 → 409
+- [ ] 批量批准 3 条，逐条状态都变了
+- [ ] 【驳回】带理由，状态变 `rejected`
+
+**告警与分析**
+- [ ] 「告警」页有 open 告警，`context` 里能看到观测值与阈值
+- [ ] 【确认】后状态变 `acknowledged`，【解决】后变 `resolved`
+- [ ] Dashboard 的 KPI 卡片与「分析」页数字一致
+- [ ] 图表 hover 有 tooltip，窗口缩放时图表重排（不是溢出或压扁）
+
+**审计**
+- [ ] 「审计」页能看到上面每一步操作，含 actor、action、resource、时间
+- [ ] 点开一条 `campaign.updated`，`before`/`after` 能看出改了什么
+- [ ] `request_id` 与后端日志里的能对上
+
+**运维面**
+- [ ] `/healthz` 200；`/readyz` 200 且所有 check 为 ok
+- [ ] `/metrics` 能看到 `http_requests_total` 在增长
+- [ ] 生产环境下 `/docs` 与 `/redoc` 是 404
+- [ ] 响应头里有 CSP、HSTS（https）、`X-Request-ID`
+- [ ] `POST /admin/prune?audit_days=365` 返回删除条数
+
+**部署形态**
+- [ ] 多副本时：连续触发 3 个 run，每个的 SSE 时间线都能实时更新（验证 cookie 亲和生效）
+- [ ] 滚动更新期间持续请求，无 5xx（验证 `preStop: sleep 10` 与 `maxUnavailable: 0`）

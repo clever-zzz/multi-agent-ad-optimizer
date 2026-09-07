@@ -1,0 +1,216 @@
+# Local / staging stack for the production backend and frontend.
+#
+#   cd deploy/compose
+#   cp .env.example .env            # then fill in the REQUIRED values
+#   docker compose up --build
+#
+# Optional profiles:
+#   --profile analytics   adds ClickHouse for DATA_MODE=warehouse
+#
+# The frontend is reachable on http://localhost:8080 and proxies /api to the
+# backend, so the browser only ever talks to one origin.
+
+name: adoptimizer
+
+x-backend-env: &backend-env
+  APP__ENVIRONMENT: ${APP__ENVIRONMENT:-development}
+  APP__NAME: ${APP__NAME:-Ad Optimizer}
+  APP__CORS_ALLOW_ORIGINS: ${APP__CORS_ALLOW_ORIGINS:-["http://localhost:8080","http://localhost:5173"]}
+  DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-adoptimizer}:${POSTGRES_PASSWORD:-adoptimizer}@postgres:5432/${POSTGRES_DB:-adoptimizer}
+  DATABASE__POOL_SIZE: ${DATABASE__POOL_SIZE:-10}
+  DATABASE__MAX_OVERFLOW: ${DATABASE__MAX_OVERFLOW:-20}
+  REDIS__ENABLED: "true"
+  REDIS__URL: redis://redis:6379/0
+  SECURITY__JWT_SECRET: ${SECURITY__JWT_SECRET:?set SECURITY__JWT_SECRET in .env (at least 32 characters)}
+  SECURITY__BOOTSTRAP_ADMIN_EMAIL: ${SECURITY__BOOTSTRAP_ADMIN_EMAIL:-admin@adoptimizer.dev}
+  SECURITY__BOOTSTRAP_ADMIN_PASSWORD: ${SECURITY__BOOTSTRAP_ADMIN_PASSWORD:?set SECURITY__BOOTSTRAP_ADMIN_PASSWORD in .env}
+  SECURITY__REQUIRE_ACTION_APPROVAL: ${SECURITY__REQUIRE_ACTION_APPROVAL:-true}
+  LLM__PROVIDER: ${LLM__PROVIDER:-mock}
+  LLM__MODEL: ${LLM__MODEL:-gpt-4o-mini}
+  LLM__API_KEY: ${LLM__API_KEY:-}
+  LLM__MONTHLY_BUDGET_USD: ${LLM__MONTHLY_BUDGET_USD:-200}
+  DATA_MODE: ${DATA_MODE:-mock}
+  OBSERVABILITY__LOG_LEVEL: ${OBSERVABILITY__LOG_LEVEL:-INFO}
+  OBSERVABILITY__JSON_LOGS: ${OBSERVABILITY__JSON_LOGS:-true}
+  OPTIMIZATION__USE_CONVEX_SOLVER: ${OPTIMIZATION__USE_CONVEX_SOLVER:-true}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-adoptimizer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adoptimizer}
+      POSTGRES_DB: ${POSTGRES_DB:-adoptimizer}
+      # Deterministic collation avoids index corruption warnings across locales.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - log_min_duration_statement=500
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-adoptimizer} -d ${POSTGRES_DB:-adoptimizer}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # maxmemory-policy allkeys-lru keeps the cache from evicting the app OOM;
+    # appendonly gives durable rate-limit and idempotency counters.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.backend
+    image: adoptimizer-backend:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      RUN_MIGRATIONS: "true"
+      # One worker: runs are dispatched in-process and the SSE stream is served
+      # from the same process. Scale horizontally with replicas instead, and see
+      # docs/adr/0002-in-process-run-dispatch.md before running more than one
+      # replica behind a load balancer.
+      UVICORN_WORKERS: "1"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      # SQLite is not used here, but the app still wants a writable home.
+      - api-data:/var/lib/adoptimizer
+    networks: [backend, edge]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.backend
+    image: adoptimizer-backend:${IMAGE_TAG:-dev}
+    # One-shot job: it runs a single optimisation loop and exits. Schedule it
+    # from cron/k8s CronJob rather than restarting it in a loop.
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      # Migrations are owned by the api service; the worker must not race it.
+      RUN_MIGRATIONS: "false"
+    command: ["adoptimizer", "run", "--max-iterations", "2", "--window-days", "7"]
+    profiles: ["worker"]
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.frontend
+      args:
+        # Relative path means the browser calls the same origin nginx serves.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api/v1}
+        VITE_APP_TITLE: ${VITE_APP_TITLE:-Ad Optimizer}
+    image: adoptimizer-frontend:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_UPSTREAM: api:8000
+      LISTEN_PORT: "8080"
+      SSE_READ_TIMEOUT: 3600s
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    networks: [edge]
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    restart: unless-stopped
+    profiles: ["analytics"]
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-ad_optimizer}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ../../init-scripts/clickhouse:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+volumes:
+  postgres-data:
+  redis-data:
+  api-data:
+  clickhouse-data:
+
+networks:
+  # The frontend never talks to the datastore directly.
+  backend:
+    internal: false
+  edge:
+    internal: false

@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+#
+# Backend image: FastAPI + the LangGraph agent loop.
+# Build context is the repository root:
+#   docker build -f deploy/docker/Dockerfile.backend -t adoptimizer-backend .
+
+ARG PYTHON_VERSION=3.12
+
+# ---------- Stage 1: build the wheel and its dependencies ----------
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /build
+
+# Compiled wheels are needed for argon2-cffi, asyncpg and numpy on slim bases.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/pyproject.toml backend/README.md ./
+COPY backend/src ./src
+
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip wheel \
+    && /opt/venv/bin/pip install ".[postgres,analytics,worker]"
+
+# ---------- Stage 2: minimal runtime ----------
+FROM python:${PYTHON_VERSION}-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    ADOPTIMIZER_HOME=/var/lib/adoptimizer \
+    PORT=8000 \
+    UVICORN_WORKERS=1
+
+# tini reaps the zombie processes uvicorn can leave when a run is cancelled.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 adoptimizer \
+    && useradd --system --uid 10001 --gid adoptimizer --home-dir /app --shell /usr/sbin/nologin adoptimizer
+
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+COPY backend/alembic.ini ./alembic.ini
+COPY backend/migrations ./migrations
+COPY deploy/docker/backend-entrypoint.sh /usr/local/bin/backend-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/backend-entrypoint.sh \
+    && mkdir -p ${ADOPTIMIZER_HOME} \
+    && chown -R adoptimizer:adoptimizer /app ${ADOPTIMIZER_HOME}
+
+USER adoptimizer
+
+EXPOSE 8000
+
+# Liveness only: readiness is served to the orchestrator, not baked into the
+# image, because it depends on the database being reachable.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8000/healthz || exit 1
+
+ENTRYPOINT ["tini", "--", "/usr/local/bin/backend-entrypoint.sh"]
+
+# UVICORN_WORKERS must stay at 1. Runs are dispatched as in-process asyncio
+# tasks and the SSE stream is served by the same process, so extra workers would
+# silently separate a run from its subscribers. Scale with replicas instead; see
+# docs/adr/0002-in-process-run-dispatch.md. `exec` replaces the shell so tini
+# still delivers SIGTERM straight to uvicorn.
+CMD ["sh", "-c", "exec uvicorn adoptimizer.main:app --host 0.0.0.0 --port ${PORT} --workers ${UVICORN_WORKERS} --proxy-headers --forwarded-allow-ips '*'"]

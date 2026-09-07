@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+import sys
+from typing import Any, TypedDict
 
 import structlog
 
@@ -40,22 +41,27 @@ except ImportError:
 
 # ────────── State Schema ──────────
 
-STATE_SCHEMA = {
-    "task": str,
-    "campaign_ids": list,
-    "metrics": list,
-    "new_creatives": list,
-    "audience_insights": dict,
-    "bidding_decisions": list,
-    "optimization_actions": list,
-    "budget_allocations": list,
-    "alerts": list,
-    "agent_messages": list,
-    "current_agent": str,
-    "iteration": int,
-    "max_iterations": int,
-    "is_complete": bool,
-}
+class AdOptimizerGraphState(TypedDict, total=False):
+    """LangGraph 状态 schema.
+
+    显式声明字段可让每个 key 成为独立的 last-value channel，
+    节点因此能拿到累积后的完整状态，而不是上一个节点的返回值。
+    """
+
+    task: str
+    campaign_ids: list
+    metrics: list
+    new_creatives: list
+    audience_insights: dict
+    bidding_decisions: list
+    optimization_actions: list
+    budget_allocations: list
+    alerts: list
+    agent_messages: list
+    current_agent: str
+    iteration: int
+    max_iterations: int
+    is_complete: bool
 
 
 def _merge_lists(old: list, new: list) -> list:
@@ -88,7 +94,7 @@ class AdOptimizerSupervisor:
 
     def _build_graph(self) -> Any:
         """构建 LangGraph 状态图."""
-        graph = StateGraph(dict)
+        graph = StateGraph(AdOptimizerGraphState)
 
         graph.add_node("monitor", self.monitor.run)
         graph.add_node("audience", self.audience.run)
@@ -226,6 +232,10 @@ def main() -> None:
     """命令行运行入口."""
     from dotenv import load_dotenv
     load_dotenv()
+
+    # Windows consoles default to GBK; summaries contain characters like U+00A5.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
     llm = None
     api_key = os.getenv("OPENAI_API_KEY", "")

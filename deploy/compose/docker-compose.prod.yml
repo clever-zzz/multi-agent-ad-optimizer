@@ -1,0 +1,117 @@
+# Production hardening overlay for docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Differences from the development stack:
+#   - APP__ENVIRONMENT=production, which makes the backend refuse to boot with a
+#     weak JWT secret, a wildcard CORS origin, a demo bootstrap password or a
+#     SQLite database (see Settings._enforce_production_hardening).
+#   - images are pinned by tag, never built locally,
+#   - no host port is published for the datastore,
+#   - containers drop all capabilities and run read-only where possible.
+
+name: adoptimizer
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-16.6}-alpine
+    restart: always
+    # !override is a Compose merge tag: it replaces the base file's published
+    # ports with an empty list, so the datastore is never bound to the host.
+    ports: !override []
+    security_opt:
+      - no-new-privileges:true
+    # The container root is read-only; the data directory stays on the named
+    # volume so it survives a redeploy.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 512m
+
+  redis:
+    image: redis:${REDIS_VERSION:-7.4}-alpine
+    restart: always
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - redis-data:/data
+
+  api:
+    image: ${REGISTRY:-adoptimizer}/backend:${IMAGE_TAG:?set IMAGE_TAG to a released version}
+    build: !override null
+    restart: always
+    environment:
+      APP__ENVIRONMENT: production
+      APP__TRUSTED_HOSTS: ${APP__TRUSTED_HOSTS:-["*"]}
+      APP__CORS_ALLOW_ORIGINS: ${APP__CORS_ALLOW_ORIGINS:?set an explicit https origin list}
+      REDIS__URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OBSERVABILITY__JSON_LOGS: "true"
+      OBSERVABILITY__LOG_LEVEL: ${OBSERVABILITY__LOG_LEVEL:-INFO}
+      SECURITY__VERIFY_SESSION_ON_REQUEST: "true"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - api-data:/var/lib/adoptimizer
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+        reservations:
+          memory: 256m
+      update_config:
+        order: start-first
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+
+  frontend:
+    image: ${REGISTRY:-adoptimizer}/frontend:${IMAGE_TAG}
+    build: !override null
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+      # The entrypoint renders the config template into conf.d at start-up.
+      - /etc/nginx/conf.d
+    deploy:
+      replicas: ${FRONTEND_REPLICAS:-2}
+      resources:
+        limits:
+          memory: 128m
+        reservations:
+          memory: 32m
+
+volumes:
+  postgres-data:
+  redis-data:
+  api-data:

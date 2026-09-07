@@ -1,0 +1,49 @@
+# Non-secret runtime configuration.
+# Secrets live in adoptimizer-secrets (see secret.example.yaml) and must never
+# be committed with real values.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adoptimizer-config
+  namespace: adoptimizer
+  labels:
+    app.kubernetes.io/part-of: adoptimizer
+data:
+  APP__NAME: "Ad Optimizer"
+  APP__ENVIRONMENT: "production"
+  APP__API_V1_PREFIX: "/api/v1"
+  APP__CORS_ALLOW_ORIGINS: '["https://ads.example.com"]'
+  APP__TRUSTED_HOSTS: '["ads.example.com"]'
+  DATABASE__URL: "postgresql+asyncpg://adoptimizer@postgres:5432/adoptimizer"
+  DATABASE__POOL_SIZE: "10"
+  DATABASE__MAX_OVERFLOW: "20"
+  DATABASE__POOL_RECYCLE_SECONDS: "1800"
+  REDIS__ENABLED: "true"
+  REDIS__URL: "redis://redis:6379/0"
+  REDIS__CACHE_TTL_SECONDS: "300"
+  CLICKHOUSE__ENABLED: "false"
+  SECURITY__JWT_ALGORITHM: "HS256"
+  SECURITY__ACCESS_TOKEN_TTL_MINUTES: "15"
+  SECURITY__REFRESH_TOKEN_TTL_DAYS: "7"
+  SECURITY__REQUIRE_ACTION_APPROVAL: "true"
+  SECURITY__VERIFY_SESSION_ON_REQUEST: "true"
+  SECURITY__MAX_FAILED_LOGINS: "5"
+  SECURITY__LOCKOUT_SECONDS: "900"
+  SECURITY__PASSWORD_MIN_LENGTH: "10"
+  RATE_LIMIT__ENABLED: "true"
+  RATE_LIMIT__DEFAULT_REQUESTS_PER_MINUTE: "300"
+  RATE_LIMIT__WRITE_REQUESTS_PER_MINUTE: "60"
+  RATE_LIMIT__OPTIMIZE_RUNS_PER_HOUR: "20"
+  LLM__PROVIDER: "mock"
+  LLM__MODEL: "gpt-4o-mini"
+  LLM__MONTHLY_BUDGET_USD: "200"
+  LLM__FAIL_OPEN_TO_MOCK: "true"
+  DATA_MODE: "mock"
+  OPTIMIZATION__MAX_ITERATIONS: "3"
+  OPTIMIZATION__USE_CONVEX_SOLVER: "true"
+  OPTIMIZATION__MAX_BUDGET_CHANGE_PCT: "50"
+  OBSERVABILITY__LOG_LEVEL: "INFO"
+  OBSERVABILITY__JSON_LOGS: "true"
+  OBSERVABILITY__METRICS_ENABLED: "true"
+  OBSERVABILITY__SERVICE_NAME: "adoptimizer-backend"
+  RUN_MIGRATIONS: "false"

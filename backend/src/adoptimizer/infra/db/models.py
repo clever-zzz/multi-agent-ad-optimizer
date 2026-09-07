@@ -1,0 +1,394 @@
+"""ORM models for the operational datastore.
+
+Design notes:
+- Every table uses a stable string primary key generated in the application so
+  ids can be created before insert and are safe to expose publicly.
+- High-cardinality ad events live in ClickHouse; this store keeps daily
+  aggregates which is enough to run the full optimizer without a warehouse.
+- Money is stored as Float for parity with the ad platform APIs, but always
+  rounded at the domain boundary.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .base import Base, TimestampMixin, as_utc, utcnow
+
+
+class User(Base, TimestampMixin):
+    """An authenticated operator of the platform."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(200), default="")
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="viewer", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    sessions: Mapped[list[RefreshSession]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+    # Declared as an explicit unique index rather than unique=True + index=True
+    # on the column: that combination makes SQLAlchemy emit both a UNIQUE
+    # constraint and a unique index, and Alembic autogenerate only reproduces
+    # one of them, so `alembic check` would report permanent drift.
+    __table_args__ = (Index("ix_users_email", "email", unique=True),)
+
+
+class RefreshSession(Base, TimestampMixin):
+    """A issued refresh token, revocable independently of the access token."""
+
+    __tablename__ = "refresh_sessions"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    user_agent: Mapped[str] = mapped_column(String(400), default="")
+    ip_address: Mapped[str] = mapped_column(String(64), default="")
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+    @property
+    def is_valid(self) -> bool:
+        return self.revoked_at is None and as_utc(self.expires_at) > utcnow()
+
+
+class Campaign(Base, TimestampMixin):
+    """An advertising campaign under optimization."""
+
+    __tablename__ = "campaigns"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    platform: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False, index=True)
+    external_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    daily_budget: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    total_budget: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    target_cpa: Mapped[float] = mapped_column(Float, default=100.0, nullable=False)
+    target_roas: Mapped[float] = mapped_column(Float, default=2.0, nullable=False)
+    current_bid_cpm: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    target_audience: Mapped[str] = mapped_column(Text, default="")
+    objective: Mapped[str] = mapped_column(String(60), default="conversions")
+    created_by: Mapped[str | None] = mapped_column(String(32), ForeignKey("users.id"))
+
+    creatives: Mapped[list[Creative]] = relationship(
+        back_populates="campaign", cascade="all, delete-orphan", lazy="selectin"
+    )
+    daily_metrics: Mapped[list[DailyMetric]] = relationship(
+        back_populates="campaign", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id", name="uq_campaign_platform_external"),
+        Index("ix_campaign_status_platform", "status", "platform"),
+    )
+
+
+class Creative(Base, TimestampMixin):
+    """An ad creative, human-authored or generated by the creative agent."""
+
+    __tablename__ = "creatives"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    creative_type: Mapped[str] = mapped_column(String(20), default="text", nullable=False)
+    headline: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    cta_text: Mapped[str] = mapped_column(String(60), default="Learn More")
+    target_emotion: Mapped[str] = mapped_column(String(40), default="")
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False, index=True)
+    ab_group: Mapped[str] = mapped_column(String(40), default="control")
+    origin: Mapped[str] = mapped_column(String(20), default="human")
+    score: Mapped[float | None] = mapped_column(Float)
+    generated_by_run_id: Mapped[str | None] = mapped_column(String(40))
+
+    campaign: Mapped[Campaign] = relationship(back_populates="creatives")
+
+    __table_args__ = (Index("ix_creative_campaign_status", "campaign_id", "status"),)
+
+
+class DailyMetric(Base):
+    """Daily aggregate per campaign/creative, the optimizer's input."""
+
+    __tablename__ = "daily_metrics"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False
+    )
+    creative_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    stat_date: Mapped[date] = mapped_column(Date, nullable=False)
+    impressions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    clicks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    conversions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    revenue: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    unique_reach: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    campaign: Mapped[Campaign] = relationship(back_populates="daily_metrics")
+
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "creative_id", "stat_date", name="uq_daily_metric_slot"),
+        Index("ix_daily_metric_campaign_date", "campaign_id", "stat_date"),
+        # SQL treats NULLs as distinct, so the constraint above does not protect
+        # the campaign-level slot where creative_id IS NULL. Without this index
+        # two concurrent upserts can insert duplicate campaign/day rows, and the
+        # SUM() based snapshot queries would then double-count spend and revenue.
+        # Both PostgreSQL and SQLite support partial indexes.
+        Index(
+            "uq_daily_metric_campaign_slot",
+            "campaign_id",
+            "stat_date",
+            unique=True,
+            postgresql_where=text("creative_id IS NULL"),
+            sqlite_where=text("creative_id IS NULL"),
+        ),
+    )
+
+
+class OptimizationRun(Base, TimestampMixin):
+    """One execution of the multi-agent optimization loop."""
+
+    __tablename__ = "optimization_runs"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    trigger_type: Mapped[str] = mapped_column(String(20), default="manual")
+    requested_by: Mapped[str | None] = mapped_column(String(32), ForeignKey("users.id"))
+    campaign_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    iteration: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_iterations: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), index=True)
+
+    events: Mapped[list[RunEvent]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="RunEvent.seq"
+    )
+    actions: Mapped[list[OptimizationAction]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class RunEvent(Base):
+    """Append-only event stream for a run; powers SSE replay and auditing."""
+
+    __tablename__ = "run_events"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("optimization_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent: Mapped[str] = mapped_column(String(20), default="supervisor")
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    run: Mapped[OptimizationRun] = relationship(back_populates="events")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "seq", name="uq_run_event_seq"),
+        Index("ix_run_event_run_seq", "run_id", "seq"),
+    )
+
+
+class OptimizationAction(Base, TimestampMixin):
+    """A concrete change proposed by the agents, gated by human approval."""
+
+    __tablename__ = "optimization_actions"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("optimization_runs.id", ondelete="SET NULL"), index=True
+    )
+    campaign_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    creative_id: Mapped[str | None] = mapped_column(String(40))
+    action_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="proposed", nullable=False, index=True)
+    before_value: Mapped[str] = mapped_column(String(200), default="")
+    after_value: Mapped[str] = mapped_column(String(200), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    proposed_by: Mapped[str] = mapped_column(String(20), default="optimize")
+    approved_by: Mapped[str | None] = mapped_column(String(32), ForeignKey("users.id"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    external_reference: Mapped[str | None] = mapped_column(String(200))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    run: Mapped[OptimizationRun | None] = relationship(back_populates="actions")
+
+    __table_args__ = (Index("ix_action_status_type", "status", "action_type"),)
+
+
+class Alert(Base, TimestampMixin):
+    """A monitoring alert raised by the monitor agent."""
+
+    __tablename__ = "alerts"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    run_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    rule: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    severity: Mapped[str] = mapped_column(String(20), default="warning", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="open", nullable=False, index=True)
+    observed: Mapped[float | None] = mapped_column(Float)
+    threshold: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    message: Mapped[str] = mapped_column(Text, default="")
+    dedup_key: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    acknowledged_by: Mapped[str | None] = mapped_column(String(32), ForeignKey("users.id"))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_alert_status_detected", "status", "detected_at"),)
+
+
+class BudgetAllocationRecord(Base, TimestampMixin):
+    """Persisted budget reallocation proposal."""
+
+    __tablename__ = "budget_allocations"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    campaign_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    current_budget: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    recommended_budget: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    change_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    solver: Mapped[str] = mapped_column(String(30), default="greedy_lp")
+    status: Mapped[str] = mapped_column(String(20), default="proposed", nullable=False)
+
+
+class ABTest(Base, TimestampMixin):
+    """A controlled creative experiment with a significance gate."""
+
+    __tablename__ = "ab_tests"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False, index=True)
+    control_creative_id: Mapped[str | None] = mapped_column(String(40))
+    variant_creative_id: Mapped[str | None] = mapped_column(String(40))
+    metric: Mapped[str] = mapped_column(String(20), default="ctr")
+    minimum_detectable_effect: Mapped[float] = mapped_column(Float, default=0.1, nullable=False)
+    required_sample_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    traffic_split: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    concluded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    winner_creative_id: Mapped[str | None] = mapped_column(String(40))
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_by_run_id: Mapped[str | None] = mapped_column(String(40))
+
+
+class AuditLog(Base):
+    """Immutable record of every state-changing operation."""
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    actor_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    actor_email: Mapped[str] = mapped_column(String(320), default="")
+    actor_role: Mapped[str] = mapped_column(String(20), default="")
+    action: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    resource_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    before: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    after: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    ip_address: Mapped[str] = mapped_column(String(64), default="")
+    user_agent: Mapped[str] = mapped_column(String(400), default="")
+    request_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
+class IdempotencyRecord(Base):
+    """Stores a response against a client-supplied idempotency key."""
+
+    __tablename__ = "idempotency_records"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    method: Mapped[str] = mapped_column(String(10), nullable=False)
+    path: Mapped[str] = mapped_column(String(400), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    response_body: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+
+class LLMSpendRecord(Base):
+    """Per-call model spend, aggregated for budget guardrails."""
+
+    __tablename__ = "llm_spend"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    agent: Mapped[str] = mapped_column(String(20), default="")
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)
+    model: Mapped[str] = mapped_column(String(80), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), default="success", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )

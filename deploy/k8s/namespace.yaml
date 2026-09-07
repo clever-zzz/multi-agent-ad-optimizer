@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adoptimizer
+  labels:
+    app.kubernetes.io/part-of: adoptimizer
+    # Rejects unencrypted pod-to-pod traffic when a NetworkPolicy controller
+    # enforces the cluster default deny.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
