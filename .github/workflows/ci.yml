@@ -17,8 +17,6 @@ permissions:
 env:
   PYTHON_VERSION: "3.12"
   NODE_VERSION: "22"
-  # Keep in sync with deploy/compose/docker-compose.yml.
-  POSTGRES_VERSION: "16.6-alpine"
 
 jobs:
   backend:
@@ -103,7 +101,9 @@ jobs:
         working-directory: backend
     services:
       postgres:
-        image: postgres:${{ env.POSTGRES_VERSION }}
+        # Keep in sync with deploy/compose/docker-compose.prod.yml and
+        # deploy/k8s/postgres.yaml (production dialect parity).
+        image: postgres:16.6-alpine
         env:
           POSTGRES_USER: adoptimizer
           POSTGRES_PASSWORD: adoptimizer-ci
@@ -267,3 +267,19 @@ jobs:
             [ "$(basename "$f")" = "secret.example.yaml" ] && continue
             kubectl apply --dry-run=client --validate=false -f "$f"
           done
+  workflows:
+    name: Workflows · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Workflow definitions are security-sensitive, so the linter binary is
+      # pulled from an exact release tag instead of a floating major version.
+      - name: Install actionlint
+        run: |
+          curl -sSfL -o download-actionlint.bash "https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash"
+          bash download-actionlint.bash v1.7.12
+
+      - name: Lint workflow definitions
+        run: ./actionlint -color
