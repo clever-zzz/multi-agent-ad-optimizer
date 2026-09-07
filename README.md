@@ -1,7 +1,7 @@
 # Ad Optimizer — 生产级多智能体广告投放优化平台
 
-[![CI](https://github.com/bcefghj/multi-agent-ad-optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/bcefghj/multi-agent-ad-optimizer/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://python.org)
+[![CI](https://github.com/clever-zzz/multi-agent-ad-optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/clever-zzz/multi-agent-ad-optimizer/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-green)](https://github.com/langchain-ai/langgraph)
@@ -13,6 +13,20 @@
 后端 FastAPI + SQLAlchemy 2 (async) + LangGraph，前端 React 19 + TanStack Query + Tailwind 4，配套 Docker Compose、Kubernetes (kustomize)、GitHub Actions CI 与完整运维文档。
 
 > **默认零外部依赖即可跑通**：`LLM__PROVIDER=mock` + SQLite + 内置模拟广告平台适配器。不需要 API Key、不需要 Docker、不需要 PostgreSQL。
+
+## 落地状态速览
+
+| 维度 | 现状 |
+|---|---|
+| 后端 | FastAPI + SQLAlchemy 2 async + Alembic，14 张表，47 个业务端点 + 4 个系统端点 |
+| 前端 | React 19 + TypeScript + Vite + Tailwind 4 运营控制台，9 个页面；`package-lock.json` 已提交，安装一律 `npm ci` |
+| 编排 | LangGraph Supervisor 图（5 智能体 + 告警迭代回环）；缺依赖时自动降级为等价顺序执行器 |
+| 安全治理 | Argon2id 哈希 + 可撤销 JWT 会话 + 4 角色 RBAC + 全量审计 + 人工审批门 + 首次登录强制改密 |
+| 可观测 | `/healthz` `/readyz` `/metrics` + structlog JSON + 全链路 `X-Request-ID` + SSE 运行事件回放 |
+| 测试 | 后端 591（332 unit + 259 integration，覆盖率 80.81%，ratchet 下限 78%）+ 前端 99，CI 强制 |
+| 部署 | 多阶段非 root 镜像 + compose（dev/prod）+ kustomize（HPA/PDB/NetworkPolicy/Ingress） |
+| CI | 5 个 job：`backend` / `migrations` / `frontend` / `images` / `manifests` |
+| 遗留 demo | `python/` `java/` `golang/` 仅作教学参考，不在生产路径上 |
 
 ---
 
@@ -43,10 +57,12 @@ cd multi-agent-ad-optimizer
 
 浏览器打开 <http://localhost:5173>，用 `admin@adoptimizer.dev` / `Adm1n!ChangeMe` 登录。
 
+> 首次登录会**强制设置个人密码**（bootstrap 账号标记 `must_change_password`，弹窗不可关闭、不可绕过）。这是刻意的治理行为，不是 bug。
+
 ### 方式 B：make（macOS / Linux / Git Bash）
 
 ```bash
-make install     # 建 venv、装后端与前端依赖
+make install     # 建 venv、装后端与前端依赖（前端走 npm ci）
 make dev         # API :8000 + Web :5173
 ```
 
@@ -83,7 +99,7 @@ backend/                  生产后端（FastAPI + LangGraph）
     infra/                数据库(SQLAlchemy async)、缓存(Redis/内存)、ClickHouse、广告平台适配器
     repositories/         持久化访问层
     services/             应用用例（认证、活动、优化、动作、审计、分析）
-    api/                  路由与 DTO，/healthz /readyz /metrics 免鉴权
+    api/                  路由与 DTO，/healthz /readyz /metrics /system/info 免鉴权
   migrations/             Alembic（异步引擎，SQLite 走 batch mode）
   tests/                  unit + integration（临时 SQLite、mock LLM、内存缓存）
 frontend/                 操作台（React 19 + TypeScript + Vite + Tailwind 4）
@@ -113,7 +129,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
     SSE 实时进度)      │  ├ SecurityHeadersMiddleware (HSTS/CSP/...)  │
                       │  ├ RateLimitMiddleware       (令牌桶)         │
                       │  ├ GZip / CORS / TrustedHost                 │
-                      │  └ RBAC 依赖注入 (require_permission)         │
+                      │  └ RBAC 依赖注入 (require_permission)        │
                       └───────────────┬──────────────────────────────┘
                                       │ OptimizationService.start_run
                                       ▼
@@ -136,7 +152,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
                                                         DATA_MODE=warehouse
 ```
 
-**关键不变量**：Agent 之间不直接调用，只通过共享 `AgentState` 通信；所有状态变更都写入 `audit_logs`；所有对外部广告平台的写操作都必须先经过 `optimization_actions` 的人工审批门（`SECURITY__REQUIRE_ACTION_APPROVAL=true`）。
+**关键不变量**：Agent 之间不直接调用，只通过共享 `AgentState` 通信；所有状态变更都写入 `audit_logs`；所有对外部广告平台的写操作都必须先经过 `optimization_actions` 的人工审批门（`SECURITY__REQUIRE_ACTION_APPROVAL=true`，默认开启）。
 
 详见 [docs/production/02-architecture.md](docs/production/02-architecture.md)。
 
@@ -164,6 +180,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 - Argon2id 口令哈希（可调 time/memory/parallelism），JWT access + 可撤销 refresh 会话
 - 4 角色 RBAC（admin / optimizer / analyst / viewer）映射到 11 个细粒度权限
 - 登录失败计数 + 锁定；改密码/改角色/停用账号会吊销会话；**最后一个在职 admin 不允许被降级或停用**
+- bootstrap 账号标记 `must_change_password`，首次登录强制改密且弹窗不可关闭
 - 全量审计日志（actor、前后值、IP、UA、request_id）；写操作支持 `Idempotency-Key`
 - 生产环境启动即校验：弱密钥、通配 CORS、SQLite 一律拒绝启动
 - 安全响应头（CSP、HSTS、X-Content-Type-Options、Referrer-Policy、Frame-Options）
@@ -184,7 +201,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 
 ## API 概览
 
-前缀 `/api/v1`，共 **47** 个业务端点 + **4** 个免鉴权系统端点。错误响应统一为 RFC 9457 风格的 problem document：
+业务端点前缀 `/api/v1`，共 **47** 个；另有 **4** 个免鉴权系统端点挂在根路径（`/healthz` `/readyz` `/metrics` `/system/info`）。错误响应统一为 RFC 9457 风格的 problem document：
 
 ```json
 {
@@ -206,7 +223,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 | `/alerts` | 4 | 列表、按严重度汇总、确认、解决 |
 | `/analytics` | 6 | 总览、快照、时序、活动下钻、LLM 花费、即时异常检测 |
 | `/admin` | 7 | 运行时配置、依赖健康、审计、实验、灌种子、改用户、保留期清理 |
-| 系统 | 4 | `/healthz` `/readyz` `/metrics` `/system/info` |
+| 系统 | 4 | `/healthz` `/readyz` `/metrics` `/system/info`（根路径） |
 
 完整端点表、权限矩阵与调用示例见 [docs/production/03-api-reference.md](docs/production/03-api-reference.md)。交互式文档：启动后访问 <http://localhost:8000/docs>。
 
@@ -234,14 +251,15 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 make check                 # 同上，CI 顺序一致
 ```
 
-| 门禁 | 工具 | 阈值 |
+| 门禁 | 工具 | 阈值 / 当前规模 |
 |---|---|---|
 | 格式 | `ruff format` | 必须无 diff |
 | Lint | `ruff check` | 0 error（E/W/F/I/N/UP/B/A/C4/SIM/TCH/RUF/S/PTH/DTZ/ASYNC/RET/ARG） |
 | 类型 | `mypy --strict` / `tsc` | 后端 0 error；前端 `strict` + `noUnusedLocals` |
 | 迁移 | `alembic upgrade head / check / downgrade base` | 可升级、可回滚，且 `alembic check` 无 autogenerate 漂移 |
-| 测试 | `pytest --cov` / `vitest` | 后端覆盖率 **≥ 78%**（分支覆盖），失败即 CI 红 |
-| Lint | `eslint --max-warnings 0` | 0 warning |
+| 后端测试 | `pytest --cov` | 591 个（332 unit + 259 integration）；分支覆盖率 80.81%，ratchet 下限 **78%**，失败即 CI 红 |
+| 前端测试 | `vitest` | 99 个；`eslint --max-warnings 0` 同时强制 0 warning |
+| 依赖安装 | `npm ci` | lockfile 已提交，CI 与 `setup.ps1` 一律走 `npm ci`，漂移即失败 |
 
 CI 还会构建两个容器镜像，并校验 compose 与 kustomize 清单可渲染。见 [.github/workflows/ci.yml](.github/workflows/ci.yml)（5 个 job：`backend`、`migrations`、`frontend`、`images`、`manifests`）。
 
