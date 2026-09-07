@@ -254,19 +254,21 @@ jobs:
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
 
-      # --validate=false: client-side dry run must not need a live cluster to
-      # fetch OpenAPI schemas, otherwise this job only passes on a runner that
-      # happens to have a kubeconfig.
+      # `kubectl apply --dry-run=client` still performs API discovery, so on a
+      # runner without a kubeconfig it dials localhost:8080 and fails. Build
+      # the overlay offline instead: this parses every referenced resource and
+      # applies patches and transformers without needing a live cluster.
       - name: Validate kustomize
-        run: kubectl apply --dry-run=client --validate=false -k deploy/k8s
+        run: kubectl kustomize deploy/k8s > /tmp/kustomize-build.yaml
 
+      # Standalone parse check so files the overlay does not reference (for
+      # example secret.example.yaml) cannot rot silently.
       - name: Validate Kubernetes manifests
         run: |
           for f in deploy/k8s/*.yaml; do
-            [ "$(basename "$f")" = "kustomization.yaml" ] && continue
-            [ "$(basename "$f")" = "secret.example.yaml" ] && continue
-            kubectl apply --dry-run=client --validate=false -f "$f"
+            ruby -ryaml -e 'YAML.load_stream(File.read(ARGV[0], encoding: "UTF-8"))' "$f" || exit 1
           done
+          test -s /tmp/kustomize-build.yaml
   workflows:
     name: Workflows · actionlint
     runs-on: ubuntu-latest
@@ -279,7 +281,7 @@ jobs:
       - name: Install actionlint
         run: |
           curl -sSfL -o download-actionlint.bash "https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash"
-          bash download-actionlint.bash v1.7.12
+          bash download-actionlint.bash 1.7.12
 
       - name: Lint workflow definitions
         run: ./actionlint -color
