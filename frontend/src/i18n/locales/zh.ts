@@ -773,5 +773,7 @@ export const zhCN: Record<string, string> = {
   "· ref {reference}": "· 单号 {reference}",
   "auto-refreshing every 5s while a run is in flight": "运行进行中时每 5 秒自动刷新",
   "The supervisor loops monitor → audience → creative → bidding → optimize. It produces proposals; nothing is applied without approval.": "监督者按 monitor → audience → creative → bidding → optimize 循环推进。它只产出提案；未经审批不会应用任何变更。",
+  "No events yet": "暂无事件",
+  "Nothing here yet": "暂无数据",
   // __I18N_APPEND__
 };
