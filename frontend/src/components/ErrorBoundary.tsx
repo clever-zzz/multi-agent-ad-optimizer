@@ -1,3 +1,4 @@
+import { tStatic } from "@/i18n/translate";
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/ui/Icon";
@@ -52,20 +53,19 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
           <span className="mx-auto grid size-12 place-items-center rounded-xl border border-neg/30 bg-neg/10 text-neg">
             <Icon name="warning" size={22} />
           </span>
-          <h1 className="mt-4 text-lg font-semibold text-ink-1">This view failed to render</h1>
+          <h1 className="mt-4 text-lg font-semibold text-ink-1">{tStatic("This view failed to render")}</h1>
           <p className="mt-2 text-sm leading-relaxed text-ink-3">
-            The rest of the console is still usable. Reloading re-fetches everything from the API;
-            nothing you approved is lost, because approvals are committed server-side.
+            {tStatic("The rest of the console is still usable. Reloading re-fetches everything from the API; nothing you approved is lost, because approvals are committed server-side.")}
           </p>
           <pre className="mt-4 max-h-40 overflow-auto rounded-lg border border-line bg-surface-1 p-3 text-left font-mono text-[11px] leading-relaxed text-neg">
             {error.message}
           </pre>
           <div className="mt-5 flex items-center justify-center gap-2">
             <Button variant="primary" icon="refresh" size="md" onClick={this.reload}>
-              Reload console
+              {tStatic("Reload console")}
             </Button>
             <Button variant="ghost" size="md" onClick={() => this.setState({ error: null })}>
-              Dismiss
+              {tStatic("Dismiss")}
             </Button>
           </div>
         </div>

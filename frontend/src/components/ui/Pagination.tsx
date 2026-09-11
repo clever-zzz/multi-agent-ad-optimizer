@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/Button";
 import { formatNumber } from "@/lib/format";
@@ -21,6 +22,7 @@ export function Pagination({
   pageSizeOptions = [20, 50, 100, 200],
   className,
 }: PaginationProps) {
+  const { t } = useI18n();
   const pageCount = pageSize > 0 ? Math.max(1, Math.ceil(total / pageSize)) : 1;
   const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const to = Math.min(total, page * pageSize);
@@ -33,12 +35,12 @@ export function Pagination({
       )}
     >
       <p className="tnum text-xs text-ink-3">
-        {formatNumber(from)}–{formatNumber(to)} of {formatNumber(total)}
+        {t("{from}–{to} of {total}", { from: formatNumber(from), to: formatNumber(to), total: formatNumber(total) })}
       </p>
       <div className="flex items-center gap-2">
         {onPageSizeChange && (
           <label className="flex items-center gap-1.5 text-xs text-ink-3">
-            Rows
+            {t("Rows")}
             <select
               value={pageSize}
               onChange={(event) => onPageSizeChange(Number(event.target.value))}
@@ -58,7 +60,7 @@ export function Pagination({
           icon="chevronLeft"
           disabled={page <= 1}
           onClick={() => onChange(page - 1)}
-          aria-label="Previous page"
+          aria-label={t("Previous page")}
         />
         <span className="tnum min-w-16 text-center text-xs text-ink-2">
           {page} / {pageCount}
@@ -69,7 +71,7 @@ export function Pagination({
           iconRight="chevronRight"
           disabled={page >= pageCount}
           onClick={() => onChange(page + 1)}
-          aria-label="Next page"
+          aria-label={t("Next page")}
         />
       </div>
     </div>

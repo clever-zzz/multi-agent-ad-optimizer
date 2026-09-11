@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { cn } from "@/lib/cn";
@@ -49,10 +50,12 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
     };
   }, [menuOpen]);
 
+  const { t, locale, setLocale } = useI18n();
+
   const handleLogout = async () => {
     setMenuOpen(false);
     await logout();
-    toast.info("Signed out", "Your refresh token was revoked.");
+    toast.info(t("Signed out"), t("Your refresh token was revoked."));
     navigate("/login", { replace: true });
   };
 
@@ -61,7 +64,7 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
       <button
         type="button"
         onClick={onMenu}
-        aria-label="Open navigation"
+        aria-label={t("Open navigation")}
         className="rounded-md p-1.5 text-ink-2 hover:bg-surface-3 hover:text-ink-1 lg:hidden"
       >
         <Icon name="menu" size={18} />
@@ -77,8 +80,8 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
           className="hidden items-center gap-2 rounded-lg border border-line bg-surface-2 px-2.5 py-1.5 sm:flex"
           title={
             degraded.length > 0
-              ? `Degraded: ${degraded.join(", ")}`
-              : "All critical dependencies healthy"
+              ? t("Degraded: {list}", { list: degraded.join(", ") })
+              : t("All critical dependencies healthy")
           }
         >
           <span
@@ -88,20 +91,30 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
             )}
           />
           <span className="text-[11px] font-medium text-ink-2">
-            {ready ? "All systems ready" : health ? `${degraded.length} degraded` : "Checking…"}
+            {ready ? t("All systems ready") : health ? t("{count} degraded", { count: degraded.length }) : t("Checking…")}
           </span>
           {health && (
             <span className="tnum hidden text-[11px] text-ink-3 md:inline">
-              up {formatDuration(new Date(Date.now() - health.uptime_seconds * 1000).toISOString())}
+              {t("up {duration}", { duration: formatDuration(new Date(Date.now() - health.uptime_seconds * 1000).toISOString()) })}
             </span>
           )}
         </div>
 
         {canTriggerRun && onNewRun && (
           <Button variant="primary" icon="play" onClick={onNewRun}>
-            New run
+            {t("New run")}
           </Button>
         )}
+
+        <button
+          type="button"
+          onClick={() => setLocale(locale === "zh-CN" ? "en" : "zh-CN")}
+          aria-label={t("Switch language")}
+          title={t("Switch language")}
+          className="rounded-lg border border-line bg-surface-2 px-2 py-1.5 text-[11px] font-medium text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink-1"
+        >
+          {locale === "zh-CN" ? "EN" : "中文"}
+        </button>
 
         <div className="relative" ref={menuRef}>
           <button
@@ -124,12 +137,12 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
             >
               <div className="border-b border-line px-3.5 py-3">
                 <p className="truncate text-[13px] font-semibold text-ink-1">
-                  {user?.full_name || "Operator"}
+                  {user?.full_name || t("Operator")}
                 </p>
                 <p className="truncate text-xs text-ink-3">{user?.email}</p>
                 <div className="mt-2 flex items-center gap-1.5">
-                  <Badge tone="brand">{user?.role ?? "unknown"}</Badge>
-                  {user?.must_change_password && <Badge tone="warning">password reset due</Badge>}
+                  <Badge tone="brand">{t(user?.role ?? "unknown")}</Badge>
+                  {user?.must_change_password && <Badge tone="warning">{t("password reset due")}</Badge>}
                 </div>
               </div>
               <div className="p-1.5">
@@ -143,7 +156,7 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
                   className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-[13px] text-ink-2 transition-colors hover:bg-surface-3 hover:text-ink-1"
                 >
                   <Icon name="sliders" size={15} />
-                  System settings
+                  {t("System settings")}
                 </button>
                 <button
                   type="button"
@@ -152,7 +165,7 @@ export function Topbar({ title, subtitle, onMenu, onNewRun, canTriggerRun = fals
                   className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-[13px] text-neg transition-colors hover:bg-neg/10"
                 >
                   <Icon name="logout" size={15} />
-                  Sign out
+                  {t("Sign out")}
                 </button>
               </div>
             </div>

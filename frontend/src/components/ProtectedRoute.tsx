@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import type { ReactNode } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
@@ -19,11 +20,12 @@ export function ProtectedRoute({ children, permission, adminOnly = false }: Prot
   const hydrated = useAuth((state) => state.hydrated);
   const user = useAuth((state) => state.user);
   const location = useLocation();
+  const { t } = useI18n();
 
   if (!hydrated) {
     return (
       <div className="grid min-h-screen place-items-center">
-        <Spinner label="Restoring session…" />
+        <Spinner label={t("Restoring session…")} />
       </div>
     );
   }
@@ -38,8 +40,8 @@ export function ProtectedRoute({ children, permission, adminOnly = false }: Prot
         <EmptyState
           tone="negative"
           icon="shield"
-          title="Administrator access required"
-          hint="This area reads the audit trail and runtime configuration, which the API restricts to the admin role."
+          title={t("Administrator access required")}
+          hint={t("This area reads the audit trail and runtime configuration, which the API restricts to the admin role.")}
         />
       </div>
     );
@@ -51,8 +53,8 @@ export function ProtectedRoute({ children, permission, adminOnly = false }: Prot
         <EmptyState
           tone="negative"
           icon="shield"
-          title="Insufficient permissions"
-          hint={`Your role (${user.role}) is not granted ${permission}.`}
+          title={t("Insufficient permissions")}
+          hint={t("Your role ({role}) is not granted {permission}.", { role: user.role, permission })}
         />
       </div>
     );

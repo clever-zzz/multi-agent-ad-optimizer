@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { Badge, type BadgeTone } from "@/components/ui/Badge";
 import { humanize } from "@/lib/format";
 
@@ -90,10 +91,11 @@ export interface StatusPillProps {
 }
 
 export function StatusPill({ domain, value, dot = true, label, className }: StatusPillProps) {
+  const { t } = useI18n();
   const tone = MAPS[domain][value] ?? "neutral";
   return (
     <Badge tone={tone} dot={dot} className={className}>
-      {label ?? humanize(value)}
+      {label ?? t(humanize(value))}
     </Badge>
   );
 }

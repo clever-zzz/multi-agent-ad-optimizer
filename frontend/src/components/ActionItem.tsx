@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { Link } from "react-router-dom";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/Button";
@@ -77,6 +78,7 @@ export function ActionItem({
   onExecute,
   className,
 }: ActionItemProps) {
+  const { t } = useI18n();
   const id = action.id ?? "";
   const pending = action.status === "proposed";
   const approved = action.status === "approved";
@@ -98,7 +100,7 @@ export function ActionItem({
             type="checkbox"
             checked={selected}
             onChange={(event) => onSelect(event.target.checked)}
-            aria-label={`Select proposal ${id}`}
+            aria-label={t("Select proposal {id}", { id })}
             disabled={!pending}
             className="mt-1 size-3.5 shrink-0 accent-[var(--color-brand-500)] disabled:opacity-40"
           />
@@ -120,7 +122,7 @@ export function ActionItem({
             <h3 className="text-[13px] font-semibold text-ink-1">
               {humanize(action.action_type)}
             </h3>
-            {highImpact && <Badge tone="warning">budget impact</Badge>}
+            {highImpact && <Badge tone="warning">{t("budget impact")}</Badge>}
             <StatusPill domain="action" value={action.status} />
           </div>
 
@@ -133,7 +135,7 @@ export function ActionItem({
               <span className="font-mono">{truncate(action.campaign_id, 18)}</span>
             )}
             <span>·</span>
-            <span>proposed by {action.proposed_by}</span>
+            <span>{t("proposed by {name}", { name: action.proposed_by })}</span>
             <span>·</span>
             <span>{formatDateTime(action.created_at)}</span>
           </p>
@@ -143,7 +145,7 @@ export function ActionItem({
           <p className={cn("tnum text-sm font-semibold", CONFIDENCE_TEXT[tone])}>
             {formatPercent(action.confidence, 0)}
           </p>
-          <p className="text-[10px] tracking-wide text-ink-3 uppercase">confidence</p>
+          <p className="text-[10px] tracking-wide text-ink-3 uppercase">{t("confidence")}</p>
         </div>
       </div>
 
@@ -176,9 +178,9 @@ export function ActionItem({
 
       {(action.approved_by || action.executed_at || action.external_reference) && (
         <p className="tnum text-[11px] text-ink-3">
-          {action.approved_by && <>approved by {action.approved_by} </>}
-          {action.executed_at && <>· executed {formatDateTime(action.executed_at)} </>}
-          {action.external_reference && <>· ref {action.external_reference}</>}
+          {action.approved_by && <>{t("approved by {name}", { name: action.approved_by })} </>}
+          {action.executed_at && <>{t("· executed {time}", { time: formatDateTime(action.executed_at) })} </>}
+          {action.external_reference && <>{t("· ref {reference}", { reference: action.external_reference })}</>}
         </p>
       )}
 
@@ -187,29 +189,29 @@ export function ActionItem({
           {pending && canApprove && onApprove && (
             <>
               <Button variant="success" icon="check" onClick={() => onApprove(false)} disabled={busy}>
-                Approve
+                {t("Approve")}
               </Button>
               {canExecute && onExecute && (
                 <Button variant="primary" icon="play" onClick={() => onApprove(true)} disabled={busy}>
-                  Approve &amp; execute
+                  {t("Approve & execute")}
                 </Button>
               )}
               {onReject && (
                 <Button variant="ghost" icon="close" onClick={onReject} disabled={busy} className="text-neg hover:bg-neg/10">
-                  Reject
+                  {t("Reject")}
                 </Button>
               )}
             </>
           )}
           {approved && canExecute && onExecute && (
             <Button variant="primary" icon="play" onClick={onExecute} disabled={busy} loading={busy}>
-              Execute now
+              {t("Execute now")}
             </Button>
           )}
           {action.run_id && (
             <Link to={`/runs/${action.run_id}`} className="ml-auto">
               <Button size="xs" variant="ghost" iconRight="external">
-                Open run
+                {t("Open run")}
               </Button>
             </Link>
           )}

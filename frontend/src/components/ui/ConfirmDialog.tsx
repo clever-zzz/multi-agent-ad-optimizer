@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import type { ReactNode } from "react";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
@@ -25,6 +26,7 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
+  const { t } = useI18n();
   return (
     <Modal
       open={open}
@@ -34,14 +36,14 @@ export function ConfirmDialog({
       footer={
         <>
           <Button variant="ghost" onClick={onCancel} disabled={busy}>
-            {cancelLabel}
+            {t(cancelLabel)}
           </Button>
           <Button
             variant={tone === "danger" ? "danger" : tone === "success" ? "success" : "primary"}
             onClick={onConfirm}
             loading={busy}
           >
-            {confirmLabel}
+            {t(confirmLabel)}
           </Button>
         </>
       }

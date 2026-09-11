@@ -1,5 +1,7 @@
 import type { ProblemDetail, TokenResponse } from "@/lib/types";
 
+import { tStatic } from "@/i18n/translate";
+
 // Empty base URL means "same origin", which in development is the Vite proxy and
 // in production is nginx. No backend host is ever baked into the client bundle.
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
@@ -12,7 +14,7 @@ export class ApiError extends Error {
   readonly fieldErrors: Array<{ loc: string; msg: string; type?: string }>;
 
   constructor(problem: ProblemDetail, fallbackTitle?: string) {
-    super(problem.detail || problem.title || fallbackTitle || "Request failed");
+    super(problem.detail || problem.title || fallbackTitle || tStatic("Request failed"));
     this.name = "ApiError";
     this.status = problem.status;
     this.type = problem.type;
@@ -101,7 +103,7 @@ async function parseProblem(response: Response): Promise<ProblemDetail> {
   } catch {
     return {
       type: "about:blank",
-      title: response.statusText || "Request failed",
+      title: response.statusText || tStatic("Request failed"),
       status: response.status,
       request_id: requestId,
     };

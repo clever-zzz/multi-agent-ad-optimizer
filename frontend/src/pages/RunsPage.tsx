@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
@@ -39,6 +40,7 @@ function summaryOf(run: Run): RunSummary | null {
 }
 
 export function RunsPage() {
+  const { t } = useI18n();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const user = useAuth((state) => state.user);
@@ -79,30 +81,32 @@ export function RunsPage() {
   const columns: Array<Column<Run>> = [
     {
       key: "id",
-      header: "Run ID",
+      header: t("Run ID"),
       cell: (row) => (
         <span className="font-mono text-xs text-brand-300">{truncate(row.id, 22)}</span>
       ),
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="run" value={row.status} /> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="run" value={row.status} /> },
     {
       key: "trigger",
-      header: "Trigger",
+      header: t("Trigger"),
       cell: (row) => <Badge tone={row.trigger_type === "manual" ? "brand" : "neutral"}>{row.trigger_type}</Badge>,
     },
     {
       key: "scope",
-      header: "Scope",
+      header: t("Scope"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
-          {row.campaign_ids.length === 0 ? "all campaigns" : `${row.campaign_ids.length} campaigns`}
+          {row.campaign_ids.length === 0
+            ? t("all campaigns")
+            : t("{count} campaigns", { count: row.campaign_ids.length })}
         </span>
       ),
     },
     {
       key: "iteration",
-      header: "Iterations",
+      header: t("Iterations"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -112,7 +116,7 @@ export function RunsPage() {
     },
     {
       key: "outcome",
-      header: "Outcome",
+      header: t("Outcome"),
       align: "right",
       cell: (row) => {
         const summary = summaryOf(row);
@@ -127,7 +131,7 @@ export function RunsPage() {
     },
     {
       key: "spend",
-      header: "Model spend",
+      header: t("Model spend"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -137,7 +141,7 @@ export function RunsPage() {
     },
     {
       key: "duration",
-      header: "Duration",
+      header: t("Duration"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -147,7 +151,7 @@ export function RunsPage() {
     },
     {
       key: "created",
-      header: "Started",
+      header: t("Started"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatRelative(row.created_at)}</span>,
     },
@@ -156,12 +160,12 @@ export function RunsPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Optimization runs"
-        description="Each run is one supervisor execution. Open a run to watch the agents work in real time."
+        title={t("Optimization runs")}
+        description={t("Each run is one supervisor execution. Open a run to watch the agents work in real time.")}
         actions={
           canTrigger && (
             <Button variant="primary" icon="play" onClick={() => setDialogOpen(true)}>
-              New run
+              {t("New run")}
             </Button>
           )
         }
@@ -171,9 +175,9 @@ export function RunsPage() {
         <div className="flex flex-wrap items-end gap-3 border-b border-line px-4 py-3">
           <SelectField
             wrapClassName="w-44"
-            label="Status"
+            label={t("Status")}
             value={status}
-            placeholder="All"
+            placeholder={t("All")}
             options={STATUS_OPTIONS}
             onChange={(event) => {
               setStatus(event.target.value as RunStatus | "");
@@ -181,12 +185,12 @@ export function RunsPage() {
             }}
           />
           <Button variant="ghost" icon="refresh" onClick={() => void runs.refetch()} loading={runs.isFetching}>
-            Refresh
+            {t("Refresh")}
           </Button>
           {anyActive && (
             <span className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-ink-3">
               <span className="size-1.5 rounded-full bg-pos live-dot" />
-              auto-refreshing every 5s while a run is in flight
+              {t("auto-refreshing every 5s while a run is in flight")}
             </span>
           )}
         </div>
@@ -203,8 +207,8 @@ export function RunsPage() {
           rowKey={(row) => row.id}
           loading={runs.isLoading}
           onRowClick={(row) => navigate(`/runs/${row.id}`)}
-          emptyTitle="No runs recorded"
-          emptyHint="Trigger the supervisor to analyse delivery and propose changes."
+          emptyTitle={t("No runs recorded")}
+          emptyHint={t("Trigger the supervisor to analyse delivery and propose changes.")}
           skeletonRows={8}
         />
 

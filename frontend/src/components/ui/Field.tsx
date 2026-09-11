@@ -5,6 +5,7 @@ import type {
   TextareaHTMLAttributes,
 } from "react";
 import { useId } from "react";
+import { tStatic } from "@/i18n/translate";
 import { cn } from "@/lib/cn";
 
 export interface FieldShellProps {
@@ -112,7 +113,7 @@ export function SelectField({
             {placeholder !== undefined && <option value="">{placeholder}</option>}
             {options.map((option) => (
               <option key={option.value} value={option.value} disabled={option.disabled}>
-                {option.label}
+                {tStatic(option.label)}
               </option>
             ))}
           </select>

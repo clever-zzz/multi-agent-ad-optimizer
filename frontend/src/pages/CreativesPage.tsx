@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -40,6 +41,14 @@ const TYPE_OPTIONS = [
   { value: "video", label: "Video" },
 ];
 
+// Origin values come from the API contract, so the display key is resolved here
+    // once and reused by both the filter options and the detail modal.
+function originLabelKey(origin: string): string {
+  if (origin === "llm") return "Model generated";
+  if (origin === "rule") return "Rule template";
+  return "Human authored";
+}
+
 const SORT_OPTIONS = [
   { value: "created_at", label: "Newest first" },
   { value: "score", label: "Highest score" },
@@ -48,6 +57,7 @@ const SORT_OPTIONS = [
 ];
 
 export function CreativesPage() {
+  const { t } = useI18n();
   const pagination = usePagination(25);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<CreativeStatus | "">("");
@@ -75,7 +85,7 @@ export function CreativesPage() {
 
   const originSlices = Object.entries(totals?.by_origin ?? {}).map(([key, value]) => ({
     id: key,
-    label: key === "llm" ? "Model generated" : key === "rule" ? "Rule template" : "Human authored",
+    label: t(originLabelKey(key)),
     value,
     color:
       key === "llm"
@@ -88,7 +98,7 @@ export function CreativesPage() {
   const columns: Array<Column<Creative>> = [
     {
       key: "headline",
-      header: "Creative",
+      header: t("Creative"),
       cell: (row) => (
         <div className="min-w-0">
           <p className="truncate text-[13px] font-medium text-ink-1">{row.headline}</p>
@@ -99,7 +109,7 @@ export function CreativesPage() {
     },
     {
       key: "campaign",
-      header: "Campaign",
+      header: t("Campaign"),
       cell: (row) => (
         <Link to={`/campaigns/${row.campaign_id}`} className="text-xs text-ink-2 hover:text-brand-300 hover:underline">
           {campaignNames.get(row.campaign_id) ?? truncate(row.campaign_id, 18)}
@@ -107,10 +117,10 @@ export function CreativesPage() {
       ),
       className: "max-w-44",
     },
-    { key: "type", header: "Type", cell: (row) => <Badge>{row.creative_type}</Badge> },
+    { key: "type", header: t("Type"), cell: (row) => <Badge>{row.creative_type}</Badge> },
     {
       key: "origin",
-      header: "Origin",
+      header: t("Origin"),
       cell: (row) => (
         <Badge tone={row.origin === "llm" ? "violet" : row.origin === "rule" ? "info" : "neutral"}>
           {row.origin === "llm" ? "model" : row.origin}
@@ -119,14 +129,14 @@ export function CreativesPage() {
     },
     {
       key: "emotion",
-      header: "Emotion",
+      header: t("Emotion"),
       cell: (row) => <span className="text-xs text-ink-2">{row.target_emotion || "—"}</span>,
     },
-    { key: "group", header: "Test group", cell: (row) => <span className="text-xs text-ink-2">{row.ab_group}</span> },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="creative" value={row.status} /> },
+    { key: "group", header: t("Test group"), cell: (row) => <span className="text-xs text-ink-2">{row.ab_group}</span> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="creative" value={row.status} /> },
     {
       key: "score",
-      header: "Score",
+      header: t("Score"),
       align: "right",
       cell: (row) =>
         row.score === null ? (
@@ -137,7 +147,7 @@ export function CreativesPage() {
     },
     {
       key: "created",
-      header: "Created",
+      header: t("Created"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatRelative(row.created_at)}</span>,
     },
@@ -146,7 +156,7 @@ export function CreativesPage() {
       header: "",
       align: "right",
       cell: (row) => (
-        <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label={`Inspect ${row.headline}`} />
+        <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label={t("Inspect {name}", { name: row.headline })} />
       ),
     },
   ];
@@ -154,43 +164,43 @@ export function CreativesPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Creative library"
-        description="Every headline the account can serve, with provenance. Model-generated copy is labelled as such and scored on live delivery rather than on how good it reads."
+        title={t("Creative library")}
+        description={t("Every headline the account can serve, with provenance. Model-generated copy is labelled as such and scored on live delivery rather than on how good it reads.")}
       />
 
       <div className="grid gap-3 lg:grid-cols-[repeat(3,minmax(0,1fr))_minmax(0,1.2fr)]">
         <StatCard
-          label="Total creatives"
+          label={t("Total creatives")}
           icon="sparkles"
           loading={summary.isLoading}
           value={formatNumber(totals?.total)}
-          hint={`${formatNumber(totals?.scored)} scored on delivery`}
+          hint={t("{count} scored on delivery", { count: formatNumber(totals?.scored) })}
         />
         <StatCard
-          label="Model authored"
+          label={t("Model authored")}
           icon="cpu"
           tone="violet"
           loading={summary.isLoading}
           value={formatNumber(totals?.generated)}
-          hint={`${formatPercent(totals?.generated_share, 1)} of the library`}
+          hint={t("{share} of the library", { share: formatPercent(totals?.generated_share, 1) })}
         />
         <StatCard
-          label="Awaiting review"
+          label={t("Awaiting review")}
           icon="eye"
           tone={(totals?.by_status.draft ?? 0) > 0 ? "warning" : "neutral"}
           loading={summary.isLoading}
           value={formatNumber(totals?.by_status.draft)}
-          hint="draft status"
+          hint={t("draft status")}
         />
-        <Card title="Provenance" subtitle="Where each creative came from">
+        <Card title={t("Provenance")} subtitle={t("Where each creative came from")}>
           {originSlices.length === 0 ? (
-            <p className="py-6 text-center text-xs text-ink-3">No creatives recorded yet.</p>
+            <p className="py-6 text-center text-xs text-ink-3">{t("No creatives recorded yet.")}</p>
           ) : (
             <Donut
               slices={originSlices}
               size={126}
               thickness={15}
-              centerLabel="creatives"
+              centerLabel={t("creatives")}
               centerValue={formatNumber(totals?.total ?? 0)}
             />
           )}
@@ -211,16 +221,16 @@ export function CreativesPage() {
                 setSearch(event.target.value);
                 pagination.reset();
               }}
-              placeholder="Search headline or body copy…"
-              aria-label="Search creatives"
+              placeholder={t("Search headline or body copy…")}
+              aria-label={t("Search creatives")}
               className="field pl-8"
             />
           </div>
           <SelectField
             wrapClassName="w-36"
-            label="Status"
+            label={t("Status")}
             value={status}
-            placeholder="All"
+            placeholder={t("All")}
             options={STATUS_OPTIONS}
             onChange={(event) => {
               setStatus(event.target.value as CreativeStatus | "");
@@ -229,9 +239,9 @@ export function CreativesPage() {
           />
           <SelectField
             wrapClassName="w-44"
-            label="Origin"
+            label={t("Origin")}
             value={origin}
-            placeholder="All origins"
+            placeholder={t("All origins")}
             options={ORIGIN_OPTIONS}
             onChange={(event) => {
               setOrigin(event.target.value as "human" | "llm" | "rule" | "");
@@ -240,9 +250,9 @@ export function CreativesPage() {
           />
           <SelectField
             wrapClassName="w-32"
-            label="Type"
+            label={t("Type")}
             value={type}
-            placeholder="All"
+            placeholder={t("All")}
             options={TYPE_OPTIONS}
             onChange={(event) => {
               setType(event.target.value as "text" | "image" | "video" | "");
@@ -251,7 +261,7 @@ export function CreativesPage() {
           />
           <SelectField
             wrapClassName="w-44"
-            label="Sort"
+            label={t("Sort")}
             value={sort}
             options={SORT_OPTIONS}
             onChange={(event) => {
@@ -273,8 +283,8 @@ export function CreativesPage() {
           rowKey={(row) => row.id}
           loading={library.isFetching}
           onRowClick={(row) => setDetail(row)}
-          emptyTitle="No creatives match"
-          emptyHint="Clear a filter, or run the optimizer — the creative agent writes variants for underperforming campaigns."
+          emptyTitle={t("No creatives match")}
+          emptyHint={t("Clear a filter, or run the optimizer — the creative agent writes variants for underperforming campaigns.")}
           skeletonRows={8}
         />
 
@@ -291,17 +301,24 @@ export function CreativesPage() {
         open={detail !== null}
         onClose={() => setDetail(null)}
         title={detail?.headline ?? ""}
-        description={detail ? `${humanize(detail.creative_type)} creative · ${detail.origin} authored` : undefined}
+        description={
+          detail
+            ? t("{type} creative · {origin}", {
+                type: humanize(detail.creative_type),
+                origin: t(originLabelKey(detail.origin)),
+              })
+            : undefined
+        }
         size="md"
         footer={
           <>
             <Button variant="ghost" onClick={() => setDetail(null)}>
-              Close
+              {t("Close")}
             </Button>
             {detail && (
               <Link to={`/campaigns/${detail.campaign_id}`}>
                 <Button variant="primary" iconRight="chevronRight">
-                  Open campaign
+                  {t("Open campaign")}
                 </Button>
               </Link>
             )}
@@ -319,15 +336,15 @@ export function CreativesPage() {
             </div>
 
             <div className="rounded-lg border border-line bg-surface-2 p-4">
-              <p className="text-[10px] tracking-wide text-ink-3 uppercase">Headline</p>
+              <p className="text-[10px] tracking-wide text-ink-3 uppercase">{t("Headline")}</p>
               <p className="mt-1 text-base font-semibold text-ink-1">{detail.headline}</p>
               {detail.description && (
                 <>
-                  <p className="mt-3 text-[10px] tracking-wide text-ink-3 uppercase">Body</p>
+                  <p className="mt-3 text-[10px] tracking-wide text-ink-3 uppercase">{t("Body")}</p>
                   <p className="mt-1 text-[13px] leading-relaxed text-ink-2">{detail.description}</p>
                 </>
               )}
-              <p className="mt-3 text-[10px] tracking-wide text-ink-3 uppercase">Call to action</p>
+              <p className="mt-3 text-[10px] tracking-wide text-ink-3 uppercase">{t("Call to action")}</p>
               <p className="mt-1 inline-flex rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-semibold text-white">
                 {detail.cta_text || "—"}
               </p>
@@ -335,10 +352,10 @@ export function CreativesPage() {
 
             <dl className="grid grid-cols-2 gap-3">
               {[
-                ["Campaign", campaignNames.get(detail.campaign_id) ?? detail.campaign_id],
-                ["Performance score", detail.score === null ? "unscored" : detail.score.toFixed(2)],
-                ["Generated by run", detail.generated_by_run_id ?? "—"],
-                ["Created", formatRelative(detail.created_at)],
+                [t("Campaign"), campaignNames.get(detail.campaign_id) ?? detail.campaign_id],
+                [t("Performance score"), detail.score === null ? t("unscored") : detail.score.toFixed(2)],
+                [t("Generated by run"), detail.generated_by_run_id ?? "—"],
+                [t("Created"), formatRelative(detail.created_at)],
               ].map(([label, value]) => (
                 <div key={label} className="min-w-0">
                   <dt className="text-[10px] tracking-wide text-ink-3 uppercase">{label}</dt>
@@ -352,7 +369,7 @@ export function CreativesPage() {
             {detail.generated_by_run_id && (
               <Link to={`/runs/${detail.generated_by_run_id}`} className="inline-flex items-center gap-1.5 text-xs text-brand-300 hover:underline">
                 <Icon name="external" size={12} />
-                Inspect the run that produced this creative
+                {t("Inspect the run that produced this creative")}
               </Link>
             )}
           </div>

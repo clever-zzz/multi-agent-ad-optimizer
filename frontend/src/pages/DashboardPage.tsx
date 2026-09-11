@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
@@ -55,6 +56,7 @@ export function DashboardPage() {
   const user = useAuth((state) => state.user);
   const [windowDays, setWindowDays] = useState<WindowValue>("7");
   const [trendDays, setTrendDays] = useState(30);
+  const { t } = useI18n();
 
   const days = Number(windowDays);
   const overview = useOverview(days);
@@ -76,23 +78,23 @@ export function DashboardPage() {
   const alertSlices = useMemo(() => {
     const bySeverity = data?.alerts.by_severity ?? {};
     return [
-      { id: "critical", label: "Critical", value: bySeverity.critical ?? 0, color: "var(--color-neg)" },
-      { id: "warning", label: "Warning", value: bySeverity.warning ?? 0, color: "var(--color-warn)" },
-      { id: "info", label: "Info", value: bySeverity.info ?? 0, color: "var(--color-accent-400)" },
+      { id: "critical", label: t("Critical"), value: bySeverity.critical ?? 0, color: "var(--color-neg)" },
+      { id: "warning", label: t("Warning"), value: bySeverity.warning ?? 0, color: "var(--color-warn)" },
+      { id: "info", label: t("Info"), value: bySeverity.info ?? 0, color: "var(--color-accent-400)" },
     ].filter((slice) => slice.value > 0);
-  }, [data]);
+  }, [data, t]);
 
   const actionSlices = useMemo(() => {
     const byStatus = data?.actions.by_status ?? {};
     return [
-      { id: "proposed", label: "Awaiting approval", value: byStatus.proposed ?? 0, color: "var(--color-brand-400)" },
-      { id: "approved", label: "Approved", value: byStatus.approved ?? 0, color: "var(--color-accent-400)" },
-      { id: "executed", label: "Executed", value: byStatus.executed ?? 0, color: "var(--color-pos)" },
-      { id: "rejected", label: "Rejected", value: byStatus.rejected ?? 0, color: "var(--color-ink-3)" },
-      { id: "failed", label: "Failed", value: byStatus.failed ?? 0, color: "var(--color-neg)" },
-      { id: "skipped", label: "Skipped", value: byStatus.skipped ?? 0, color: "var(--color-warn)" },
+      { id: "proposed", label: t("Awaiting approval"), value: byStatus.proposed ?? 0, color: "var(--color-brand-400)" },
+      { id: "approved", label: t("Approved"), value: byStatus.approved ?? 0, color: "var(--color-accent-400)" },
+      { id: "executed", label: t("Executed"), value: byStatus.executed ?? 0, color: "var(--color-pos)" },
+      { id: "rejected", label: t("Rejected"), value: byStatus.rejected ?? 0, color: "var(--color-ink-3)" },
+      { id: "failed", label: t("Failed"), value: byStatus.failed ?? 0, color: "var(--color-neg)" },
+      { id: "skipped", label: t("Skipped"), value: byStatus.skipped ?? 0, color: "var(--color-warn)" },
     ].filter((slice) => slice.value > 0);
-  }, [data]);
+  }, [data, t]);
 
   const healthScore = data?.health.score ?? 0;
   const healthTone =
@@ -101,27 +103,27 @@ export function DashboardPage() {
   const runColumns: Array<Column<Run>> = [
     {
       key: "id",
-      header: "Run",
+      header: t("Run"),
       cell: (row) => (
         <Link to={`/runs/${row.id}`} className="font-mono text-xs text-brand-300 hover:underline">
           {truncate(row.id, 18)}
         </Link>
       ),
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="run" value={row.status} /> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="run" value={row.status} /> },
     {
       key: "campaigns",
-      header: "Scope",
+      header: t("Scope"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
-          {row.campaign_ids.length === 0 ? "all" : row.campaign_ids.length}
+          {row.campaign_ids.length === 0 ? t("all") : row.campaign_ids.length}
         </span>
       ),
     },
     {
       key: "actions",
-      header: "Proposals",
+      header: t("Proposals"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -133,7 +135,7 @@ export function DashboardPage() {
     },
     {
       key: "cost",
-      header: "Model spend",
+      header: t("Model spend"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">{formatCurrency(row.llm_cost_usd, { digits: 4 })}</span>
@@ -141,7 +143,7 @@ export function DashboardPage() {
     },
     {
       key: "created",
-      header: "Started",
+      header: t("Started"),
       align: "right",
       cell: (row) => (
         <span className="text-xs text-ink-3">{formatRelative(row.created_at)}</span>
@@ -154,8 +156,8 @@ export function DashboardPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Portfolio overview"
-        description="Delivery, model output and outstanding operator work for the selected window."
+        title={t("Portfolio overview")}
+        description={t("Delivery, model output and outstanding operator work for the selected window.")}
         actions={
           <>
             <Tabs
@@ -166,7 +168,7 @@ export function DashboardPage() {
             />
             {can(user, "run:trigger") && (
               <Button variant="primary" icon="play" onClick={() => navigate("/runs?new=1")}>
-                New run
+                {t("New run")}
               </Button>
             )}
           </>
@@ -179,80 +181,80 @@ export function DashboardPage() {
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          label="Spend"
+          label={t("Spend")}
           icon="wallet"
           tone="brand"
           loading={loading}
           value={formatCurrency(portfolio?.total_cost, { compact: true })}
-          hint={`${days}-day window`}
+          hint={t("{days}-day window", { days })}
         />
         <StatCard
-          label="Revenue"
+          label={t("Revenue")}
           icon="trendUp"
           tone="positive"
           loading={loading}
           value={formatCurrency(portfolio?.total_revenue, { compact: true })}
-          hint={`${formatCompact(portfolio?.conversions)} conversions`}
+          hint={t("{count} conversions", { count: formatCompact(portfolio?.conversions) })}
         />
         <StatCard
-          label="ROAS"
+          label={t("ROAS")}
           icon="target"
           tone={(portfolio?.roas ?? 0) >= 2 ? "positive" : "warning"}
           loading={loading}
           value={formatRatio(portfolio?.roas)}
-          hint="revenue ÷ spend"
+          hint={t("revenue ÷ spend")}
         />
         <StatCard
-          label="CPA"
+          label={t("CPA")}
           icon="users"
           tone="neutral"
           loading={loading}
           value={formatCurrency(portfolio?.cpa)}
-          hint="cost per acquisition"
+          hint={t("cost per acquisition")}
         />
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          label="CTR"
+          label={t("CTR")}
           icon="eye"
           loading={loading}
           value={formatPercent(portfolio?.ctr)}
-          hint={`${formatCompact(portfolio?.clicks)} clicks / ${formatCompact(portfolio?.impressions)} impressions`}
+          hint={t("{clicks} clicks / {impressions} impressions", { clicks: formatCompact(portfolio?.clicks), impressions: formatCompact(portfolio?.impressions) })}
         />
         <StatCard
-          label="CVR"
+          label={t("CVR")}
           icon="check"
           loading={loading}
           value={formatPercent(portfolio?.cvr)}
-          hint="click → conversion"
+          hint={t("click → conversion")}
         />
         <StatCard
-          label="Health score"
+          label={t("Health score")}
           icon="activity"
           tone={healthTone}
           loading={loading}
           value={data ? data.health.score.toFixed(1) : "—"}
           unit="/ 100"
-          hint={data?.health.status ?? "composite of ROAS, CPA and volume"}
+          hint={t(data?.health.status ?? "composite of ROAS, CPA and volume")}
         />
         <StatCard
-          label="Needs approval"
+          label={t("Needs approval")}
           icon="checkSquare"
           tone={(data?.actions.pending ?? 0) > 0 ? "warning" : "neutral"}
           loading={loading}
           value={formatNumber(data?.actions.pending)}
           hint={
             <Link to="/actions" className="text-brand-300 hover:underline">
-              open the queue →
+              {t("open the queue →")}
             </Link>
           }
         />
       </div>
 
       <Card
-        title="Delivery trend"
-        subtitle={`Daily spend, revenue and ROAS across the last ${trendDays} days`}
+        title={t("Delivery trend")}
+        subtitle={t("Daily spend, revenue and ROAS across the last {days} days", { days: trendDays })}
         actions={
           <Tabs
             size="sm"
@@ -271,7 +273,7 @@ export function DashboardPage() {
         ) : (
           <TrendChart
             data={trendData}
-            series={TREND_SERIES}
+            series={TREND_SERIES.map((series) => ({ ...series, label: t(series.label) }))}
             height={260}
             yLeftLabel="USD"
             yRightLabel="ROAS"
@@ -280,7 +282,7 @@ export function DashboardPage() {
       </Card>
 
       <div className="grid gap-3 lg:grid-cols-3">
-        <Card title="Top campaigns by ROAS" subtitle="Best performing in window">
+        <Card title={t("Top campaigns by ROAS")} subtitle={t("Best performing in window")}>
           {loading ? (
             <Skeleton className="h-40 w-full" />
           ) : (
@@ -290,16 +292,16 @@ export function DashboardPage() {
                 label: campaign.campaign_name || truncate(campaign.campaign_id, 22),
                 value: campaign.roas,
                 tone: campaign.roas >= 2 ? "positive" : "warning",
-                hint: `${formatCurrency(campaign.cost, { compact: true })} spend · ${formatNumber(campaign.conversions)} conv`,
+                hint: t("{spend} spend · {conv} conv", { spend: formatCurrency(campaign.cost, { compact: true }), conv: formatNumber(campaign.conversions) }),
                 onClick: () => navigate(`/campaigns/${campaign.campaign_id}`),
               }))}
               format={(value) => `${value.toFixed(2)}x`}
-              emptyLabel="No delivery in this window"
+              emptyLabel={t("No delivery in this window")}
             />
           )}
         </Card>
 
-        <Card title="Needs attention" subtitle="Worst ROAS in window">
+        <Card title={t("Needs attention")} subtitle={t("Worst ROAS in window")}>
           {loading ? (
             <Skeleton className="h-40 w-full" />
           ) : (
@@ -309,23 +311,23 @@ export function DashboardPage() {
                 label: campaign.campaign_name || truncate(campaign.campaign_id, 22),
                 value: campaign.roas,
                 tone: campaign.roas < 1 ? "negative" : "warning",
-                hint: `CTR ${formatPercent(campaign.ctr)} · CPA ${formatCurrency(campaign.cpa)}`,
+                hint: t("CTR {ctr} · CPA {cpa}", { ctr: formatPercent(campaign.ctr), cpa: formatCurrency(campaign.cpa) }),
                 onClick: () => navigate(`/campaigns/${campaign.campaign_id}`),
               }))}
               format={(value) => `${value.toFixed(2)}x`}
-              emptyLabel="No delivery in this window"
+              emptyLabel={t("No delivery in this window")}
             />
           )}
         </Card>
 
         <div className="flex flex-col gap-3">
           <Card
-            title="Open alerts"
-            subtitle={`${formatNumber(data?.alerts.open ?? 0)} unresolved`}
+            title={t("Open alerts")}
+            subtitle={t("{count} unresolved", { count: formatNumber(data?.alerts.open ?? 0) })}
             actions={
               <Link to="/alerts">
                 <Button size="xs" variant="ghost" iconRight="chevronRight">
-                  View
+                  {t("View")}
                 </Button>
               </Link>
             }
@@ -338,8 +340,8 @@ export function DashboardPage() {
                   <Icon name="check" size={15} />
                 </span>
                 <div>
-                  <p className="text-[13px] font-medium text-ink-1">All clear</p>
-                  <p className="text-xs text-ink-3">No open anomalies in this window.</p>
+                  <p className="text-[13px] font-medium text-ink-1">{t("All clear")}</p>
+                  <p className="text-xs text-ink-3">{t("No open anomalies in this window.")}</p>
                 </div>
               </div>
             ) : (
@@ -347,33 +349,33 @@ export function DashboardPage() {
                 slices={alertSlices}
                 size={132}
                 thickness={15}
-                centerLabel="open"
+                centerLabel={t("open")}
                 centerValue={formatNumber(data?.alerts.open ?? 0)}
               />
             )}
           </Card>
 
-          <Card title="Campaign fleet" subtitle="Lifecycle distribution">
+          <Card title={t("Campaign fleet")} subtitle={t("Lifecycle distribution")}>
             {loading ? (
               <Skeleton className="h-20 w-full" />
             ) : (
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs text-ink-3">Total</span>
+                  <span className="text-xs text-ink-3">{t("Total")}</span>
                   <span className="tnum text-sm font-semibold text-ink-1">
                     {formatNumber(data?.campaigns.total ?? 0)}
                   </span>
                 </div>
                 <div className="flex gap-2">
                   <Badge tone="positive" dot>
-                    {formatNumber(data?.campaigns.active ?? 0)} active
+                    {formatNumber(data?.campaigns.active ?? 0)} {t("active")}
                   </Badge>
                   <Badge tone="warning" dot>
-                    {formatNumber(data?.campaigns.paused ?? 0)} paused
+                    {formatNumber(data?.campaigns.paused ?? 0)} {t("paused")}
                   </Badge>
                 </div>
                 <Link to="/campaigns" className="mt-1 inline-flex items-center gap-1 text-xs text-brand-300 hover:underline">
-                  Manage campaigns
+                  {t("Manage campaigns")}
                   <Icon name="chevronRight" size={12} />
                 </Link>
               </div>
@@ -385,13 +387,13 @@ export function DashboardPage() {
       <div className="grid gap-3 lg:grid-cols-3">
         <Card
           className="lg:col-span-2"
-          title="Recent optimization runs"
-          subtitle="Latest supervisor executions"
+          title={t("Recent optimization runs")}
+          subtitle={t("Latest supervisor executions")}
           padded={false}
           actions={
             <Link to="/runs">
               <Button size="xs" variant="ghost" iconRight="chevronRight">
-                All runs
+                {t("All runs")}
               </Button>
             </Link>
           }
@@ -401,26 +403,26 @@ export function DashboardPage() {
             rows={runs.data?.items ?? []}
             rowKey={(row) => row.id}
             loading={runs.isLoading}
-            error={runs.isError ? "Could not load recent runs" : undefined}
+            error={runs.isError ? t("Could not load recent runs") : undefined}
             onRowClick={(row) => navigate(`/runs/${row.id}`)}
-            emptyTitle="No runs yet"
-            emptyHint="Trigger the supervisor to analyse delivery and propose changes."
+            emptyTitle={t("No runs yet")}
+            emptyHint={t("Trigger the supervisor to analyse delivery and propose changes.")}
             skeletonRows={4}
             dense
           />
         </Card>
 
-        <Card title="Action pipeline" subtitle="Where proposals stand">
+        <Card title={t("Action pipeline")} subtitle={t("Where proposals stand")}>
           {loading ? (
             <Skeleton className="h-40 w-full" />
           ) : actionSlices.length === 0 ? (
-            <p className="py-6 text-center text-xs text-ink-3">No proposals recorded yet.</p>
+            <p className="py-6 text-center text-xs text-ink-3">{t("No proposals recorded yet.")}</p>
           ) : (
             <Donut
               slices={actionSlices}
               size={150}
               thickness={17}
-              centerLabel="proposals"
+              centerLabel={t("proposals")}
               centerValue={formatNumber(
                 actionSlices.reduce((sum, slice) => sum + slice.value, 0),
               )}

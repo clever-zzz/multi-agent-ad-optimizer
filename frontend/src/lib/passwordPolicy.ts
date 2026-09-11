@@ -1,5 +1,6 @@
 // Mirrors AuthService.validate_password_strength in backend/services/auth.py.
 // SECURITY__PASSWORD_MIN_LENGTH defaults to 10 and is bounded at >= 8 server side.
+import { tStatic } from "@/i18n/translate";
 export const PASSWORD_MIN_LENGTH = 10;
 export const PASSWORD_SYMBOLS = "!@#$%^&*()-_=+[]{};:,.<>/?";
 
@@ -15,7 +16,17 @@ export function passwordProblems(password: string, minLength = PASSWORD_MIN_LENG
   return problems;
 }
 
+export function localizePasswordProblem(problem: string): string {
+  if (problem.startsWith("at least ")) {
+    return tStatic("at least {min} characters", { min: problem.split(" ")[2] });
+  }
+  return tStatic(problem);
+}
+
 export function passwordProblemText(password: string, minLength = PASSWORD_MIN_LENGTH): string | undefined {
   const problems = passwordProblems(password, minLength);
-  return problems.length > 0 ? `Password needs ${problems.join(", ")}` : undefined;
+  if (problems.length === 0) return undefined;
+  return tStatic("Password needs {problems}", {
+    problems: problems.map(localizePasswordProblem).join(", "),
+  });
 }

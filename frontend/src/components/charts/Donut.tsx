@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useState } from "react";
 import { cn } from "@/lib/cn";
 
@@ -40,6 +41,7 @@ export function Donut({
   format = (value) => String(Math.round(value)),
   className,
 }: DonutProps) {
+  const { t } = useI18n();
   const [active, setActive] = useState<string | null>(null);
   const total = slices.reduce((sum, slice) => sum + Math.max(0, slice.value), 0);
   const radius = (size - thickness) / 2;
@@ -48,7 +50,7 @@ export function Donut({
   if (total <= 0) {
     return (
       <div className={cn("grid place-items-center", className)} style={{ width: size, height: size }}>
-        <p className="text-xs text-ink-3">No data</p>
+        <p className="text-xs text-ink-3">{t("No data")}</p>
       </div>
     );
   }
@@ -66,7 +68,7 @@ export function Donut({
   return (
     <div className={cn("flex flex-wrap items-center gap-5", className)}>
       <div className="relative shrink-0" style={{ width: size, height: size }}>
-        <svg width={size} height={size} role="img" aria-label={centerLabel ?? "Distribution"}>
+        <svg width={size} height={size} role="img" aria-label={centerLabel ?? t("Distribution")}>
           <circle
             cx={center}
             cy={center}
@@ -95,7 +97,7 @@ export function Donut({
             {activeSlice ? format(activeSlice.value) : (centerValue ?? format(total))}
           </span>
           <span className="max-w-24 truncate text-[11px] text-ink-3">
-            {activeSlice ? activeSlice.label : (centerLabel ?? "Total")}
+            {activeSlice ? activeSlice.label : (centerLabel ?? t("Total"))}
           </span>
         </div>
       </div>

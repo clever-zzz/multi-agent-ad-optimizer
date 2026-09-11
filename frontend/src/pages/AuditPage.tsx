@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useState } from "react";
 
 import { PageHeader } from "@/components/PageHeader";
@@ -31,6 +32,7 @@ const SENSITIVE = new Set([
 ]);
 
 export function AuditPage() {
+  const { t } = useI18n();
   const pagination = usePagination(50);
   const [action, setAction] = useState("");
   const [resourceType, setResourceType] = useState("");
@@ -48,23 +50,23 @@ export function AuditPage() {
   const columns: Array<Column<AuditEntry>> = [
     {
       key: "created",
-      header: "Timestamp",
+      header: t("Timestamp"),
       cell: (row) => <span className="tnum text-xs text-ink-2">{formatDateTime(row.created_at)}</span>,
     },
     {
       key: "actor",
-      header: "Actor",
+      header: t("Actor"),
       cell: (row) => (
         <div className="min-w-0">
-          <p className="truncate text-[13px] text-ink-1">{row.actor_email || "system"}</p>
-          <p className="text-[11px] text-ink-3">{row.actor_role || "—"}</p>
+          <p className="truncate text-[13px] text-ink-1">{row.actor_email || t("system")}</p>
+          <p className="text-[11px] text-ink-3">{t(row.actor_role || "—")}</p>
         </div>
       ),
       className: "max-w-52",
     },
     {
       key: "action",
-      header: "Action",
+      header: t("Action"),
       cell: (row) => (
         <span className="flex items-center gap-1.5">
           {SENSITIVE.has(row.action) && <Icon name="warning" size={12} className="shrink-0 text-warn" />}
@@ -74,7 +76,7 @@ export function AuditPage() {
     },
     {
       key: "resource",
-      header: "Resource",
+      header: t("Resource"),
       cell: (row) => (
         <span className="text-xs text-ink-2">
           <Badge>{humanize(row.resource_type)}</Badge>{" "}
@@ -84,12 +86,12 @@ export function AuditPage() {
     },
     {
       key: "ip",
-      header: "Source IP",
+      header: t("Source IP"),
       cell: (row) => <span className="font-mono text-xs text-ink-3">{row.ip_address || "—"}</span>,
     },
     {
       key: "request",
-      header: "Request ID",
+      header: t("Request ID"),
       cell: (row) => <span className="font-mono text-[11px] text-ink-3">{truncate(row.request_id, 14)}</span>,
     },
     {
@@ -98,8 +100,8 @@ export function AuditPage() {
       align: "right",
       cell: (row) =>
         row.before || row.after ? (
-          <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label="Inspect change">
-            Diff
+          <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label={t("Inspect change")}>
+            {t("Diff")}
           </Button>
         ) : (
           <span className="text-xs text-ink-3">—</span>
@@ -110,17 +112,17 @@ export function AuditPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Audit log"
-        description="Append-only record of every privileged operation, with the before and after state of the resource it touched. Correlate any entry to a request via its request ID."
+        title={t("Audit log")}
+        description={t("Append-only record of every privileged operation, with the before and after state of the resource it touched. Correlate any entry to a request via its request ID.")}
       />
 
       <Card padded={false}>
         <div className="flex flex-wrap items-end gap-3 border-b border-line px-4 py-3">
           <TextField
             wrapClassName="w-56"
-            label="Action"
+            label={t("Action")}
             value={action}
-            placeholder="e.g. action.approved"
+            placeholder={t("e.g. action.approved")}
             onChange={(event) => {
               setAction(event.target.value);
               pagination.reset();
@@ -128,9 +130,9 @@ export function AuditPage() {
           />
           <TextField
             wrapClassName="w-48"
-            label="Resource type"
+            label={t("Resource type")}
             value={resourceType}
-            placeholder="e.g. campaign"
+            placeholder={t("e.g. campaign")}
             onChange={(event) => {
               setResourceType(event.target.value);
               pagination.reset();
@@ -146,11 +148,11 @@ export function AuditPage() {
                 pagination.reset();
               }}
             >
-              Clear
+              {t("Clear")}
             </Button>
           )}
           <Button className="ml-auto" variant="ghost" icon="refresh" onClick={() => void audit.refetch()} loading={audit.isFetching}>
-            Refresh
+            {t("Refresh")}
           </Button>
         </div>
 
@@ -166,8 +168,8 @@ export function AuditPage() {
           rowKey={(row) => row.id}
           loading={audit.isFetching}
           onRowClick={(row) => (row.before || row.after ? setDetail(row) : undefined)}
-          emptyTitle="No audit entries"
-          emptyHint="Entries appear as soon as an operator or the optimizer changes state."
+          emptyTitle={t("No audit entries")}
+          emptyHint={t("Entries appear as soon as an operator or the optimizer changes state.")}
           skeletonRows={10}
           dense
         />
@@ -186,11 +188,11 @@ export function AuditPage() {
         open={detail !== null}
         onClose={() => setDetail(null)}
         title={detail ? detail.action : ""}
-        description={detail ? `${detail.actor_email || "system"} · ${formatDateTime(detail.created_at)}` : undefined}
+        description={detail ? t("{actor} · {time}", { actor: detail.actor_email || t("system"), time: formatDateTime(detail.created_at) }) : undefined}
         size="lg"
         footer={
           <Button variant="ghost" onClick={() => setDetail(null)}>
-            Close
+            {t("Close")}
           </Button>
         }
       >
@@ -198,10 +200,10 @@ export function AuditPage() {
           <div className="flex flex-col gap-3.5">
             <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               {[
-                ["Actor role", detail.actor_role || "—"],
-                ["Resource", humanize(detail.resource_type)],
-                ["Resource ID", detail.resource_id ?? "—"],
-                ["Source IP", detail.ip_address || "—"],
+                [t("Actor role"), t(detail.actor_role || "—")],
+                [t("Resource"), humanize(detail.resource_type)],
+                [t("Resource ID"), detail.resource_id ?? "—"],
+                [t("Source IP"), detail.ip_address || "—"],
               ].map(([label, value]) => (
                 <div key={label} className="min-w-0">
                   <dt className="text-[10px] tracking-wide text-ink-3 uppercase">{label}</dt>
@@ -214,13 +216,13 @@ export function AuditPage() {
 
             <div className="grid gap-3 lg:grid-cols-2">
               <div>
-                <p className="mb-1.5 text-[10px] tracking-wide text-neg uppercase">Before</p>
+                <p className="mb-1.5 text-[10px] tracking-wide text-neg uppercase">{t("Before")}</p>
                 <pre className="max-h-72 overflow-auto rounded-lg border border-neg/25 bg-neg/5 p-3 font-mono text-[11px] leading-relaxed text-ink-2">
                   {detail.before ? JSON.stringify(detail.before, null, 2) : "null"}
                 </pre>
               </div>
               <div>
-                <p className="mb-1.5 text-[10px] tracking-wide text-pos uppercase">After</p>
+                <p className="mb-1.5 text-[10px] tracking-wide text-pos uppercase">{t("After")}</p>
                 <pre className="max-h-72 overflow-auto rounded-lg border border-pos/25 bg-pos/5 p-3 font-mono text-[11px] leading-relaxed text-ink-2">
                   {detail.after ? JSON.stringify(detail.after, null, 2) : "null"}
                 </pre>

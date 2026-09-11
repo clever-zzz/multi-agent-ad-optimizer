@@ -49,4 +49,10 @@ export default [
     files: ["src/**/*.test.{ts,tsx}", "src/test/**/*.{ts,tsx}"],
     rules: { "react-refresh/only-export-components": "off" },
   },
+  {
+    // The i18n module intentionally co-locates the provider, the context and the
+    // useI18n hook; HMR granularity is irrelevant for a locale switcher.
+    files: ["src/i18n/**/*.{ts,tsx}"],
+    rules: { "react-refresh/only-export-components": "off" },
+  },
 ];

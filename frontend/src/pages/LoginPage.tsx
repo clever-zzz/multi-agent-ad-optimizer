@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useState, type FormEvent } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { cn } from "@/lib/cn";
@@ -40,6 +41,7 @@ export function LoginPage() {
   const status = useAuth((state) => state.status);
   const user = useAuth((state) => state.user);
   const { data: readiness } = useReadiness({ refetchMs: 60_000 });
+  const { t, locale, setLocale } = useI18n();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -58,16 +60,16 @@ export function LoginPage() {
     setFieldError(undefined);
     try {
       const account = await login(email.trim(), password);
-      toast.success(`Welcome back, ${account.full_name || account.email}`);
+      toast.success(t("Welcome back, {name}", { name: account.full_name || account.email }));
       navigate(from, { replace: true });
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 401) {
-        setError("Those credentials were not accepted.");
-        setFieldError("Check the email and password, then try again.");
+        setError(t("Those credentials were not accepted."));
+        setFieldError(t("Check the email and password, then try again."));
       } else if (caught instanceof ApiError && caught.status === 429) {
-        setError("Too many sign-in attempts. Wait a moment before retrying.");
+        setError(t("Too many sign-in attempts. Wait a moment before retrying."));
       } else {
-        setError(caught instanceof Error ? caught.message : "Sign-in failed.");
+        setError(caught instanceof Error ? caught.message : t("Sign-in failed."));
       }
     }
   };
@@ -91,16 +93,15 @@ export function LoginPage() {
             </span>
             <div>
               <p className="text-base font-semibold text-ink-1">AdOptimizer</p>
-              <p className="text-xs text-ink-3">Multi-agent advertising optimization platform</p>
+              <p className="text-xs text-ink-3">{t("Multi-agent advertising optimization platform")}</p>
             </div>
           </div>
 
           <h1 className="mt-12 max-w-lg text-3xl leading-tight font-semibold tracking-tight text-ink-1">
-            A production control room for paid media, not a demo script.
+            {t("A production control room for paid media, not a demo script.")}
           </h1>
           <p className="mt-3 max-w-lg text-sm leading-relaxed text-ink-2">
-            Deterministic statistics decide what is true about your delivery. Models only write copy
-            and justify trade-offs. Nothing reaches an ad platform without an explicit approval.
+            {t("Deterministic statistics decide what is true about your delivery. Models only write copy and justify trade-offs. Nothing reaches an ad platform without an explicit approval.")}
           </p>
 
           <ul className="mt-9 grid max-w-xl gap-4 sm:grid-cols-2">
@@ -109,16 +110,15 @@ export function LoginPage() {
                 <span className="grid size-7 place-items-center rounded-lg border border-brand-600/30 bg-brand-600/12 text-brand-300">
                   <Icon name={item.icon} size={14} />
                 </span>
-                <p className="mt-2.5 text-[13px] font-semibold text-ink-1">{item.title}</p>
-                <p className="mt-1 text-xs leading-relaxed text-ink-3">{item.body}</p>
+                <p className="mt-2.5 text-[13px] font-semibold text-ink-1">{t(item.title)}</p>
+                <p className="mt-1 text-xs leading-relaxed text-ink-3">{t(item.body)}</p>
               </li>
             ))}
           </ul>
         </div>
 
         <p className="relative mt-10 text-[11px] text-ink-3">
-          Wilson intervals and empirical-Bayes shrinkage keep low-volume campaigns from producing
-          confident nonsense.
+          {t("Wilson intervals and empirical-Bayes shrinkage keep low-volume campaigns from producing confident nonsense.")}
         </p>
       </div>
 
@@ -131,9 +131,19 @@ export function LoginPage() {
             <p className="text-sm font-semibold text-ink-1">AdOptimizer</p>
           </div>
 
-          <h2 className="text-xl font-semibold tracking-tight text-ink-1">Sign in</h2>
+          <div className="mb-3 flex justify-end">
+            <button
+              type="button"
+              onClick={() => setLocale(locale === "zh-CN" ? "en" : "zh-CN")}
+              className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-3 transition-colors hover:bg-surface-2 hover:text-ink-1"
+            >
+              {locale === "zh-CN" ? "English" : "简体中文"}
+            </button>
+          </div>
+
+          <h2 className="text-xl font-semibold tracking-tight text-ink-1">{t("Sign in")}</h2>
           <p className="mt-1 text-[13px] text-ink-3">
-            Use the account your administrator provisioned.
+            {t("Use the account your administrator provisioned.")}
           </p>
 
           <div className="mt-4 flex items-center gap-2 rounded-lg border border-line bg-surface-1 px-3 py-2">
@@ -143,9 +153,9 @@ export function LoginPage() {
             <span className="text-[11px] text-ink-3">
               {readiness
                 ? backendReady
-                  ? `API ready · v${readiness.version} · ${readiness.environment}`
-                  : `API degraded · ${Object.keys(readiness.dependencies).length} dependencies checked`
-                : "Checking API reachability…"}
+                  ? t("API ready · v{version} · {environment}", { version: readiness.version, environment: readiness.environment })
+                  : t("API degraded · {count} dependencies checked", { count: Object.keys(readiness.dependencies).length })
+                : t("Checking API reachability…")}
             </span>
           </div>
 
@@ -161,7 +171,7 @@ export function LoginPage() {
             )}
 
             <TextField
-              label="Work email"
+              label={t("Work email")}
               type="email"
               name="email"
               autoComplete="username"
@@ -172,7 +182,7 @@ export function LoginPage() {
               autoFocus
             />
             <TextField
-              label="Password"
+              label={t("Password")}
               type="password"
               name="password"
               autoComplete="current-password"
@@ -191,21 +201,20 @@ export function LoginPage() {
               loading={status === "authenticating"}
               disabled={!email || !password}
             >
-              Sign in
+              {t("Sign in")}
             </Button>
           </form>
 
           <div className="card mt-6 p-3.5">
             <p className="text-[11px] font-semibold tracking-wide text-ink-3 uppercase">
-              Local development
+              {t("Local development")}
             </p>
             <p className="mt-1.5 text-xs leading-relaxed text-ink-2">
-              The bootstrap administrator is created on first start from{" "}
+              {t("The bootstrap administrator is created on first start from")}{" "}
               <code className="rounded bg-surface-3 px-1 py-0.5 font-mono text-[11px] text-brand-300">
                 SECURITY__BOOTSTRAP_ADMIN_EMAIL
               </code>
-              . Rotate it immediately after the first sign-in — the account is flagged
-              must-change-password.
+              {t(". Rotate it immediately after the first sign-in — the account is flagged must-change-password.")}
             </p>
             <button
               type="button"
@@ -216,7 +225,7 @@ export function LoginPage() {
               className="mt-2.5 inline-flex items-center gap-1.5 text-[11px] font-medium text-brand-300 hover:text-brand-400"
             >
               <Icon name="plus" size={11} />
-              Fill the default bootstrap credentials
+              {t("Fill the default bootstrap credentials")}
             </button>
           </div>
         </div>

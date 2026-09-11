@@ -1,3 +1,4 @@
+import { useI18n, localizeOptions } from "@/i18n";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -54,6 +55,7 @@ const RULE_EXPLAINERS: Record<AlertRule, string> = {
 };
 
 export function AlertsPage() {
+  const { t } = useI18n();
   const user = useAuth((state) => state.user);
   const canAck = can(user, "alert:ack");
 
@@ -85,8 +87,16 @@ export function AlertsPage() {
     mutation.mutate(
       { alertId: alert.id },
       {
-        onSuccess: () => toast.success(`Alert ${verb}`, humanize(alert.rule)),
-        onError: (error) => toast.error(`Could not ${verb} alert`, (error as Error).message),
+        onSuccess: () =>
+          toast.success(
+            verb === "acknowledged" ? t("Alert acknowledged") : t("Alert resolved"),
+            humanize(alert.rule),
+          ),
+        onError: (error) =>
+          toast.error(
+            verb === "acknowledged" ? t("Could not acknowledge alert") : t("Could not resolve alert"),
+            (error as Error).message,
+          ),
       },
     );
   };
@@ -94,23 +104,23 @@ export function AlertsPage() {
   const columns: Array<Column<Alert>> = [
     {
       key: "severity",
-      header: "Severity",
+      header: t("Severity"),
       cell: (row) => <StatusPill domain="severity" value={row.severity} />,
     },
     {
       key: "rule",
-      header: "Rule",
+      header: t("Rule"),
       cell: (row) => (
         <div className="min-w-0">
           <p className="text-[13px] font-medium text-ink-1">{humanize(row.rule)}</p>
-          <p className="truncate text-[11px] text-ink-3">{RULE_EXPLAINERS[row.rule]}</p>
+          <p className="truncate text-[11px] text-ink-3">{t(RULE_EXPLAINERS[row.rule])}</p>
         </div>
       ),
       className: "max-w-72",
     },
     {
       key: "campaign",
-      header: "Campaign",
+      header: t("Campaign"),
       cell: (row) => (
         <Link to={`/campaigns/${row.campaign_id}`} className="text-xs text-ink-2 hover:text-brand-300 hover:underline">
           {campaignNames.get(row.campaign_id) ?? truncate(row.campaign_id, 20)}
@@ -120,13 +130,13 @@ export function AlertsPage() {
     },
     {
       key: "message",
-      header: "Detail",
+      header: t("Detail"),
       cell: (row) => <span className="text-xs text-ink-2">{truncate(row.message, 90)}</span>,
       className: "max-w-sm",
     },
     {
       key: "observed",
-      header: "Observed",
+      header: t("Observed"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs">
@@ -137,10 +147,10 @@ export function AlertsPage() {
         </span>
       ),
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="alert" value={row.status} /> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="alert" value={row.status} /> },
     {
       key: "detected",
-      header: "Detected",
+      header: t("Detected"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatDateTime(row.detected_at)}</span>,
     },
@@ -157,7 +167,7 @@ export function AlertsPage() {
               onClick={() => act(acknowledge, row, "acknowledged")}
               disabled={acknowledge.isPending}
             >
-              Acknowledge
+              {t("Acknowledge")}
             </Button>
           )}
           {canAck && row.status !== "resolved" && (
@@ -168,11 +178,11 @@ export function AlertsPage() {
               onClick={() => act(resolve, row, "resolved")}
               disabled={resolve.isPending}
             >
-              Resolve
+              {t("Resolve")}
             </Button>
           )}
-          <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label="Inspect alert">
-            Context
+          <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label={t("Inspect alert")}>
+            {t("Context")}
           </Button>
         </div>
       ),
@@ -182,8 +192,8 @@ export function AlertsPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Alerts"
-        description="Raised by the monitor agent from statistical rules, not from model opinion. Each alert records the observed value against the threshold that fired."
+        title={t("Alerts")}
+        description={t("Raised by the monitor agent from statistical rules, not from model opinion. Each alert records the observed value against the threshold that fired.")}
         actions={
           <Button
             variant="secondary"
@@ -195,59 +205,59 @@ export function AlertsPage() {
                 {
                   onSuccess: (found) =>
                     toast.info(
-                      "Detection complete",
+                      t("Detection complete"),
                       found.length === 0
-                        ? "No thresholds breached in the last 7 days."
-                        : `${found.length} alert(s) raised.`,
+                        ? t("No thresholds breached in the last 7 days.")
+                        : t("{count} alert(s) raised.", { count: found.length }),
                     ),
-                  onError: (error) => toast.error("Detection failed", (error as Error).message),
+                  onError: (error) => toast.error(t("Detection failed"), (error as Error).message),
                 },
               )
             }
           >
-            Run detection now
+            {t("Run detection now")}
           </Button>
         }
       />
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <StatCard
-          label="Open"
+          label={t("Open")}
           icon="bell"
           tone={(counts?.open ?? 0) > 0 ? "warning" : "positive"}
           loading={summary.isLoading}
           value={formatNumber(counts?.open)}
-          hint="not yet resolved"
+          hint={t("not yet resolved")}
         />
         <StatCard
-          label="Critical"
+          label={t("Critical")}
           icon="warning"
           tone={(bySeverity.critical ?? 0) > 0 ? "negative" : "neutral"}
           loading={summary.isLoading}
           value={formatNumber(bySeverity.critical)}
-          hint="immediate attention"
+          hint={t("immediate attention")}
         />
         <StatCard
-          label="Warning"
+          label={t("Warning")}
           icon="warning"
           tone={(bySeverity.warning ?? 0) > 0 ? "warning" : "neutral"}
           loading={summary.isLoading}
           value={formatNumber(bySeverity.warning)}
         />
         <StatCard
-          label="Acknowledged"
+          label={t("Acknowledged")}
           icon="check"
           loading={summary.isLoading}
           value={formatNumber(counts?.acknowledged)}
-          hint="seen by an operator"
+          hint={t("seen by an operator")}
         />
         <StatCard
-          label="Resolved"
+          label={t("Resolved")}
           icon="checkSquare"
           tone="positive"
           loading={summary.isLoading}
           value={formatNumber(counts?.resolved)}
-          hint="closed"
+          hint={t("closed")}
         />
       </div>
 
@@ -255,10 +265,10 @@ export function AlertsPage() {
         <div className="flex flex-wrap items-end gap-3 border-b border-line px-4 py-3">
           <SelectField
             wrapClassName="w-40"
-            label="Status"
+            label={t("Status")}
             value={status}
-            placeholder="All"
-            options={STATUS_OPTIONS}
+            placeholder={t("All")}
+            options={localizeOptions(t, STATUS_OPTIONS)}
             onChange={(event) => {
               setStatus(event.target.value as AlertStatus | "");
               pagination.reset();
@@ -266,10 +276,10 @@ export function AlertsPage() {
           />
           <SelectField
             wrapClassName="w-36"
-            label="Severity"
+            label={t("Severity")}
             value={severity}
-            placeholder="All"
-            options={SEVERITY_OPTIONS}
+            placeholder={t("All")}
+            options={localizeOptions(t, SEVERITY_OPTIONS)}
             onChange={(event) => {
               setSeverity(event.target.value as AlertSeverity | "");
               pagination.reset();
@@ -277,10 +287,10 @@ export function AlertsPage() {
           />
           <SelectField
             wrapClassName="w-52"
-            label="Rule"
+            label={t("Rule")}
             value={rule}
-            placeholder="All rules"
-            options={RULE_OPTIONS}
+            placeholder={t("All rules")}
+            options={localizeOptions(t, RULE_OPTIONS)}
             onChange={(event) => {
               setRule(event.target.value as AlertRule | "");
               pagination.reset();
@@ -297,11 +307,11 @@ export function AlertsPage() {
                 pagination.reset();
               }}
             >
-              Clear filters
+              {t("Clear filters")}
             </Button>
           )}
           <Button className="ml-auto" variant="ghost" icon="refresh" onClick={() => void alerts.refetch()} loading={alerts.isFetching}>
-            Refresh
+            {t("Refresh")}
           </Button>
         </div>
 
@@ -317,8 +327,8 @@ export function AlertsPage() {
           rowKey={(row) => row.id ?? row.dedup_key}
           loading={alerts.isFetching}
           onRowClick={(row) => setDetail(row)}
-          emptyTitle="No alerts match"
-          emptyHint="Delivery is inside every configured threshold for these filters."
+          emptyTitle={t("No alerts match")}
+          emptyHint={t("Delivery is inside every configured threshold for these filters.")}
           skeletonRows={6}
         />
 
@@ -335,16 +345,16 @@ export function AlertsPage() {
         open={detail !== null}
         onClose={() => setDetail(null)}
         title={detail ? humanize(detail.rule) : ""}
-        description={detail ? RULE_EXPLAINERS[detail.rule] : undefined}
+        description={detail ? t(RULE_EXPLAINERS[detail.rule]) : undefined}
         size="md"
         footer={
           <>
             <Button variant="ghost" onClick={() => setDetail(null)}>
-              Close
+              {t("Close")}
             </Button>
             {canAck && detail?.status === "open" && (
               <Button variant="primary" icon="check" onClick={() => detail && act(acknowledge, detail, "acknowledged")}>
-                Acknowledge
+                {t("Acknowledge")}
               </Button>
             )}
           </>
@@ -358,7 +368,7 @@ export function AlertsPage() {
               {detail.run_id && (
                 <Link to={`/runs/${detail.run_id}`}>
                   <Button size="xs" variant="ghost" iconRight="external">
-                    Source run
+                    {t("Source run")}
                   </Button>
                 </Link>
               )}
@@ -368,12 +378,12 @@ export function AlertsPage() {
 
             <dl className="grid grid-cols-2 gap-3 rounded-lg border border-line bg-surface-2 p-3">
               {[
-                ["Campaign", campaignNames.get(detail.campaign_id) ?? detail.campaign_id],
-                ["Detected", formatDateTime(detail.detected_at)],
-                ["Observed", detail.observed === null ? "—" : detail.observed.toFixed(4)],
-                ["Threshold", detail.threshold.toFixed(4)],
-                ["Acknowledged by", detail.acknowledged_by ?? "—"],
-                ["Dedup key", detail.dedup_key],
+                [t("Campaign"), campaignNames.get(detail.campaign_id) ?? detail.campaign_id],
+                [t("Detected"), formatDateTime(detail.detected_at)],
+                [t("Observed"), detail.observed === null ? "—" : detail.observed.toFixed(4)],
+                [t("Threshold"), detail.threshold.toFixed(4)],
+                [t("Acknowledged by"), detail.acknowledged_by ?? "—"],
+                [t("Dedup key"), detail.dedup_key],
               ].map(([label, value]) => (
                 <div key={label} className="min-w-0">
                   <dt className="text-[10px] tracking-wide text-ink-3 uppercase">{label}</dt>
@@ -385,7 +395,7 @@ export function AlertsPage() {
             </dl>
 
             <div>
-              <p className="mb-1.5 text-[11px] tracking-wide text-ink-3 uppercase">Detection context</p>
+              <p className="mb-1.5 text-[11px] tracking-wide text-ink-3 uppercase">{t("Detection context")}</p>
               <pre className="max-h-56 overflow-auto rounded-lg border border-line bg-surface-2 p-3 font-mono text-[11px] leading-relaxed text-ink-2">
                 {JSON.stringify(detail.context, null, 2)}
               </pre>
@@ -393,8 +403,9 @@ export function AlertsPage() {
 
             <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-ink-3">
               <Icon name="info" size={12} className="mt-0.5 shrink-0" />
-              Alerts are de-duplicated by key, so the same condition on the same campaign does not
-              raise a new row every run.
+              {t(
+                "Alerts are de-duplicated by key, so the same condition on the same campaign does not raise a new row every run.",
+              )}
             </p>
           </div>
         )}

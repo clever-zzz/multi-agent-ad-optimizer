@@ -1,3 +1,4 @@
+import { tStatic } from "@/i18n/translate";
 import { cn } from "@/lib/cn";
 
 export interface TabItem<T extends string> {
@@ -46,7 +47,7 @@ export function Tabs<T extends string>({
                 : "text-ink-3 hover:bg-surface-2 hover:text-ink-2",
             )}
           >
-            {item.label}
+            {tStatic(item.label)}
             {item.count !== undefined && (
               <span
                 className={cn(

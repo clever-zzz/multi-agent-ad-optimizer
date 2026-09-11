@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
@@ -53,6 +54,7 @@ const TREND_WINDOWS = [
 ];
 
 export function CampaignDetailPage() {
+  const { t } = useI18n();
   const { campaignId = "" } = useParams();
   const navigate = useNavigate();
   const user = useAuth((state) => state.user);
@@ -92,7 +94,7 @@ export function CampaignDetailPage() {
   const creativeColumns: Array<Column<Creative>> = [
     {
       key: "headline",
-      header: "Creative",
+      header: t("Creative"),
       cell: (row) => (
         <div className="min-w-0">
           <p className="truncate text-[13px] font-medium text-ink-1">{row.headline}</p>
@@ -103,12 +105,12 @@ export function CampaignDetailPage() {
       ),
       className: "max-w-96",
     },
-    { key: "type", header: "Type", cell: (row) => <Badge>{row.creative_type}</Badge> },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="creative" value={row.status} /> },
-    { key: "group", header: "Test group", cell: (row) => <span className="text-xs text-ink-2">{row.ab_group}</span> },
+    { key: "type", header: t("Type"), cell: (row) => <Badge>{row.creative_type}</Badge> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="creative" value={row.status} /> },
+    { key: "group", header: t("Test group"), cell: (row) => <span className="text-xs text-ink-2">{row.ab_group}</span> },
     {
       key: "origin",
-      header: "Origin",
+      header: t("Origin"),
       cell: (row) => (
         <Badge tone={row.origin === "llm" ? "violet" : row.origin === "rule" ? "info" : "neutral"}>
           {row.origin}
@@ -117,28 +119,28 @@ export function CampaignDetailPage() {
     },
     {
       key: "score",
-      header: "Score",
+      header: t("Score"),
       align: "right",
       cell: (row) =>
         row.score === null ? (
-          <span className="text-xs text-ink-3">unscored</span>
+          <span className="text-xs text-ink-3">{t("unscored")}</span>
         ) : (
           <span className="tnum text-xs font-semibold text-ink-1">{row.score.toFixed(1)}</span>
         ),
     },
     {
       key: "created",
-      header: "Created",
+      header: t("Created"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatRelative(row.created_at)}</span>,
     },
   ];
 
   const actionColumns: Array<Column<OptimizationAction>> = [
-    { key: "type", header: "Proposal", cell: (row) => <span className="text-xs text-ink-1">{humanize(row.action_type)}</span> },
+    { key: "type", header: t("Proposal"), cell: (row) => <span className="text-xs text-ink-1">{humanize(row.action_type)}</span> },
     {
       key: "change",
-      header: "Change",
+      header: t("Change"),
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
           {row.before_value || "—"} → <span className="font-medium text-ink-1">{row.after_value || "—"}</span>
@@ -147,31 +149,31 @@ export function CampaignDetailPage() {
     },
     {
       key: "confidence",
-      header: "Confidence",
+      header: t("Confidence"),
       align: "right",
       cell: (row) => <span className="tnum text-xs text-ink-2">{formatPercent(row.confidence, 0)}</span>,
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="action" value={row.status} /> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="action" value={row.status} /> },
     {
       key: "created",
-      header: "Proposed",
+      header: t("Proposed"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatRelative(row.created_at)}</span>,
     },
   ];
 
   const alertColumns: Array<Column<Alert>> = [
-    { key: "severity", header: "Severity", cell: (row) => <StatusPill domain="severity" value={row.severity} /> },
-    { key: "rule", header: "Rule", cell: (row) => <span className="text-xs text-ink-1">{humanize(row.rule)}</span> },
+    { key: "severity", header: t("Severity"), cell: (row) => <StatusPill domain="severity" value={row.severity} /> },
+    { key: "rule", header: t("Rule"), cell: (row) => <span className="text-xs text-ink-1">{humanize(row.rule)}</span> },
     {
       key: "message",
-      header: "Detail",
+      header: t("Detail"),
       cell: (row) => <span className="text-xs text-ink-2">{truncate(row.message, 110)}</span>,
       className: "max-w-md",
     },
     {
       key: "observed",
-      header: "Observed / threshold",
+      header: t("Observed / threshold"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -179,14 +181,14 @@ export function CampaignDetailPage() {
         </span>
       ),
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="alert" value={row.status} /> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="alert" value={row.status} /> },
   ];
 
   if (campaign.isError) {
     return (
       <div className="flex flex-col gap-4">
-        <PageHeader title="Campaign" breadcrumb={<Link to="/campaigns" className="hover:text-ink-1">Campaigns</Link>} />
-        <ErrorNotice error={campaign.error} onRetry={() => void campaign.refetch()} title="Campaign unavailable" />
+        <PageHeader title={t("Campaign")} breadcrumb={<Link to="/campaigns" className="hover:text-ink-1">{t("Campaigns")}</Link>} />
+        <ErrorNotice error={campaign.error} onRetry={() => void campaign.refetch()} title={t("Campaign unavailable")} />
       </div>
     );
   }
@@ -211,21 +213,26 @@ export function CampaignDetailPage() {
         breadcrumb={
           <>
             <Link to="/campaigns" className="hover:text-ink-1">
-              Campaigns
+              {t("Campaigns")}
             </Link>
             <Icon name="chevronRight" size={11} />
             <span className="text-ink-2">{record ? truncate(record.name, 40) : campaignId}</span>
           </>
         }
-        title={record?.name ?? "Loading campaign…"}
+        title={record?.name ?? t("Loading campaign…")}
         description={
           record && (
             <span className="flex flex-wrap items-center gap-2">
               <StatusPill domain="platform" value={record.platform} dot={false} />
               <StatusPill domain="campaign" value={record.status} />
               <span className="tnum text-ink-3">
-                {record.objective} · started {formatDateTime(record.start_date)}
-                {record.end_date ? ` · ends ${formatDateTime(record.end_date)}` : " · always-on"}
+                {t("{objective} · started {date}", {
+                  objective: humanize(record.objective),
+                  date: formatDateTime(record.start_date),
+                })}
+                {record.end_date
+                  ? t(" · ends {date}", { date: formatDateTime(record.end_date) })
+                  : t(" · always-on")}
               </span>
             </span>
           )
@@ -234,12 +241,12 @@ export function CampaignDetailPage() {
           <>
             {canTrigger && (
               <Button variant="primary" icon="play" onClick={() => setRunOpen(true)}>
-                Optimize this campaign
+                {t("Optimize this campaign")}
               </Button>
             )}
             {canWrite && (
               <Button variant="secondary" icon="sliders" onClick={() => setEditOpen(true)}>
-                Edit
+                {t("Edit")}
               </Button>
             )}
           </>
@@ -250,55 +257,55 @@ export function CampaignDetailPage() {
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          label={`Spend (${windowDays}d)`}
+          label={t("Spend ({days}d)", { days: windowDays })}
           icon="wallet"
           tone="brand"
           loading={breakdown.isLoading}
           value={formatCurrency(snapshot?.total_cost, { compact: true })}
-          hint={`daily budget ${formatCurrency(record?.daily_budget, { digits: 0 })}`}
+          hint={t("daily budget {amount}", { amount: formatCurrency(record?.daily_budget, { digits: 0 }) })}
         />
         <StatCard
-          label="Revenue"
+          label={t("Revenue")}
           icon="trendUp"
           tone="positive"
           loading={breakdown.isLoading}
           value={formatCurrency(snapshot?.total_revenue, { compact: true })}
-          hint={`${formatNumber(snapshot?.conversions)} conversions`}
+          hint={t("{count} conversions", { count: formatNumber(snapshot?.conversions) })}
         />
         <StatCard
-          label="ROAS vs target"
+          label={t("ROAS vs target")}
           icon="target"
           tone={roasTone}
           loading={breakdown.isLoading}
           value={formatRatio(snapshot?.roas)}
-          hint={`target ${formatRatio(record?.target_roas)}`}
+          hint={t("target {value}", { value: formatRatio(record?.target_roas) })}
         />
         <StatCard
-          label="CPA vs target"
+          label={t("CPA vs target")}
           icon="users"
           tone={cpaTone}
           loading={breakdown.isLoading}
           value={formatCurrency(snapshot?.cpa)}
-          hint={`target ${formatCurrency(record?.target_cpa)}`}
+          hint={t("target {value}", { value: formatCurrency(record?.target_cpa) })}
         />
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="CTR" icon="eye" loading={breakdown.isLoading} value={formatPercent(snapshot?.ctr)} />
-        <StatCard label="CVR" icon="check" loading={breakdown.isLoading} value={formatPercent(snapshot?.cvr)} />
-        <StatCard label="CPC" icon="wallet" loading={breakdown.isLoading} value={formatCurrency(snapshot?.cpc)} />
+        <StatCard label={t("CTR")} icon="eye" loading={breakdown.isLoading} value={formatPercent(snapshot?.ctr)} />
+        <StatCard label={t("CVR")} icon="check" loading={breakdown.isLoading} value={formatPercent(snapshot?.cvr)} />
+        <StatCard label={t("CPC")} icon="wallet" loading={breakdown.isLoading} value={formatCurrency(snapshot?.cpc)} />
         <StatCard
-          label="CTR lower bound"
+          label={t("CTR lower bound")}
           icon="shield"
           loading={breakdown.isLoading}
           value={formatPercent(snapshot?.ctr_lower_bound)}
-          hint="Wilson 95% — used instead of raw CTR when volume is thin"
+          hint={t("Wilson 95% — used instead of raw CTR when volume is thin")}
         />
       </div>
 
       <Card
-        title="Delivery trend"
-        subtitle="Daily spend, revenue and ROAS for this campaign"
+        title={t("Delivery trend")}
+        subtitle={t("Daily spend, revenue and ROAS for this campaign")}
         actions={
           <Tabs size="sm" items={TREND_WINDOWS.map((w) => ({ value: w.value, label: w.label }))} value={trendDays} onChange={setTrendDays} />
         }
@@ -306,15 +313,24 @@ export function CampaignDetailPage() {
         {trend.isLoading ? (
           <Skeleton className="h-56 w-full" />
         ) : (
-          <TrendChart data={trendData} series={SERIES} height={240} yLeftLabel="USD" yRightLabel="ROAS" />
+          <TrendChart
+            data={trendData}
+            series={SERIES.map((series) => ({ ...series, label: t(series.label) }))}
+            height={240}
+            yLeftLabel="USD"
+            yRightLabel="ROAS"
+          />
         )}
       </Card>
 
       <div className="grid gap-3 lg:grid-cols-3">
         <Card
           className="lg:col-span-2"
-          title="Creatives"
-          subtitle={`${formatNumber(creatives.data?.length ?? 0)} attached · scored on ${windowDays}-day delivery`}
+          title={t("Creatives")}
+          subtitle={t("{count} attached · scored on {days}-day delivery", {
+            count: formatNumber(creatives.data?.length ?? 0),
+            days: windowDays,
+          })}
           padded={false}
           actions={
             <Tabs
@@ -334,14 +350,14 @@ export function CampaignDetailPage() {
             rows={creatives.data ?? []}
             rowKey={(row) => row.id}
             loading={creatives.isLoading}
-            emptyTitle="No creatives yet"
-            emptyHint="The creative agent generates variants during an optimization run, or you can add one manually."
+            emptyTitle={t("No creatives yet")}
+            emptyHint={t("The creative agent generates variants during an optimization run, or you can add one manually.")}
             skeletonRows={4}
             dense
           />
         </Card>
 
-        <Card title="Creative score leaderboard" subtitle="Composite of volume, efficiency and revenue">
+        <Card title={t("Creative score leaderboard")} subtitle={t("Composite of volume, efficiency and revenue")}>
           {breakdown.isLoading ? (
             <Skeleton className="h-40 w-full" />
           ) : (
@@ -354,11 +370,14 @@ export function CampaignDetailPage() {
                   label: creative ? truncate(creative.headline, 34) : truncate(row.creative_id, 20),
                   value: row.score,
                   tone: creative?.origin === "llm" ? ("violet" as const) : ("brand" as const),
-                  hint: `${formatNumber(row.impressions)} impr · ${formatCurrency(row.cost, { compact: true })}`,
+                  hint: t("{impr} impr · {cost}", {
+                    impr: formatNumber(row.impressions),
+                    cost: formatCurrency(row.cost, { compact: true }),
+                  }),
                 };
               })}
               format={(value) => value.toFixed(1)}
-              emptyLabel="No scored creatives in this window"
+              emptyLabel={t("No scored creatives in this window")}
             />
           )}
         </Card>
@@ -366,13 +385,13 @@ export function CampaignDetailPage() {
 
       <div className="grid gap-3 lg:grid-cols-2">
         <Card
-          title="Proposed actions"
-          subtitle="Latest proposals for this campaign"
+          title={t("Proposed actions")}
+          subtitle={t("Latest proposals for this campaign")}
           padded={false}
           actions={
             <Link to="/actions">
               <Button size="xs" variant="ghost" iconRight="chevronRight">
-                Approval queue
+                {t("Approval queue")}
               </Button>
             </Link>
           }
@@ -383,27 +402,27 @@ export function CampaignDetailPage() {
             rowKey={(row) => row.id ?? `${row.action_type}-${row.created_at}`}
             loading={actions.isLoading}
             onRowClick={() => navigate("/actions")}
-            emptyTitle="No proposals"
-            emptyHint="Run the optimizer to generate budget, bid and creative proposals."
+            emptyTitle={t("No proposals")}
+            emptyHint={t("Run the optimizer to generate budget, bid and creative proposals.")}
             skeletonRows={3}
             dense
           />
         </Card>
 
         <Card
-          title="Open alerts"
-          subtitle="Unresolved anomalies from the monitor agent"
+          title={t("Open alerts")}
+          subtitle={t("Unresolved anomalies from the monitor agent")}
           padded={false}
           actions={
             <Link to="/alerts">
               <Button size="xs" variant="ghost" iconRight="chevronRight">
-                All alerts
+                {t("All alerts")}
               </Button>
             </Link>
           }
         >
           {alerts.data && alerts.data.items.length === 0 ? (
-            <EmptyState tone="neutral" icon="check" title="No open alerts" hint="Delivery is inside every configured threshold." />
+            <EmptyState tone="neutral" icon="check" title={t("No open alerts")} hint={t("Delivery is inside every configured threshold.")} />
           ) : (
             <Table<Alert>
               columns={alertColumns}

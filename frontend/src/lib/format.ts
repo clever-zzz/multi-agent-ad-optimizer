@@ -1,3 +1,4 @@
+import { getActiveLocale, tStatic } from "@/i18n/translate";
 // Presentation helpers. Every number that reaches the screen goes through here so
 // formatting stays consistent across pages and stays trivially unit-testable.
 
@@ -9,7 +10,7 @@ export function isNil(value: unknown): boolean {
 
 export function formatNumber(value: number | null | undefined, digits = 0): string {
   if (isNil(value)) return DASH;
-  return Number(value).toLocaleString("en-US", {
+  return Number(value).toLocaleString(getActiveLocale(), {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
@@ -17,7 +18,7 @@ export function formatNumber(value: number | null | undefined, digits = 0): stri
 
 export function formatCompact(value: number | null | undefined): string {
   if (isNil(value)) return DASH;
-  return Number(value).toLocaleString("en-US", {
+  return Number(value).toLocaleString(getActiveLocale(), {
     notation: "compact",
     maximumFractionDigits: 1,
   });
@@ -29,7 +30,7 @@ export function formatCurrency(
 ): string {
   if (isNil(value)) return DASH;
   const { compact = false, digits = 2 } = options;
-  return Number(value).toLocaleString("en-US", {
+  return Number(value).toLocaleString(getActiveLocale(), {
     style: "currency",
     currency: "USD",
     notation: compact ? "compact" : "standard",
@@ -60,7 +61,7 @@ export function formatDateTime(value: string | Date | null | undefined): string 
   if (!value) return DASH;
   const date = typeof value === "string" ? new Date(value) : value;
   if (Number.isNaN(date.getTime())) return DASH;
-  return date.toLocaleString("en-US", {
+  return date.toLocaleString(getActiveLocale(), {
     year: "numeric",
     month: "short",
     day: "2-digit",
@@ -74,14 +75,14 @@ export function formatDate(value: string | Date | null | undefined): string {
   if (!value) return DASH;
   const date = typeof value === "string" ? new Date(value) : value;
   if (Number.isNaN(date.getTime())) return DASH;
-  return date.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "2-digit" });
+  return date.toLocaleDateString(getActiveLocale(), { year: "numeric", month: "short", day: "2-digit" });
 }
 
 export function formatTime(value: string | Date | null | undefined): string {
   if (!value) return DASH;
   const date = typeof value === "string" ? new Date(value) : value;
   if (Number.isNaN(date.getTime())) return DASH;
-  return date.toLocaleTimeString("en-US", {
+  return date.toLocaleTimeString(getActiveLocale(), {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -99,7 +100,7 @@ export function formatRelative(value: string | Date | null | undefined, now = Da
   const abs = Math.abs(diffSeconds);
   const suffix = diffSeconds < 0 ? "ago" : "from now";
 
-  if (abs < 45) return diffSeconds < 0 ? "just now" : "in a moment";
+  if (abs < 45) return diffSeconds < 0 ? tStatic("just now") : tStatic("in a moment");
   const units: Array<[number, string]> = [
     [60, "minute"],
     [3600, "hour"],
@@ -111,10 +112,10 @@ export function formatRelative(value: string | Date | null | undefined, now = Da
     const [seconds, label] = units[i];
     if (abs >= seconds) {
       const amount = Math.round(abs / seconds);
-      return `${amount} ${label}${amount === 1 ? "" : "s"} ${suffix}`;
+      return tStatic(`{amount} ${label}${amount === 1 ? "" : "s"} ${suffix}`, { amount });
     }
   }
-  return `${abs} seconds ${suffix}`;
+  return tStatic(`{amount} seconds ${suffix}`, { amount: abs });
 }
 
 export function formatDuration(start: string | null | undefined, end?: string | null): string {
@@ -131,12 +132,15 @@ export function formatDuration(start: string | null | undefined, end?: string | 
   return `${hours}h ${minutes % 60}m`;
 }
 
-// Converts snake_case enum values into stable display labels.
+// Converts snake_case enum values into stable display labels. Enum values are
+// looked up verbatim first so translations can key off the API contract
+// ("low_ctr") instead of the cosmetic Title Case form ("Low Ctr").
 export function humanize(value: string | null | undefined): string {
   if (!value) return DASH;
-  return value
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  const direct = tStatic(value);
+  if (direct !== value) return direct;
+  const titled = value.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  return tStatic(titled);
 }
 
 export function truncate(value: string, max = 80): string {

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/cn";
 import { clamp, formatAxisNumber } from "@/components/charts/chartUtils";
 
@@ -34,13 +35,17 @@ export interface BarListProps {
 export function BarList({
   items,
   format = (value) => formatAxisNumber(value),
-  emptyLabel = "Nothing to rank yet",
+  emptyLabel,
   className,
   dense = false,
 }: BarListProps) {
+  const { t } = useI18n();
+
   if (items.length === 0) {
     return (
-      <p className={cn("px-1 py-8 text-center text-xs text-ink-3", className)}>{emptyLabel}</p>
+      <p className={cn("px-1 py-8 text-center text-xs text-ink-3", className)}>
+        {emptyLabel ?? t("Nothing to rank yet")}
+      </p>
     );
   }
 

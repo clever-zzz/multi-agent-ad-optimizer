@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -19,6 +20,7 @@ import { formatDateTime, formatNumber, formatPercent, humanize, truncate } from 
 import type { ABTest } from "@/lib/types";
 
 export function ExperimentsPage() {
+  const { t } = useI18n();
   const pagination = usePagination(25);
   const [campaignId, setCampaignId] = useState("");
   const [detail, setDetail] = useState<ABTest | null>(null);
@@ -40,7 +42,7 @@ export function ExperimentsPage() {
   const columns: Array<Column<ABTest>> = [
     {
       key: "name",
-      header: "Experiment",
+      header: t("Experiment"),
       cell: (row) => (
         <div className="min-w-0">
           <p className="truncate text-[13px] font-medium text-ink-1">{row.name}</p>
@@ -51,7 +53,7 @@ export function ExperimentsPage() {
     },
     {
       key: "campaign",
-      header: "Campaign",
+      header: t("Campaign"),
       cell: (row) => (
         <Link to={`/campaigns/${row.campaign_id}`} className="text-xs text-ink-2 hover:text-brand-300 hover:underline">
           {campaignNames.get(row.campaign_id) ?? truncate(row.campaign_id, 18)}
@@ -59,41 +61,41 @@ export function ExperimentsPage() {
       ),
       className: "max-w-44",
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="abtest" value={row.status} /> },
-    { key: "metric", header: "Metric", cell: (row) => <Badge>{row.metric.toUpperCase()}</Badge> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="abtest" value={row.status} /> },
+    { key: "metric", header: t("Metric"), cell: (row) => <Badge>{row.metric.toUpperCase()}</Badge> },
     {
       key: "mde",
-      header: "MDE",
+      header: t("MDE"),
       align: "right",
       cell: (row) => <span className="tnum text-xs text-ink-2">{formatPercent(row.minimum_detectable_effect, 1)}</span>,
     },
     {
       key: "sample",
-      header: "Required sample",
+      header: t("Required sample"),
       align: "right",
       cell: (row) => <span className="tnum text-xs text-ink-2">{formatNumber(row.required_sample_size)}</span>,
     },
     {
       key: "split",
-      header: "Split",
+      header: t("Split"),
       align: "right",
       cell: (row) => <span className="tnum text-xs text-ink-2">{formatPercent(row.traffic_split, 0)}</span>,
     },
     {
       key: "winner",
-      header: "Outcome",
+      header: t("Outcome"),
       cell: (row) =>
         row.winner_creative_id ? (
-          <Badge tone="positive">winner declared</Badge>
+          <Badge tone="positive">{t("winner declared")}</Badge>
         ) : row.status === "concluded" ? (
-          <Badge tone="neutral">inconclusive</Badge>
+          <Badge tone="neutral">{t("inconclusive")}</Badge>
         ) : (
           <span className="text-xs text-ink-3">—</span>
         ),
     },
     {
       key: "started",
-      header: "Started",
+      header: t("Started"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{row.started_at ? formatDateTime(row.started_at) : "—"}</span>,
     },
@@ -101,24 +103,21 @@ export function ExperimentsPage() {
       key: "open",
       header: "",
       align: "right",
-      cell: (row) => <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label={`Inspect ${row.name}`} />,
+      cell: (row) => <Button size="xs" variant="ghost" icon="eye" onClick={() => setDetail(row)} aria-label={t("Inspect {name}", { name: row.name })} />,
     },
   ];
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Experiments"
-        description="A/B tests created by the optimizer. Each one carries an explicit hypothesis, a minimum detectable effect and the sample size required before a winner may be declared."
+        title={t("Experiments")}
+        description={t("A/B tests created by the optimizer. Each one carries an explicit hypothesis, a minimum detectable effect and the sample size required before a winner may be declared.")}
       />
 
       <div className="grid gap-3 lg:grid-cols-3">
-        <Card className="lg:col-span-3" title="Why experiments are pre-registered" padded>
+        <Card className="lg:col-span-3" title={t("Why experiments are pre-registered")} padded>
           <p className="max-w-4xl text-[13px] leading-relaxed text-ink-2">
-            Declaring a winner before the required sample size is reached is the most common way
-            ad-tech dashboards invent lift. Every test here stores its metric, minimum detectable
-            effect and required sample at creation time, so the conclusion can be checked against
-            what was promised rather than chosen after the fact.
+            {t("Declaring a winner before the required sample size is reached is the most common way ad-tech dashboards invent lift. Every test here stores its metric, minimum detectable effect and required sample at creation time, so the conclusion can be checked against what was promised rather than chosen after the fact.")}
           </p>
         </Card>
       </div>
@@ -127,9 +126,9 @@ export function ExperimentsPage() {
         <div className="flex flex-wrap items-end gap-3 border-b border-line px-4 py-3">
           <SelectField
             wrapClassName="w-64"
-            label="Campaign"
+            label={t("Campaign")}
             value={campaignId}
-            placeholder="All campaigns"
+            placeholder={t("All campaigns")}
             options={campaignOptions}
             onChange={(event) => {
               setCampaignId(event.target.value);
@@ -137,7 +136,7 @@ export function ExperimentsPage() {
             }}
           />
           <Button className="ml-auto" variant="ghost" icon="refresh" onClick={() => void experiments.refetch()} loading={experiments.isFetching}>
-            Refresh
+            {t("Refresh")}
           </Button>
         </div>
 
@@ -153,12 +152,12 @@ export function ExperimentsPage() {
           rowKey={(row) => row.id}
           loading={experiments.isFetching}
           onRowClick={(row) => setDetail(row)}
-          emptyTitle="No experiments yet"
-          emptyHint="The optimizer proposes start_ab_test actions when two creatives are statistically indistinguishable but look different."
+          emptyTitle={t("No experiments yet")}
+          emptyHint={t("The optimizer proposes start_ab_test actions when two creatives are statistically indistinguishable but look different.")}
           emptyAction={
             <Link to="/actions">
               <Button variant="secondary" icon="checkSquare">
-                Open approval queue
+                {t("Open approval queue")}
               </Button>
             </Link>
           }
@@ -178,11 +177,15 @@ export function ExperimentsPage() {
         open={detail !== null}
         onClose={() => setDetail(null)}
         title={detail?.name ?? ""}
-        description={detail ? `${humanize(detail.status)} · ${detail.metric.toUpperCase()} test` : undefined}
+        description={
+          detail
+            ? t("{status} · {metric} test", { status: humanize(detail.status), metric: detail.metric.toUpperCase() })
+            : undefined
+        }
         size="lg"
         footer={
           <Button variant="ghost" onClick={() => setDetail(null)}>
-            Close
+            {t("Close")}
           </Button>
         }
       >
@@ -190,22 +193,22 @@ export function ExperimentsPage() {
           <div className="flex flex-col gap-3.5">
             {detail.hypothesis && (
               <div className="rounded-lg border border-line bg-surface-2 p-3.5">
-                <p className="text-[10px] tracking-wide text-ink-3 uppercase">Hypothesis</p>
+                <p className="text-[10px] tracking-wide text-ink-3 uppercase">{t("Hypothesis")}</p>
                 <p className="mt-1 text-[13px] leading-relaxed text-ink-1">{detail.hypothesis}</p>
               </div>
             )}
 
             <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {[
-                ["Status", humanize(detail.status)],
-                ["Primary metric", detail.metric.toUpperCase()],
-                ["Traffic split", formatPercent(detail.traffic_split, 0)],
-                ["Minimum detectable effect", formatPercent(detail.minimum_detectable_effect, 1)],
-                ["Required sample size", formatNumber(detail.required_sample_size)],
-                ["Campaign", campaignNames.get(detail.campaign_id) ?? detail.campaign_id],
-                ["Started", detail.started_at ? formatDateTime(detail.started_at) : "not started"],
-                ["Concluded", detail.concluded_at ? formatDateTime(detail.concluded_at) : "—"],
-                ["Winner", detail.winner_creative_id ? truncate(detail.winner_creative_id, 18) : "none declared"],
+                [t("Status"), humanize(detail.status)],
+                [t("Primary metric"), detail.metric.toUpperCase()],
+                [t("Traffic split"), formatPercent(detail.traffic_split, 0)],
+                [t("Minimum detectable effect"), formatPercent(detail.minimum_detectable_effect, 1)],
+                [t("Required sample size"), formatNumber(detail.required_sample_size)],
+                [t("Campaign"), campaignNames.get(detail.campaign_id) ?? detail.campaign_id],
+                [t("Started"), detail.started_at ? formatDateTime(detail.started_at) : t("not started")],
+                [t("Concluded"), detail.concluded_at ? formatDateTime(detail.concluded_at) : "—"],
+                [t("Winner"), detail.winner_creative_id ? truncate(detail.winner_creative_id, 18) : t("none declared")],
               ].map(([label, value]) => (
                 <div key={label} className="min-w-0">
                   <dt className="text-[10px] tracking-wide text-ink-3 uppercase">{label}</dt>
@@ -218,13 +221,13 @@ export function ExperimentsPage() {
 
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-lg border border-line p-3">
-                <p className="text-[10px] tracking-wide text-ink-3 uppercase">Control</p>
+                <p className="text-[10px] tracking-wide text-ink-3 uppercase">{t("Control")}</p>
                 <p className="mt-1 truncate font-mono text-xs text-ink-1">
                   {detail.control_creative_id ?? "—"}
                 </p>
               </div>
               <div className="rounded-lg border border-violet/30 bg-violet/5 p-3">
-                <p className="text-[10px] tracking-wide text-violet uppercase">Variant</p>
+                <p className="text-[10px] tracking-wide text-violet uppercase">{t("Variant")}</p>
                 <p className="mt-1 truncate font-mono text-xs text-ink-1">
                   {detail.variant_creative_id ?? "—"}
                 </p>
@@ -232,13 +235,13 @@ export function ExperimentsPage() {
             </div>
 
             <div>
-              <p className="mb-1.5 text-[10px] tracking-wide text-ink-3 uppercase">Result</p>
+              <p className="mb-1.5 text-[10px] tracking-wide text-ink-3 uppercase">{t("Result")}</p>
               {Object.keys(detail.result).length === 0 ? (
                 <EmptyState
                   className="py-6"
                   icon="flask"
-                  title="No result recorded"
-                  hint="The test has not concluded, or it ended without enough evidence to declare a winner."
+                  title={t("No result recorded")}
+                  hint={t("The test has not concluded, or it ended without enough evidence to declare a winner.")}
                 />
               ) : (
                 <pre className="max-h-64 overflow-auto rounded-lg border border-line bg-surface-2 p-3 font-mono text-[11px] leading-relaxed text-ink-2">

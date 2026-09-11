@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/cn";
 import { useToasts, type ToastKind } from "@/stores/toast";
 import { Icon, type IconName } from "@/components/ui/Icon";
@@ -10,6 +11,7 @@ const KIND_STYLE: Record<ToastKind, { className: string; icon: IconName }> = {
 };
 
 export function Toaster() {
+  const { t } = useI18n();
   const toasts = useToasts((state) => state.toasts);
   const dismiss = useToasts((state) => state.dismiss);
 
@@ -41,7 +43,7 @@ export function Toaster() {
             <button
               type="button"
               onClick={() => dismiss(item.id)}
-              aria-label="Dismiss notification"
+              aria-label={t("Dismiss notification")}
               className="-mt-0.5 -mr-1 rounded p-1 text-ink-3 transition-colors hover:bg-white/5 hover:text-ink-1"
             >
               <Icon name="close" size={13} />

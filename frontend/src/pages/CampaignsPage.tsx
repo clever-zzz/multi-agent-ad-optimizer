@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -49,6 +50,7 @@ const WINDOW_OPTIONS = [
 ];
 
 export function CampaignsPage() {
+  const { t } = useI18n();
   const navigate = useNavigate();
   const user = useAuth((state) => state.user);
   const canWrite = can(user, "campaign:write");
@@ -96,11 +98,11 @@ export function CampaignsPage() {
     if (!deleteTarget) return;
     deleteCampaign.mutate(deleteTarget.id, {
       onSuccess: () => {
-        toast.success("Campaign deleted", deleteTarget.name);
+        toast.success(t("Campaign deleted"), deleteTarget.name);
         setDeleteTarget(null);
       },
       onError: (error) => {
-        toast.error("Delete failed", (error as Error).message);
+        toast.error(t("Delete failed"), (error as Error).message);
       },
     });
   };
@@ -108,7 +110,7 @@ export function CampaignsPage() {
   const columns: Array<Column<Campaign>> = [
     {
       key: "name",
-      header: "Campaign",
+      header: t("Campaign"),
       cell: (row) => (
         <div className="min-w-0">
           <p className="truncate text-[13px] font-medium text-ink-1">{row.name}</p>
@@ -119,19 +121,19 @@ export function CampaignsPage() {
     },
     {
       key: "platform",
-      header: "Platform",
+      header: t("Platform"),
       cell: (row) => <StatusPill domain="platform" value={row.platform} />,
     },
-    { key: "status", header: "Status", cell: (row) => <StatusPill domain="campaign" value={row.status} /> },
+    { key: "status", header: t("Status"), cell: (row) => <StatusPill domain="campaign" value={row.status} /> },
     {
       key: "daily_budget",
-      header: "Daily budget",
+      header: t("Daily budget"),
       align: "right",
       cell: (row) => <span className="tnum text-xs">{formatCurrency(row.daily_budget, { digits: 0 })}</span>,
     },
     {
       key: "targets",
-      header: "Targets",
+      header: t("Targets"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -141,7 +143,7 @@ export function CampaignsPage() {
     },
     {
       key: "spend",
-      header: `Spend (${windowDays}d)`,
+      header: t("Spend ({days}d)", { days: windowDays }),
       align: "right",
       cell: (row) => {
         const snapshot = snapshotById.get(row.id);
@@ -154,7 +156,7 @@ export function CampaignsPage() {
     },
     {
       key: "roas",
-      header: "ROAS",
+      header: t("ROAS"),
       align: "right",
       cell: (row) => {
         const snapshot = snapshotById.get(row.id);
@@ -165,7 +167,7 @@ export function CampaignsPage() {
     },
     {
       key: "cpa",
-      header: "CPA",
+      header: t("CPA"),
       align: "right",
       cell: (row) => {
         const snapshot = snapshotById.get(row.id);
@@ -178,7 +180,7 @@ export function CampaignsPage() {
     },
     {
       key: "ctr",
-      header: "CTR",
+      header: t("CTR"),
       align: "right",
       cell: (row) => {
         const snapshot = snapshotById.get(row.id);
@@ -187,7 +189,7 @@ export function CampaignsPage() {
     },
     {
       key: "conversions",
-      header: "Conv",
+      header: t("Conv"),
       align: "right",
       cell: (row) => (
         <span className="tnum text-xs text-ink-2">
@@ -206,8 +208,8 @@ export function CampaignsPage() {
               size="xs"
               variant="ghost"
               icon="play"
-              title="Run optimization for this campaign"
-              aria-label={`Run optimization for ${row.name}`}
+              title={t("Run optimization for this campaign")}
+              aria-label={t("Run optimization for {name}", { name: row.name })}
               onClick={() => setRunTarget([row.id])}
             />
           )}
@@ -217,16 +219,16 @@ export function CampaignsPage() {
                 size="xs"
                 variant="ghost"
                 icon="sliders"
-                title="Edit campaign"
-                aria-label={`Edit ${row.name}`}
+                title={t("Edit campaign")}
+                aria-label={t("Edit {name}", { name: row.name })}
                 onClick={() => openEdit(row)}
               />
               <Button
                 size="xs"
                 variant="ghost"
                 icon="trash"
-                title="Delete campaign"
-                aria-label={`Delete ${row.name}`}
+                title={t("Delete campaign")}
+                aria-label={t("Delete {name}", { name: row.name })}
                 className="text-neg hover:bg-neg/10"
                 onClick={() => setDeleteTarget(row)}
               />
@@ -236,8 +238,8 @@ export function CampaignsPage() {
             size="xs"
             variant="ghost"
             iconRight="chevronRight"
-            title="Open detail"
-            aria-label={`Open ${row.name}`}
+            title={t("Open detail")}
+            aria-label={t("Open {name}", { name: row.name })}
             onClick={() => navigate(`/campaigns/${row.id}`)}
           />
         </div>
@@ -248,18 +250,18 @@ export function CampaignsPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Campaigns"
-        description="Configuration on the left, live delivery on the right. Performance columns use the selected lookback window."
+        title={t("Campaigns")}
+        description={t("Configuration on the left, live delivery on the right. Performance columns use the selected lookback window.")}
         actions={
           <>
             {canTrigger && (
               <Button variant="secondary" icon="play" onClick={() => setRunTarget([])}>
-                Optimize all
+                {t("Optimize all")}
               </Button>
             )}
             {canWrite && (
               <Button variant="primary" icon="plus" onClick={openCreate}>
-                New campaign
+                {t("New campaign")}
               </Button>
             )}
           </>
@@ -280,16 +282,16 @@ export function CampaignsPage() {
                 setSearch(event.target.value);
                 pagination.reset();
               }}
-              placeholder="Search by name or external ID…"
-              aria-label="Search campaigns"
+              placeholder={t("Search by name or external ID…")}
+              aria-label={t("Search campaigns")}
               className="field pl-8"
             />
           </div>
           <SelectField
             wrapClassName="w-36"
-            label="Platform"
+            label={t("Platform")}
             value={platform}
-            placeholder="All"
+            placeholder={t("All")}
             options={PLATFORM_OPTIONS}
             onChange={(event) => {
               setPlatform(event.target.value as Platform | "");
@@ -298,9 +300,9 @@ export function CampaignsPage() {
           />
           <SelectField
             wrapClassName="w-36"
-            label="Status"
+            label={t("Status")}
             value={status}
-            placeholder="All"
+            placeholder={t("All")}
             options={STATUS_OPTIONS}
             onChange={(event) => {
               setStatus(event.target.value as CampaignStatus | "");
@@ -309,7 +311,7 @@ export function CampaignsPage() {
           />
           <SelectField
             wrapClassName="w-36"
-            label="Window"
+            label={t("Window")}
             value={windowDays}
             options={WINDOW_OPTIONS}
             onChange={(event) => setWindowDays(event.target.value)}
@@ -325,7 +327,7 @@ export function CampaignsPage() {
                 pagination.reset();
               }}
             >
-              Clear
+              {t("Clear")}
             </Button>
           )}
         </div>
@@ -342,11 +344,11 @@ export function CampaignsPage() {
           rowKey={(row) => row.id}
           loading={campaigns.isFetching}
           onRowClick={(row) => navigate(`/campaigns/${row.id}`)}
-          emptyTitle="No campaigns match"
+          emptyTitle={t("No campaigns match")}
           emptyHint={
             canWrite
-              ? "Create one, or load the deterministic demo dataset from the System page."
-              : "Ask an administrator to create a campaign or seed the demo dataset."
+              ? t("Create one, or load the deterministic demo dataset from the System page.")
+              : t("Ask an administrator to create a campaign or seed the demo dataset.")
           }
           skeletonRows={8}
         />
@@ -372,19 +374,18 @@ export function CampaignsPage() {
       />
       <ConfirmDialog
         open={deleteTarget !== null}
-        title="Delete campaign"
+        title={t("Delete campaign")}
         tone="danger"
         busy={deleteCampaign.isPending}
         confirmLabel="Delete permanently"
         message={
           <>
             <p>
-              <span className="font-semibold text-ink-1">{deleteTarget?.name}</span> and its
-              creatives, metrics and proposed actions will be removed.
+              <span className="font-semibold text-ink-1">{deleteTarget?.name}</span>{" "}
+              {t("and its creatives, metrics and proposed actions will be removed.")}
             </p>
             <p className="mt-2 text-xs text-ink-3">
-              Runs and audit entries referencing it are retained for compliance. This cannot be
-              undone.
+              {t("Runs and audit entries referencing it are retained for compliance. This cannot be undone.")}
             </p>
           </>
         }

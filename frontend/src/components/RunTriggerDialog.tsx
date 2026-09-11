@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -8,6 +9,7 @@ import { ErrorNotice } from "@/components/ui/ErrorNotice";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { Icon } from "@/components/ui/Icon";
 import { cn } from "@/lib/cn";
+import { formatCurrency, humanize } from "@/lib/format";
 import { useCampaigns } from "@/hooks/useCampaigns";
 import { useStartRun } from "@/hooks/useRuns";
 import { toast } from "@/stores/toast";
@@ -20,6 +22,7 @@ export interface RunTriggerDialogProps {
 }
 
 export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTriggerDialogProps) {
+  const { t } = useI18n();
   const navigate = useNavigate();
   const campaigns = useCampaigns({ page: 1, pageSize: 200 });
   // Destructured so the effect depends on stable function identities only.
@@ -63,12 +66,12 @@ export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTrigg
       },
       {
         onSuccess: (run) => {
-          toast.success("Run started", `Run ${run.id} is ${run.status}.`);
+          toast.success(t("Run started"), t("Run {id} is {status}.", { id: run.id, status: humanize(run.status) }));
           onClose();
           void navigate(`/runs/${run.id}`);
         },
         onError: (error) => {
-          toast.error("Could not start run", (error as Error).message);
+          toast.error(t("Could not start run"), (error as Error).message);
         },
       },
     );
@@ -78,44 +81,44 @@ export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTrigg
     <Modal
       open={open}
       onClose={onClose}
-      title="Start an optimization run"
-      description="The supervisor loops monitor → audience → creative → bidding → optimize. It produces proposals; nothing is applied without approval."
+      title={t("Start an optimization run")}
+      description={t("The supervisor loops monitor → audience → creative → bidding → optimize. It produces proposals; nothing is applied without approval.")}
       size="lg"
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={isPending}>
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button variant="primary" icon="play" onClick={submit} loading={isPending}>
-            {background ? "Start in background" : "Start and wait"}
+            {background ? t("Start in background") : t("Start and wait")}
           </Button>
         </>
       }
     >
       <div className="flex flex-col gap-4">
-        {isError && <ErrorNotice error={runError} title="Run rejected" />}
+        {isError && <ErrorNotice error={runError} title={t("Run rejected")} />}
 
         <div className="grid gap-3 sm:grid-cols-3">
           <TextField
-            label="Max iterations"
+            label={t("Max iterations")}
             type="number"
             min={1}
             max={10}
             value={maxIterations}
-            hint="1–10 supervisor loops"
+            hint={t("1–10 supervisor loops")}
             onChange={(event) => setMaxIterations(Number(event.target.value))}
           />
           <TextField
-            label="Lookback window (days)"
+            label={t("Lookback window (days)")}
             type="number"
             min={1}
             max={90}
             value={windowDays}
-            hint="Telemetry fed to the agents"
+            hint={t("Telemetry fed to the agents")}
             onChange={(event) => setWindowDays(Number(event.target.value))}
           />
           <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-ink-2">Execution</span>
+            <span className="text-xs font-medium text-ink-2">{t("Execution")}</span>
             <div className="flex h-9.5 items-center gap-2 rounded-lg border border-line bg-surface-2 px-2.5">
               <input
                 id="run-background"
@@ -125,27 +128,27 @@ export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTrigg
                 className="size-3.5 accent-[var(--color-brand-500)]"
               />
               <label htmlFor="run-background" className="text-[13px] text-ink-1">
-                Background
+                {t("Background")}
               </label>
             </div>
-            <p className="text-xs text-ink-3">Stream progress live over SSE</p>
+            <p className="text-xs text-ink-3">{t("Stream progress live over SSE")}</p>
           </div>
         </div>
 
         <div>
           <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-ink-2">Scope</span>
+              <span className="text-xs font-medium text-ink-2">{t("Scope")}</span>
               <span className="text-[11px] text-ink-3">
-                {selected.length === 0 ? "All active campaigns" : `${selected.length} selected`}
+                {selected.length === 0 ? t("All active campaigns") : t("{count} selected", { count: selected.length })}
               </span>
             </div>
             <div className="flex items-center gap-1.5">
               <Button size="xs" variant="ghost" onClick={() => setSelected(rows.map((row) => row.id))}>
-                Select visible
+                {t("Select visible")}
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setSelected([])}>
-                Clear
+                {t("Clear")}
               </Button>
             </div>
           </div>
@@ -159,17 +162,17 @@ export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTrigg
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Filter campaigns…"
-              aria-label="Filter campaigns"
+              placeholder={t("Filter campaigns…")}
+              aria-label={t("Filter campaigns")}
               className="field pl-8"
             />
           </div>
 
           <div className="max-h-60 overflow-y-auto rounded-lg border border-line">
             {campaigns.isLoading ? (
-              <p className="px-3 py-6 text-center text-xs text-ink-3">Loading campaigns…</p>
+              <p className="px-3 py-6 text-center text-xs text-ink-3">{t("Loading campaigns…")}</p>
             ) : rows.length === 0 ? (
-              <p className="px-3 py-6 text-center text-xs text-ink-3">No campaigns match.</p>
+              <p className="px-3 py-6 text-center text-xs text-ink-3">{t("No campaigns match.")}</p>
             ) : (
               <ul className="divide-y divide-line">
                 {rows.map((campaign) => {
@@ -193,7 +196,7 @@ export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTrigg
                             {campaign.name}
                           </span>
                           <span className="tnum block truncate text-[11px] text-ink-3">
-                            {campaign.platform} · daily ${campaign.daily_budget.toLocaleString()}
+                            {humanize(campaign.platform)} · {t("daily {amount}", { amount: formatCurrency(campaign.daily_budget, { digits: 0 }) })}
                           </span>
                         </span>
                         <StatusPill domain="campaign" value={campaign.status} />

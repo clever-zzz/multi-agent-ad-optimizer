@@ -1,7 +1,8 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/cn";
 import { Icon, type IconName } from "@/components/ui/Icon";
-import { formatTime, humanize } from "@/lib/format";
+import { formatNumber, formatTime, humanize } from "@/lib/format";
 import type { TimelineItem } from "@/lib/timeline";
 
 const AGENT_COLOR: Record<string, string> = {
@@ -63,7 +64,7 @@ function SummaryChips({ payload }: { payload: Record<string, unknown> }) {
           <span className="font-semibold text-ink-1">
             {typeof value === "number"
               ? Number.isInteger(value)
-                ? value.toLocaleString("en-US")
+                ? formatNumber(value)
                 : value.toFixed(2)
               : String(value)}
           </span>
@@ -113,6 +114,7 @@ export function RunTimeline({
   className,
   emptyLabel = "No events yet",
 }: RunTimelineProps) {
+  const { t } = useI18n();
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -122,7 +124,7 @@ export function RunTimeline({
   if (items.length === 0) {
     return (
       <div className={cn("grid place-items-center rounded-lg border border-dashed border-line px-4 py-12", className)}>
-        <p className="text-xs text-ink-3">{emptyLabel}</p>
+        <p className="text-xs text-ink-3">{t(emptyLabel)}</p>
       </div>
     );
   }
@@ -157,7 +159,7 @@ export function RunTimeline({
             <div className={cn("min-w-0 flex-1", isLast ? "pb-1" : "pb-4")}>
               <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
                 <span className="text-[13px] font-semibold text-ink-1 capitalize">
-                  {item.agent === "supervisor" ? "Supervisor" : humanize(item.agent)}
+                  {item.agent === "supervisor" ? t("Supervisor") : humanize(item.agent)}
                 </span>
                 <span
                   className={cn(
@@ -165,11 +167,11 @@ export function RunTimeline({
                     failed ? "font-medium text-neg" : "text-ink-3",
                   )}
                 >
-                  {TYPE_LABEL[item.type] ?? item.type}
+                  {t(TYPE_LABEL[item.type] ?? item.type)}
                 </span>
                 {typeof item.payload.iteration === "number" && item.payload.iteration > 0 && (
                   <span className="tnum rounded border border-line bg-surface-2 px-1 text-[10px] text-ink-3">
-                    iter {item.payload.iteration}
+                    {t("iter {n}", { n: item.payload.iteration })}
                   </span>
                 )}
                 {duration !== null && (

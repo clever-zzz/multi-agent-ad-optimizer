@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useState } from "react";
 
 import { Modal } from "@/components/ui/Modal";
@@ -27,6 +28,7 @@ export function ChangePasswordDialog({
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
+  const { t } = useI18n();
 
   useEffect(() => {
     if (!open) return;
@@ -40,14 +42,19 @@ export function ChangePasswordDialog({
   const problems = passwordProblems(next);
   const mismatch = confirm.length > 0 && next !== confirm;
   const reused = next.length > 0 && next === current;
+  const labelProblem = (problem: string): string =>
+    problem.startsWith("at least ")
+      ? t("at least {min} characters", { min: problem.split(" ")[2] })
+      : t(problem);
+
   const valid = current.length > 0 && problems.length === 0 && next === confirm && !reused;
 
   const checks = [
-    { label: `${PASSWORD_MIN_LENGTH}+ characters`, ok: next.length >= PASSWORD_MIN_LENGTH },
-    { label: "letter", ok: /[A-Za-z]/.test(next) },
-    { label: "digit", ok: /[0-9]/.test(next) },
-    { label: "symbol", ok: problems.length === 0 || !problems.includes("a symbol") },
-    { label: "matches confirmation", ok: next.length > 0 && next === confirm },
+    { label: t("{min}+ characters", { min: PASSWORD_MIN_LENGTH }), ok: next.length >= PASSWORD_MIN_LENGTH },
+    { label: t("letter"), ok: /[A-Za-z]/.test(next) },
+    { label: t("digit"), ok: /[0-9]/.test(next) },
+    { label: t("symbol"), ok: problems.length === 0 || !problems.includes("a symbol") },
+    { label: t("matches confirmation"), ok: next.length > 0 && next === confirm },
   ];
 
   const submit = async () => {
@@ -55,7 +62,7 @@ export function ChangePasswordDialog({
     setError(null);
     try {
       await changePassword(current, next);
-      toast.success("Password updated", "Use the new password at your next sign-in.");
+      toast.success(t("Password updated"), t("Use the new password at your next sign-in."));
       onClose();
     } catch (caught) {
       setError(caught);
@@ -69,18 +76,18 @@ export function ChangePasswordDialog({
       open={open}
       onClose={onClose}
       dismissible={!mandatory}
-      title={mandatory ? "Password change required" : "Change password"}
+      title={mandatory ? t("Password change required") : t("Change password")}
       description={
         mandatory
-          ? "This account was created with the bootstrap password. Set a personal one before continuing."
-          : "Choose a strong password that you do not reuse on any other service."
+          ? t("This account was created with the bootstrap password. Set a personal one before continuing.")
+          : t("Choose a strong password that you do not reuse on any other service.")
       }
       closeOnBackdrop={!mandatory}
       footer={
         <>
           {!mandatory && (
             <Button variant="ghost" onClick={onClose} disabled={busy}>
-              Cancel
+              {t("Cancel")}
             </Button>
           )}
           <Button
@@ -90,22 +97,22 @@ export function ChangePasswordDialog({
             disabled={!valid}
             loading={busy}
           >
-            Update password
+            {t("Update password")}
           </Button>
         </>
       }
     >
       <div className="flex flex-col gap-3">
-        {error ? <ErrorNotice error={error} title="Password not accepted" /> : null}
+        {error ? <ErrorNotice error={error} title={t("Password not accepted")} /> : null}
         {reused && (
           <p className="flex items-center gap-1.5 text-xs text-warn">
             <Icon name="warning" size={13} />
-            New password must differ from the current one.
+            {t("New password must differ from the current one.")}
           </p>
         )}
 
         <TextField
-          label="Current password"
+          label={t("Current password")}
           type="password"
           autoComplete="current-password"
           value={current}
@@ -113,21 +120,21 @@ export function ChangePasswordDialog({
           required
         />
         <TextField
-          label="New password"
+          label={t("New password")}
           type="password"
           autoComplete="new-password"
           value={next}
           onChange={(event) => setNext(event.target.value)}
-          error={problems.length > 0 ? `Password needs ${problems.join(", ")}` : undefined}
+          error={problems.length > 0 ? t("Password needs {problems}", { problems: problems.map(labelProblem).join(", ") }) : undefined}
           required
         />
         <TextField
-          label="Confirm new password"
+          label={t("Confirm new password")}
           type="password"
           autoComplete="new-password"
           value={confirm}
           onChange={(event) => setConfirm(event.target.value)}
-          error={mismatch ? "Passwords do not match" : undefined}
+          error={mismatch ? t("Passwords do not match") : undefined}
           required
         />
 

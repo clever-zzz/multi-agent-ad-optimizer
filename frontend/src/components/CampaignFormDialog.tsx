@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useMemo, useState } from "react";
 
 import { Modal } from "@/components/ui/Modal";
@@ -81,6 +82,7 @@ export interface CampaignFormDialogProps {
 }
 
 export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDialogProps) {
+  const { t } = useI18n();
   const editing = Boolean(campaign);
   const createCampaign = useCreateCampaign();
   const updateCampaign = useUpdateCampaign(campaign?.id ?? "");
@@ -107,19 +109,19 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
     const cpa = Number(form.target_cpa);
     const roas = Number(form.target_roas);
 
-    if (!Number.isFinite(daily) || daily <= 0) problems.daily_budget = "Must be greater than 0";
-    if (!Number.isFinite(total) || total < 0) problems.total_budget = "Cannot be negative";
+    if (!Number.isFinite(daily) || daily <= 0) problems.daily_budget = t("Must be greater than 0");
+    if (!Number.isFinite(total) || total < 0) problems.total_budget = t("Cannot be negative");
     if (total > 0 && daily > 0 && total < daily) {
-      problems.total_budget = "Total budget cannot be below the daily budget";
+      problems.total_budget = t("Total budget cannot be below the daily budget");
     }
-    if (!Number.isFinite(cpa) || cpa <= 0) problems.target_cpa = "Must be greater than 0";
-    if (!Number.isFinite(roas) || roas <= 0) problems.target_roas = "Must be greater than 0";
-    if (form.name.trim().length < 2) problems.name = "At least 2 characters";
+    if (!Number.isFinite(cpa) || cpa <= 0) problems.target_cpa = t("Must be greater than 0");
+    if (!Number.isFinite(roas) || roas <= 0) problems.target_roas = t("Must be greater than 0");
+    if (form.name.trim().length < 2) problems.name = t("At least 2 characters");
     if (form.end_date && form.start_date && form.end_date < form.start_date) {
-      problems.end_date = "Cannot precede the start date";
+      problems.end_date = t("Cannot precede the start date");
     }
     return problems;
-  }, [form]);
+  }, [form, t]);
 
   const busy = createCampaign.isPending || updateCampaign.isPending;
   const hasErrors = Object.keys(numericErrors).length > 0;
@@ -142,7 +144,10 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
 
     const onError = (error: unknown) => {
       setFormError(error);
-      toast.error(editing ? "Could not save campaign" : "Could not create campaign", describeError(error));
+      toast.error(
+        editing ? t("Could not save campaign") : t("Could not create campaign"),
+        describeError(error),
+      );
     };
 
     if (editing && campaign) {
@@ -150,7 +155,7 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
         { ...payload, status: form.status },
         {
           onSuccess: (saved) => {
-            toast.success("Campaign updated", saved.name);
+            toast.success(t("Campaign updated"), saved.name);
             onClose();
           },
           onError,
@@ -161,7 +166,7 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
 
     createCampaign.mutate(payload, {
       onSuccess: (saved) => {
-        toast.success("Campaign created", `${saved.name} is ${saved.status}.`);
+        toast.success(t("Campaign created"), t("{name} is {status}.", { name: saved.name, status: saved.status }));
         onClose();
       },
       onError,
@@ -179,17 +184,13 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
     <Modal
       open={open}
       onClose={onClose}
-      title={editing ? "Edit campaign" : "New campaign"}
-      description={
-        editing
-          ? "Targets drive every agent decision: the bidding agent anchors on target CPA and ROAS."
-          : "Targets drive every agent decision: the bidding agent anchors on target CPA and ROAS."
-      }
+      title={editing ? t("Edit campaign") : t("New campaign")}
+      description={t("Targets drive every agent decision: the bidding agent anchors on target CPA and ROAS.")}
       size="lg"
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={busy}>
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button
             variant="primary"
@@ -198,64 +199,64 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
             disabled={hasErrors}
             loading={busy}
           >
-            {editing ? "Save changes" : "Create campaign"}
+            {editing ? t("Save changes") : t("Create campaign")}
           </Button>
         </>
       }
     >
       <div className="flex flex-col gap-4">
         {apiError ? (
-          <ErrorNotice error={apiError} title={editing ? "Save rejected" : "Creation rejected"} />
+          <ErrorNotice error={apiError} title={editing ? t("Save rejected") : t("Creation rejected")} />
         ) : null}
 
         <div className="grid gap-3 sm:grid-cols-2">
           <TextField
-            label="Campaign name"
+            label={t("Campaign name")}
             value={form.name}
             onChange={(event) => set("name", event.target.value)}
             error={fieldError("name")}
-            placeholder="Q3 retargeting — EU"
+            placeholder={t("Q3 retargeting — EU")}
             wrapClassName="sm:col-span-2"
             required
           />
           <SelectField
-            label="Platform"
+            label={t("Platform")}
             value={form.platform}
-            options={PLATFORMS}
+            options={PLATFORMS.map((item) => ({ value: item.value, label: t(item.label) }))}
             onChange={(event) => set("platform", event.target.value as Platform)}
             disabled={editing}
-            hint={editing ? "Platform cannot change after creation" : "Determines the adapter used for execution"}
+            hint={editing ? t("Platform cannot change after creation") : t("Determines the adapter used for execution")}
           />
           {editing && (
             <SelectField
-              label="Status"
+              label={t("Status")}
               value={form.status}
-              options={STATUSES}
+              options={STATUSES.map((item) => ({ value: item.value, label: t(item.label) }))}
               onChange={(event) => set("status", event.target.value as CampaignStatus)}
             />
           )}
           {!editing && (
             <SelectField
-              label="Objective"
+              label={t("Objective")}
               value={form.objective}
-              options={OBJECTIVES.map((value) => ({ value, label: value.replace(/_/g, " ") }))}
+              options={OBJECTIVES.map((value) => ({ value, label: t(value.replace(/_/g, " ")) }))}
               onChange={(event) => set("objective", event.target.value)}
             />
           )}
           {editing && (
             <TextField
-              label="External ID"
+              label={t("External ID")}
               value={form.external_id}
               onChange={(event) => set("external_id", event.target.value)}
               error={fieldError("external_id")}
-              hint="Identifier on the ad platform"
+              hint={t("Identifier on the ad platform")}
             />
           )}
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <TextField
-            label="Daily budget (USD)"
+            label={t("Daily budget (USD)")}
             type="number"
             min={1}
             step="10"
@@ -265,17 +266,17 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
             required
           />
           <TextField
-            label="Total budget (USD)"
+            label={t("Total budget (USD)")}
             type="number"
             min={0}
             step="100"
             value={form.total_budget}
             onChange={(event) => set("total_budget", event.target.value)}
             error={fieldError("total_budget")}
-            hint="0 means uncapped"
+            hint={t("0 means uncapped")}
           />
           <TextField
-            label="Target CPA (USD)"
+            label={t("Target CPA (USD)")}
             type="number"
             min={0.01}
             step="1"
@@ -285,7 +286,7 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
             required
           />
           <TextField
-            label="Target ROAS"
+            label={t("Target ROAS")}
             type="number"
             min={0.01}
             step="0.1"
@@ -298,37 +299,37 @@ export function CampaignFormDialog({ open, onClose, campaign }: CampaignFormDial
 
         <div className="grid gap-3 sm:grid-cols-3">
           <TextField
-            label="Start date"
+            label={t("Start date")}
             type="date"
             value={form.start_date}
             onChange={(event) => set("start_date", event.target.value)}
           />
           <TextField
-            label="End date"
+            label={t("End date")}
             type="date"
             value={form.end_date}
             onChange={(event) => set("end_date", event.target.value)}
             error={fieldError("end_date")}
-            hint="Leave empty for always-on"
+            hint={t("Leave empty for always-on")}
           />
           {!editing && (
             <TextField
-              label="External ID"
+              label={t("External ID")}
               value={form.external_id}
               onChange={(event) => set("external_id", event.target.value)}
               error={fieldError("external_id")}
-              hint="Optional platform identifier"
+              hint={t("Optional platform identifier")}
             />
           )}
         </div>
 
         <TextAreaField
-          label="Target audience"
+          label={t("Target audience")}
           rows={3}
           value={form.target_audience}
           onChange={(event) => set("target_audience", event.target.value)}
-          placeholder="25–44, urban, previous purchasers, interest in running gear"
-          hint="Free text consumed by the audience agent to build segments and lookalikes"
+          placeholder={t("25–44, urban, previous purchasers, interest in running gear")}
+          hint={t("Free text consumed by the audience agent to build segments and lookalikes")}
         />
       </div>
     </Modal>

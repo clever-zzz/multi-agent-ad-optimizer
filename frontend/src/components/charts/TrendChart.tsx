@@ -1,4 +1,5 @@
 import { useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/cn";
 import { useMeasure } from "@/hooks/useMeasure";
 import {
@@ -48,11 +49,12 @@ export function TrendChart({
   height = 240,
   showLegend = true,
   className,
-  emptyLabel = "No data in this window",
+  emptyLabel,
   yLeftLabel,
   yRightLabel,
   maxXTicks = 8,
 }: TrendChartProps) {
+  const { t } = useI18n();
   const [ref, size] = useMeasure<HTMLDivElement>({ width: 0, height });
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
@@ -120,7 +122,7 @@ export function TrendChart({
   if (data.length === 0) {
     return (
       <div className={cn("grid place-items-center rounded-lg border border-dashed border-line", className)} style={{ height }}>
-        <p className="text-xs text-ink-3">{emptyLabel}</p>
+        <p className="text-xs text-ink-3">{emptyLabel ?? t("No data in this window")}</p>
       </div>
     );
   }

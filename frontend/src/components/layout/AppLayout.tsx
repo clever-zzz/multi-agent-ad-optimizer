@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useMemo, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
@@ -84,6 +85,7 @@ const FALLBACK_META: RouteMeta = {
 
 export function AppLayout() {
   const location = useLocation();
+  const { t } = useI18n();
   const navigate = useNavigate();
   const user = useAuth((state) => state.user);
   const status = useAuth((state) => state.status);
@@ -126,7 +128,7 @@ export function AppLayout() {
   if (!hydrated || status === "anonymous") {
     return (
       <div className="grid min-h-screen place-items-center">
-        <Spinner label={hydrated ? "Redirecting to sign in…" : "Restoring session…"} />
+        <Spinner label={hydrated ? t("Redirecting to sign in…") : t("Restoring session…")} />
       </div>
     );
   }
@@ -142,8 +144,8 @@ export function AppLayout() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <Topbar
-          title={meta.title}
-          subtitle={meta.subtitle}
+          title={t(meta.title)}
+          subtitle={t(meta.subtitle)}
           onMenu={() => setNavOpen(true)}
           onNewRun={() => setRunDialogOpen(true)}
           canTriggerRun={meta.showRunButton && can(user, "run:trigger")}
@@ -155,8 +157,7 @@ export function AppLayout() {
 
         <footer className="border-t border-line px-6 py-3 text-[11px] text-ink-3">
           <span>
-            Every model-proposed change stays read-only until an operator approves it. Approval is
-            audited.
+            {t("Every model-proposed change stays read-only until an operator approves it. Approval is audited.")}
           </span>
         </footer>
       </div>

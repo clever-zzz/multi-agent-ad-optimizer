@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 import { Skeleton } from "@/components/ui/Skeleton";
@@ -47,6 +48,7 @@ export function Table<T>({
   dense = false,
   className,
 }: TableProps<T>) {
+  const { t } = useI18n();
   const pad = dense ? "px-3 py-1.5" : "px-3 py-2.5";
 
   if (error) {
@@ -54,7 +56,7 @@ export function Table<T>({
       <EmptyState
         tone="negative"
         icon="warning"
-        title="Could not load data"
+        title={t("Could not load data")}
         hint={error}
         action={emptyAction}
       />
@@ -115,7 +117,7 @@ export function Table<T>({
         </tbody>
       </table>
       {!loading && rows.length === 0 && (
-        <EmptyState title={emptyTitle} hint={emptyHint} action={emptyAction} />
+        <EmptyState title={t(emptyTitle)} hint={emptyHint} action={emptyAction} />
       )}
     </div>
   );

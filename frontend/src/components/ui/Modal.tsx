@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/cn";
@@ -36,6 +37,7 @@ export function Modal({
   dismissible = true,
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const { t } = useI18n();
 
   useEffect(() => {
     if (!open) return;
@@ -85,7 +87,7 @@ export function Modal({
             <button
               type="button"
               onClick={onClose}
-              aria-label="Close dialog"
+              aria-label={t("Close dialog")}
               className="-mr-1 rounded-md p-1 text-ink-3 transition-colors hover:bg-surface-3 hover:text-ink-1"
             >
               <Icon name="close" size={16} />

@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -52,6 +53,7 @@ const CONFIDENCE_OPTIONS = [
 ];
 
 export function ActionsPage() {
+  const { t } = useI18n();
   const user = useAuth((state) => state.user);
   const canApprove = can(user, "action:approve");
   const canExecute = can(user, "action:execute");
@@ -107,10 +109,13 @@ export function ActionsPage() {
       {
         onSuccess: (updated) =>
           toast.success(
-            execute ? "Approved and executed" : "Approved",
-            `${humanize(updated.action_type)} → ${updated.status}`,
+            execute ? t("Approved and executed") : t("Approved"),
+            t("{type} → {status}", {
+              type: humanize(updated.action_type),
+              status: humanize(updated.status),
+            }),
           ),
-        onError: (error) => toast.error("Approval failed", (error as Error).message),
+        onError: (error) => toast.error(t("Approval failed"), (error as Error).message),
       },
     );
   };
@@ -120,8 +125,8 @@ export function ActionsPage() {
     rejectAction.mutate(
       { actionId: action.id, reason: "" },
       {
-        onSuccess: () => toast.info("Proposal rejected", humanize(action.action_type)),
-        onError: (error) => toast.error("Rejection failed", (error as Error).message),
+        onSuccess: () => toast.info(t("Proposal rejected"), humanize(action.action_type)),
+        onError: (error) => toast.error(t("Rejection failed"), (error as Error).message),
       },
     );
   };
@@ -134,14 +139,19 @@ export function ActionsPage() {
       {
         onSuccess: (result) => {
           toast.success(
-            `Processed ${formatNumber(ids.length)} proposals`,
-            `${result.approved.length} approved · ${result.executed.length} executed · ${result.skipped.length} skipped · ${result.failed.length} failed`,
+            t("Processed {count} proposals", { count: formatNumber(ids.length) }),
+            t("{approved} approved · {executed} executed · {skipped} skipped · {failed} failed", {
+              approved: result.approved.length,
+              executed: result.executed.length,
+              skipped: result.skipped.length,
+              failed: result.failed.length,
+            }),
           );
           setSelected(new Set());
           setBulkConfirm(null);
         },
         onError: (error) => {
-          toast.error("Bulk operation failed", (error as Error).message);
+          toast.error(t("Bulk operation failed"), (error as Error).message);
           setBulkConfirm(null);
         },
       },
@@ -153,12 +163,12 @@ export function ActionsPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Action approvals"
-        description="The human-in-the-loop gate. The optimizer proposes; nothing reaches an ad platform until an operator approves, and every decision is written to the audit trail."
+        title={t("Action approvals")}
+        description={t("The human-in-the-loop gate. The optimizer proposes; nothing reaches an ad platform until an operator approves, and every decision is written to the audit trail.")}
         actions={
           <Link to="/runs">
             <Button variant="secondary" icon="activity">
-              View runs
+              {t("View runs")}
             </Button>
           </Link>
         }
@@ -167,12 +177,11 @@ export function ActionsPage() {
       <div className="flex flex-wrap items-center gap-2 rounded-lg border border-brand-600/25 bg-brand-600/8 px-3.5 py-2.5">
         <Icon name="shield" size={15} className="shrink-0 text-brand-300" />
         <p className="text-xs leading-relaxed text-ink-2">
-          Approval is enforced server-side by{" "}
+          {t("Approval is enforced server-side by")}{" "}
           <code className="rounded bg-surface-3 px-1 py-0.5 font-mono text-[11px] text-brand-300">
             SECURITY__REQUIRE_ACTION_APPROVAL
           </code>
-          . Disabling it in a non-production environment lets the optimizer execute directly — the
-          API rejects execution without approval whenever the flag is on.
+          {t(". Disabling it in a non-production environment lets the optimizer execute directly — the API rejects execution without approval whenever the flag is on.")}
         </p>
       </div>
 
@@ -189,9 +198,9 @@ export function ActionsPage() {
           />
           <SelectField
             wrapClassName="w-44"
-            label="Type"
+            label={t("Type")}
             value={type}
-            placeholder="All types"
+            placeholder={t("All types")}
             options={TYPE_OPTIONS}
             onChange={(event) => {
               setType(event.target.value as ActionType | "");
@@ -200,7 +209,7 @@ export function ActionsPage() {
           />
           <SelectField
             wrapClassName="w-40"
-            label="Confidence"
+            label={t("Confidence")}
             value={minConfidence}
             options={CONFIDENCE_OPTIONS}
             onChange={(event) => {
@@ -209,7 +218,7 @@ export function ActionsPage() {
             }}
           />
           <Button variant="ghost" icon="refresh" onClick={() => void actions.refetch()} loading={actions.isFetching}>
-            Refresh
+            {t("Refresh")}
           </Button>
         </div>
 
@@ -235,14 +244,14 @@ export function ActionsPage() {
 
             {selected.size > 0 && (
               <>
-                <span className="tnum text-xs font-medium text-brand-300">{selected.size} selected</span>
+                <span className="tnum text-xs font-medium text-brand-300">{t("{count} selected", { count: selected.size })}</span>
                 <div className="ml-auto flex flex-wrap items-center gap-2">
                   <Button size="xs" variant="success" icon="check" onClick={() => setBulkConfirm("approve")} disabled={busy}>
-                    Approve
+                    {t("Approve")}
                   </Button>
                   {canExecute && (
                     <Button size="xs" variant="primary" icon="play" onClick={() => setBulkConfirm("execute")} disabled={busy}>
-                      Approve &amp; execute
+                      {t("Approve & execute")}
                     </Button>
                   )}
                   <Button
@@ -253,7 +262,7 @@ export function ActionsPage() {
                     onClick={() => setBulkConfirm("reject")}
                     disabled={busy}
                   >
-                    Reject
+                    {t("Reject")}
                   </Button>
                 </div>
               </>
@@ -267,11 +276,11 @@ export function ActionsPage() {
           ) : rows.length === 0 ? (
             <EmptyState
               icon="checkSquare"
-              title={tab === "proposed" ? "Approval queue is empty" : "Nothing matches these filters"}
+              title={tab === "proposed" ? t("Approval queue is empty") : t("Nothing matches these filters")}
               hint={
                 tab === "proposed"
-                  ? "Run the optimizer to generate proposals. A clean portfolio legitimately produces none."
-                  : "Widen the status, type or confidence filters."
+                  ? t("Run the optimizer to generate proposals. A clean portfolio legitimately produces none.")
+                  : t("Widen the status, type or confidence filters.")
               }
             />
           ) : (
@@ -290,8 +299,8 @@ export function ActionsPage() {
                 onExecute={() =>
                   action.id &&
                   executeAction.mutate(action.id, {
-                    onSuccess: () => toast.success("Executed", humanize(action.action_type)),
-                    onError: (error) => toast.error("Execution failed", (error as Error).message),
+                    onSuccess: () => toast.success(t("Executed"), humanize(action.action_type)),
+                    onError: (error) => toast.error(t("Execution failed"), (error as Error).message),
                   })
                 }
               />
@@ -315,30 +324,38 @@ export function ActionsPage() {
         tone={bulkConfirm === "reject" ? "danger" : bulkConfirm === "execute" ? "primary" : "success"}
         title={
           bulkConfirm === "approve"
-            ? "Approve proposals"
+            ? t("Approve proposals")
             : bulkConfirm === "execute"
-              ? "Approve and execute proposals"
-              : "Reject proposals"
+              ? t("Approve and execute proposals")
+              : t("Reject proposals")
         }
         confirmLabel={
-          bulkConfirm === "approve" ? "Approve all" : bulkConfirm === "execute" ? "Approve & execute" : "Reject all"
+          bulkConfirm === "approve"
+            ? t("Approve all")
+            : bulkConfirm === "execute"
+              ? t("Approve & execute")
+              : t("Reject all")
         }
         message={
           <>
             <p>
-              {formatNumber(selected.size)} proposal{selected.size === 1 ? "" : "s"} at or above{" "}
-              {formatPercent(Number(minConfidence), 0)} confidence.
+              {t("{count} proposals at or above {confidence} confidence.", {
+                count: formatNumber(selected.size),
+                confidence: formatPercent(Number(minConfidence), 0),
+              })}
             </p>
             {bulkConfirm === "execute" && (
               <p className="mt-2 text-xs text-warn">
-                Execution calls the live platform adapter for each approved proposal. In mock data
-                mode the adapter records the change without contacting a real network.
+                {t(
+                  "Execution calls the live platform adapter for each approved proposal. In mock data mode the adapter records the change without contacting a real network.",
+                )}
               </p>
             )}
             {bulkConfirm === "reject" && (
               <p className="mt-2 text-xs text-ink-3">
-                Rejected proposals are closed permanently and recorded against your identity in the
-                audit trail.
+                {t(
+                  "Rejected proposals are closed permanently and recorded against your identity in the audit trail.",
+                )}
               </p>
             )}
           </>

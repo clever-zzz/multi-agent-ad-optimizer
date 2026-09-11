@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { Suspense, lazy, useEffect } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
@@ -26,15 +27,17 @@ const AuditPage = lazy(() => import("@/pages/AuditPage").then((m) => ({ default:
 const SettingsPage = lazy(() => import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })));
 
 function PageFallback() {
+  const { t } = useI18n();
   return (
     <div className="grid min-h-[50vh] place-items-center">
-      <Spinner size={22} label="Loading view…" />
+      <Spinner size={22} label={t("Loading view…")} />
     </div>
   );
 }
 
 export default function App() {
   const location = useLocation();
+  const { t } = useI18n();
   const hydrated = useAuth((state) => state.hydrated);
   const hydrate = useAuth((state) => state.hydrate);
 
@@ -45,6 +48,10 @@ export default function App() {
   useEffect(() => {
     if (!hydrated) void hydrate();
   }, [hydrated, hydrate]);
+
+  useEffect(() => {
+    document.title = t("Ad Optimizer Console");
+  }, [t]);
 
   return (
     <ErrorBoundary resetKey={location.pathname}>

@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { NavLink } from "react-router-dom";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/ui/Icon";
@@ -13,6 +14,7 @@ export interface SidebarProps {
 
 export function Sidebar({ open, onClose, pendingActions = 0, openAlerts = 0 }: SidebarProps) {
   const user = useAuth((state) => state.user);
+  const { t } = useI18n();
   const nav = visibleNav(user);
 
   const badgeFor = (to: string): number => {
@@ -46,12 +48,12 @@ export function Sidebar({ open, onClose, pendingActions = 0, openAlerts = 0 }: S
             <p className="truncate text-[13px] leading-tight font-semibold text-ink-1">
               AdOptimizer
             </p>
-            <p className="truncate text-[11px] leading-tight text-ink-3">Multi-agent console</p>
+            <p className="truncate text-[11px] leading-tight text-ink-3">{t("Multi-agent console")}</p>
           </div>
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close navigation"
+            aria-label={t("Close navigation")}
             className="rounded-md p-1 text-ink-3 hover:bg-surface-3 hover:text-ink-1 lg:hidden"
           >
             <Icon name="close" size={16} />
@@ -65,7 +67,7 @@ export function Sidebar({ open, onClose, pendingActions = 0, openAlerts = 0 }: S
             return (
               <div key={group} className="mb-4">
                 <p className="px-2.5 pb-1.5 text-[10px] font-semibold tracking-[0.14em] text-ink-3 uppercase">
-                  {GROUP_LABELS[group]}
+                  {t(GROUP_LABELS[group])}
                 </p>
                 <ul className="flex flex-col gap-0.5">
                   {items.map((item) => {
@@ -85,7 +87,7 @@ export function Sidebar({ open, onClose, pendingActions = 0, openAlerts = 0 }: S
                           }
                         >
                           <Icon name={item.icon} size={16} className="shrink-0 opacity-85" />
-                          <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                          <span className="min-w-0 flex-1 truncate">{t(item.label)}</span>
                           {count > 0 && (
                             <span className="tnum rounded-full bg-neg/20 px-1.5 py-px text-[10px] font-bold text-neg">
                               {count > 99 ? "99+" : count}
@@ -108,9 +110,9 @@ export function Sidebar({ open, onClose, pendingActions = 0, openAlerts = 0 }: S
             </span>
             <div className="min-w-0 flex-1">
               <p className="truncate text-xs font-medium text-ink-1">
-                {user?.full_name || user?.email || "Signed out"}
+                {user?.full_name || user?.email || t("Signed out")}
               </p>
-              <p className="truncate text-[11px] text-ink-3 capitalize">{user?.role ?? "—"}</p>
+              <p className="truncate text-[11px] text-ink-3 capitalize">{t(user?.role ?? "—")}</p>
             </div>
           </div>
         </div>

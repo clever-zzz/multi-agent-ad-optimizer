@@ -1,3 +1,4 @@
+import { useI18n } from "@/i18n";
 import { useMemo, useState } from "react";
 
 import { PageHeader } from "@/components/PageHeader";
@@ -67,6 +68,7 @@ function toneForStatus(status: string | undefined): "positive" | "warning" | "ne
 }
 
 export function SettingsPage() {
+  const { t } = useI18n();
   const user = useAuth((state) => state.user);
   const info = useSystemInfo();
   const health = useDependencyHealth({ refetchMs: 30_000 });
@@ -100,35 +102,35 @@ export function SettingsPage() {
     if (config.environment === "production" && config.database_dialect === "sqlite") {
       found.push({
         tone: "negative",
-        text: "DATABASE__URL points at SQLite in production. Use PostgreSQL: SQLite cannot serve concurrent writers from multiple replicas.",
+        text: t("DATABASE__URL points at SQLite in production. Use PostgreSQL: SQLite cannot serve concurrent writers from multiple replicas."),
       });
     }
     if (config.environment === "production" && !config.require_action_approval) {
       found.push({
         tone: "negative",
-        text: "SECURITY__REQUIRE_ACTION_APPROVAL is off in production, so the optimizer can change budgets and bids without a human.",
+        text: t("SECURITY__REQUIRE_ACTION_APPROVAL is off in production, so the optimizer can change budgets and bids without a human."),
       });
     }
     if (!config.redis_enabled) {
       found.push({
         tone: "warning",
-        text: "Redis is not connected; caching and rate limiting fall back to per-process memory, which is not shared across replicas.",
+        text: t("Redis is not connected; caching and rate limiting fall back to per-process memory, which is not shared across replicas."),
       });
     }
     if (!config.clickhouse_enabled) {
       found.push({
         tone: "warning",
-        text: "ClickHouse is not connected; telemetry aggregates are served from the relational database.",
+        text: t("ClickHouse is not connected; telemetry aggregates are served from the relational database."),
       });
     }
     if (config.llm_provider === "mock") {
       found.push({
         tone: "warning",
-        text: "LLM__PROVIDER is mock. Creative generation returns deterministic templates instead of calling a model.",
+        text: t("LLM__PROVIDER is mock. Creative generation returns deterministic templates instead of calling a model."),
       });
     }
     return found;
-  }, [config]);
+  }, [config, t]);
 
   const budgetUsed =
     config && spend.data?.month_to_date_usd !== undefined && spend.data.monthly_budget_usd
@@ -143,43 +145,47 @@ export function SettingsPage() {
   const userColumns: Array<Column<User>> = [
     {
       key: "email",
-      header: "Account",
+      header: t("Account"),
       cell: (row) => (
         <div className="min-w-0">
           <p className="truncate text-[13px] text-ink-1">
             {row.full_name || row.email}
-            {row.id === user?.id && <span className="ml-1.5 text-[11px] text-ink-3">(you)</span>}
+            {row.id === user?.id && <span className="ml-1.5 text-[11px] text-ink-3">{t("(you)")}</span>}
           </p>
           <p className="truncate text-[11px] text-ink-3">{row.email}</p>
         </div>
       ),
     },
-    { key: "role", header: "Role", cell: (row) => <Badge tone={row.role === "admin" ? "brand" : "neutral"}>{row.role}</Badge> },
+    { key: "role", header: t("Role"), cell: (row) => <Badge tone={row.role === "admin" ? "brand" : "neutral"}>{humanize(row.role)}</Badge> },
     {
       key: "active",
-      header: "State",
+      header: t("State"),
       cell: (row) =>
         row.is_active ? (
-          <StatusPill domain="campaign" value="active" label="active" />
+          <StatusPill domain="campaign" value="active" label={t("active")} />
         ) : (
-          <StatusPill domain="campaign" value="paused" label="disabled" />
+          <StatusPill domain="campaign" value="paused" label={t("disabled")} />
         ),
     },
     {
       key: "must_change",
-      header: "Password",
+      header: t("Password"),
       cell: (row) =>
-        row.must_change_password ? <Badge tone="warning">reset due</Badge> : <span className="text-xs text-ink-3">ok</span>,
+        row.must_change_password ? (
+          <Badge tone="warning">{t("reset due")}</Badge>
+        ) : (
+          <span className="text-xs text-ink-3">{t("ok")}</span>
+        ),
     },
     {
       key: "last_login",
-      header: "Last sign-in",
+      header: t("Last sign-in"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatDateTime(row.last_login_at)}</span>,
     },
     {
       key: "created",
-      header: "Created",
+      header: t("Created"),
       align: "right",
       cell: (row) => <span className="text-xs text-ink-3">{formatDateTime(row.created_at)}</span>,
     },
@@ -189,7 +195,7 @@ export function SettingsPage() {
       align: "right",
       cell: (row) => (
         <Button variant="ghost" size="xs" onClick={() => openEdit(row)}>
-          Manage
+          {t("Manage")}
         </Button>
       ),
     },
@@ -209,14 +215,17 @@ export function SettingsPage() {
       {
         onSuccess: (updated) => {
           toast.success(
-            "Account updated",
+            t("Account updated"),
             updated.is_active
-              ? `${updated.email} is now ${updated.role}. Their sessions were revoked.`
-              : `${updated.email} can no longer sign in.`,
+              ? t("{email} is now {role}. Their sessions were revoked.", {
+                  email: updated.email,
+                  role: humanize(updated.role),
+                })
+              : t("{email} can no longer sign in.", { email: updated.email }),
           );
           setEditTarget(null);
         },
-        onError: (error) => toast.error("Could not update account", (error as Error).message),
+        onError: (error) => toast.error(t("Could not update account"), (error as Error).message),
       },
     );
   };
@@ -231,11 +240,14 @@ export function SettingsPage() {
       },
       {
         onSuccess: (created) => {
-          toast.success("Account created", `${created.email} must set a password at first sign-in.`);
+          toast.success(
+            t("Account created"),
+            t("{email} must set a password at first sign-in.", { email: created.email }),
+          );
           setUserModalOpen(false);
           setDraft({ email: "", password: "", full_name: "", role: "viewer" });
         },
-        onError: (error) => toast.error("Could not create account", (error as Error).message),
+        onError: (error) => toast.error(t("Could not create account"), (error as Error).message),
       },
     );
   };
@@ -243,21 +255,21 @@ export function SettingsPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="System"
-        description="Runtime configuration, dependency health, model spend and account administration. Read from the live API, never from build-time constants."
+        title={t("System")}
+        description={t("Runtime configuration, dependency health, model spend and account administration. Read from the live API, never from build-time constants.")}
         actions={
           <>
             <Button variant="secondary" icon="shield" onClick={() => setPasswordOpen(true)}>
-              Change my password
+              {t("Change my password")}
             </Button>
             <Button variant="ghost" icon="refresh" onClick={() => { void info.refetch(); void health.refetch(); }} loading={info.isFetching || health.isFetching}>
-              Refresh
+              {t("Refresh")}
             </Button>
           </>
         }
       />
 
-      {info.isError && <ErrorNotice error={info.error} onRetry={() => void info.refetch()} title="Configuration unavailable" />}
+      {info.isError && <ErrorNotice error={info.error} onRetry={() => void info.refetch()} title={t("Configuration unavailable")} />}
 
       {warnings.length > 0 && (
         <div className="flex flex-col gap-2">
@@ -282,7 +294,7 @@ export function SettingsPage() {
       )}
 
       <div className="grid gap-3 lg:grid-cols-2">
-        <Card title="Runtime configuration" subtitle="Non-sensitive settings as the API sees them">
+        <Card title={t("Runtime configuration")} subtitle={t("Non-sensitive settings as the API sees them")}>
           {info.isLoading ? (
             <Skeleton className="h-56 w-full" />
           ) : config ? (
@@ -296,16 +308,16 @@ export function SettingsPage() {
                 ["LLM model", config.llm_model],
                 ["Orchestrator", config.orchestrator_mode],
                 ["Cache backend", config.cache_backend],
-                ["ClickHouse", config.clickhouse_enabled ? "enabled" : "not connected"],
-                ["Redis", config.redis_enabled ? "enabled" : "not connected"],
-                ["Approval gate", config.require_action_approval ? "enforced" : "DISABLED"],
+                ["ClickHouse", config.clickhouse_enabled ? t("enabled") : t("not connected")],
+                ["Redis", config.redis_enabled ? t("enabled") : t("not connected")],
+                ["Approval gate", config.require_action_approval ? t("enforced") : t("DISABLED")],
                 ["Uptime", formatDuration(new Date(Date.now() - config.uptime_seconds * 1000).toISOString())],
               ].map(([label, value]) => (
                 <div key={String(label)}>
-                  <dt className="text-[10px] tracking-wide text-ink-3 uppercase">{label}</dt>
+                  <dt className="text-[10px] tracking-wide text-ink-3 uppercase">{t(String(label))}</dt>
                   <dd
                     className={
-                      label === "Approval gate" && value === "DISABLED"
+                      label === "Approval gate" && !config.require_action_approval
                         ? "mt-0.5 text-xs font-semibold text-neg"
                         : "mt-0.5 font-mono text-xs text-ink-1"
                     }
@@ -316,17 +328,17 @@ export function SettingsPage() {
               ))}
             </dl>
           ) : (
-            <EmptyState icon="sliders" title="No configuration returned" />
+            <EmptyState icon="sliders" title={t("No configuration returned")} />
           )}
         </Card>
 
-        <Card title="Dependency health" subtitle="Probed live from the API container" padded={false}>
+        <Card title={t("Dependency health")} subtitle={t("Probed live from the API container")} padded={false}>
           {health.isLoading ? (
             <div className="p-4">
               <Skeleton className="h-56 w-full" />
             </div>
           ) : Object.keys(dependencies).length === 0 ? (
-            <EmptyState icon="database" title="No dependencies reported" />
+            <EmptyState icon="database" title={t("No dependencies reported")} />
           ) : (
             <ul className="divide-y divide-line">
               {Object.entries(dependencies).map(([name, entry]) => {
@@ -353,7 +365,7 @@ export function SettingsPage() {
                       <p className="text-[13px] font-medium text-ink-1">{humanize(name)}</p>
                       {detail && <p className="truncate text-[11px] text-ink-3">{detail}</p>}
                     </div>
-                    <Badge tone={tone}>{status}</Badge>
+                    <Badge tone={tone}>{humanize(status)}</Badge>
                   </li>
                 );
               })}
@@ -363,12 +375,14 @@ export function SettingsPage() {
       </div>
 
       <Card
-        title="Model spend"
-        subtitle="Recorded by the LLM gateway ledger, including retries and fallback calls"
+        title={t("Model spend")}
+        subtitle={t("Recorded by the LLM gateway ledger, including retries and fallback calls")}
         actions={
           spend.data?.monthly_budget_usd ? (
             <Badge tone={budgetUsed !== null && budgetUsed > 0.8 ? "warning" : "neutral"}>
-              {budgetUsed !== null ? `${formatPercent(budgetUsed, 1)} of monthly guardrail` : "guardrail set"}
+              {budgetUsed !== null
+                ? t("{pct} of monthly guardrail", { pct: formatPercent(budgetUsed, 1) })
+                : t("guardrail set")}
             </Badge>
           ) : undefined
         }
@@ -379,13 +393,13 @@ export function SettingsPage() {
           <div className="flex flex-col gap-4">
             <div className="grid gap-3 sm:grid-cols-4">
               {[
-                ["Window", `${spend.data?.window_days ?? 30} days`],
+                ["Window", t("{count} days", { count: spend.data?.window_days ?? 30 })],
                 ["Total cost", formatCurrency(spend.data?.total_cost_usd ?? 0, { digits: 4 })],
                 ["Total calls", formatNumber(spend.data?.total_calls ?? 0)],
                 ["Month to date", formatCurrency(spend.data?.month_to_date_usd ?? 0, { digits: 4 })],
               ].map(([label, value]) => (
-                <div key={label} className="rounded-lg border border-line bg-surface-2 px-3 py-2.5">
-                  <p className="text-[10px] tracking-wide text-ink-3 uppercase">{label}</p>
+                <div key={String(label)} className="rounded-lg border border-line bg-surface-2 px-3 py-2.5">
+                  <p className="text-[10px] tracking-wide text-ink-3 uppercase">{t(String(label))}</p>
                   <p className="tnum mt-0.5 text-base font-semibold text-ink-1">{value}</p>
                 </div>
               ))}
@@ -395,10 +409,14 @@ export function SettingsPage() {
               <div>
                 <div className="mb-1 flex items-baseline justify-between text-xs">
                   <span className="text-ink-3">
-                    Monthly guardrail {formatCurrency(spend.data.monthly_budget_usd, { digits: 0 })}
+                    {t("Monthly guardrail {amount}", {
+                      amount: formatCurrency(spend.data.monthly_budget_usd, { digits: 0 }),
+                    })}
                   </span>
                   <span className="tnum text-ink-2">
-                    {formatCurrency(spend.data.month_to_date_usd ?? 0, { digits: 4 })} used
+                    {t("{amount} used", {
+                      amount: formatCurrency(spend.data.month_to_date_usd ?? 0, { digits: 4 }),
+                    })}
                   </span>
                 </div>
                 <div className="h-2 w-full overflow-hidden rounded-full bg-surface-3">
@@ -414,8 +432,7 @@ export function SettingsPage() {
                   />
                 </div>
                 <p className="mt-1.5 text-[11px] text-ink-3">
-                  The gateway refuses new calls once the guardrail is exhausted and falls back to
-                  deterministic templates, so a runaway loop cannot produce an unbounded bill.
+                  {t("The gateway refuses new calls once the guardrail is exhausted and falls back to deterministic templates, so a runaway loop cannot produce an unbounded bill.")}
                 </p>
               </div>
             ) : null}
@@ -425,7 +442,7 @@ export function SettingsPage() {
                 <table className="w-full border-collapse text-[13px]">
                   <thead>
                     <tr className="border-b border-line">
-                      {["Provider", "Model", "Calls", "Prompt tokens", "Completion tokens", "Cost"].map((header, index) => (
+                      {[t("Provider"), t("Model"), t("Calls"), t("Prompt tokens"), t("Completion tokens"), t("Cost")].map((header, index) => (
                         <th
                           key={header}
                           className={
@@ -456,16 +473,16 @@ export function SettingsPage() {
                 </table>
               </div>
             ) : (
-              <p className="text-xs text-ink-3">No model calls recorded in this window.</p>
+              <p className="text-xs text-ink-3">{t("No model calls recorded in this window.")}</p>
             )}
           </div>
         )}
       </Card>
 
-      <Card title="Accounts" subtitle="Roles map to permissions server-side; the console only reflects them" padded={false}
+      <Card title={t("Accounts")} subtitle={t("Roles map to permissions server-side; the console only reflects them")} padded={false}
         actions={
           <Button variant="primary" size="xs" icon="plus" onClick={() => setUserModalOpen(true)}>
-            New account
+            {t("New account")}
           </Button>
         }
       >
@@ -474,35 +491,33 @@ export function SettingsPage() {
           rows={users.data ?? []}
           rowKey={(row) => row.id}
           loading={users.isLoading}
-          emptyTitle="No accounts"
+          emptyTitle={t("No accounts")}
           skeletonRows={3}
           dense
         />
       </Card>
 
-      <Card title="Data management" subtitle="Demonstration dataset and retention policy">
+      <Card title={t("Data management")} subtitle={t("Demonstration dataset and retention policy")}>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="rounded-lg border border-line bg-surface-2 p-3.5">
-            <p className="text-[13px] font-semibold text-ink-1">Seed demo dataset</p>
+            <p className="text-[13px] font-semibold text-ink-1">{t("Seed demo dataset")}</p>
             <p className="mt-1 text-xs leading-relaxed text-ink-3">
-              Creates campaigns, creatives and 90 days of deterministic daily metrics so every view
-              has data. Idempotent: running it again skips unless forced.
+              {t("Creates campaigns, creatives and 90 days of deterministic daily metrics so every view has data. Idempotent: running it again skips unless forced.")}
             </p>
             <Button className="mt-3" variant="secondary" icon="database" onClick={() => setSeedOpen(true)}>
-              Load dataset
+              {t("Load dataset")}
             </Button>
           </div>
 
           <div className="rounded-lg border border-line bg-surface-2 p-3.5">
-            <p className="text-[13px] font-semibold text-ink-1">Apply retention policy</p>
+            <p className="text-[13px] font-semibold text-ink-1">{t("Apply retention policy")}</p>
             <p className="mt-1 text-xs leading-relaxed text-ink-3">
-              Deletes audit rows older than the retention window and clears expired idempotency keys.
-              Audit retention is bounded to at least 30 days server-side.
+              {t("Deletes audit rows older than the retention window and clears expired idempotency keys. Audit retention is bounded to at least 30 days server-side.")}
             </p>
             <div className="mt-3 flex items-end gap-2">
               <TextField
                 wrapClassName="w-32"
-                label="Keep audit for (days)"
+                label={t("Keep audit for (days)")}
                 type="number"
                 min={30}
                 max={3650}
@@ -510,7 +525,7 @@ export function SettingsPage() {
                 onChange={(event) => setPruneDays(event.target.value)}
               />
               <Button variant="secondary" icon="trash" onClick={() => setPruneOpen(true)}>
-                Prune now
+                {t("Prune now")}
               </Button>
             </div>
           </div>
@@ -521,21 +536,25 @@ export function SettingsPage() {
 
       <ConfirmDialog
         open={seedOpen}
-        title="Load the demo dataset"
+        title={t("Load the demo dataset")}
         tone="primary"
         busy={seed.isPending}
         confirmLabel="Seed database"
-        message="Adds campaigns, creatives and 90 days of daily metrics. Existing rows are left untouched unless the dataset is already present, in which case nothing happens."
+        message={t("Adds campaigns, creatives and 90 days of daily metrics. Existing rows are left untouched unless the dataset is already present, in which case nothing happens.")}
         onConfirm={() =>
           seed.mutate(false, {
             onSuccess: (result) => {
               toast.success(
-                result.skipped ? "Dataset already present" : "Demo dataset loaded",
-                `${result.campaigns} campaigns · ${result.creatives} creatives · ${result.daily_rows} metric rows`,
+                result.skipped ? t("Dataset already present") : t("Demo dataset loaded"),
+                t("{campaigns} campaigns · {creatives} creatives · {rows} metric rows", {
+                  campaigns: result.campaigns,
+                  creatives: result.creatives,
+                  rows: result.daily_rows,
+                }),
               );
               setSeedOpen(false);
             },
-            onError: (error) => toast.error("Seeding failed", (error as Error).message),
+            onError: (error) => toast.error(t("Seeding failed"), (error as Error).message),
           })
         }
         onCancel={() => setSeedOpen(false)}
@@ -543,19 +562,19 @@ export function SettingsPage() {
 
       <ConfirmDialog
         open={pruneOpen}
-        title="Apply retention policy"
+        title={t("Apply retention policy")}
         tone="danger"
         busy={prune.isPending}
         confirmLabel="Delete expired rows"
         message={
           <>
             <p>
-              Audit entries older than{" "}
-              <span className="font-semibold text-ink-1">{pruneDays} days</span> and all expired
-              idempotency keys will be deleted.
+              {t("Audit entries older than {days} and all expired idempotency keys will be deleted.", {
+                days: pruneDays,
+              })}
             </p>
             <p className="mt-2 text-xs text-ink-3">
-              Check your jurisdictional retention obligations before shortening this window.
+              {t("Check your jurisdictional retention obligations before shortening this window.")}
             </p>
           </>
         }
@@ -563,12 +582,15 @@ export function SettingsPage() {
           prune.mutate(Number(pruneDays), {
             onSuccess: (result) => {
               toast.success(
-                "Retention applied",
-                `${formatNumber(result.audit_logs_removed)} audit rows and ${formatNumber(result.idempotency_keys_removed)} idempotency keys removed`,
+                t("Retention applied"),
+                t("{audit} audit rows and {keys} idempotency keys removed", {
+                  audit: formatNumber(result.audit_logs_removed),
+                  keys: formatNumber(result.idempotency_keys_removed),
+                }),
               );
               setPruneOpen(false);
             },
-            onError: (error) => toast.error("Prune failed", (error as Error).message),
+            onError: (error) => toast.error(t("Prune failed"), (error as Error).message),
           })
         }
         onCancel={() => setPruneOpen(false)}
@@ -577,12 +599,12 @@ export function SettingsPage() {
       <Modal
         open={userModalOpen}
         onClose={() => setUserModalOpen(false)}
-        title="Create an account"
-        description="New accounts are flagged must-change-password and cannot sign in with the provisional password for long."
+        title={t("Create an account")}
+        description={t("New accounts are flagged must-change-password and cannot sign in with the provisional password for long.")}
         footer={
           <>
             <Button variant="ghost" onClick={() => setUserModalOpen(false)} disabled={createUser.isPending}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button
               variant="primary"
@@ -591,15 +613,15 @@ export function SettingsPage() {
               loading={createUser.isPending}
               disabled={!draft.email || passwordProblemText(draft.password) !== undefined}
             >
-              Create account
+              {t("Create account")}
             </Button>
           </>
         }
       >
         <div className="flex flex-col gap-3">
-          {createUser.isError && <ErrorNotice error={createUser.error} title="Account not created" />}
+          {createUser.isError && <ErrorNotice error={createUser.error} title={t("Account not created")} />}
           <TextField
-            label="Email"
+            label={t("Email")}
             type="email"
             autoComplete="off"
             value={draft.email}
@@ -607,27 +629,27 @@ export function SettingsPage() {
             required
           />
           <TextField
-            label="Full name"
+            label={t("Full name")}
             autoComplete="off"
             value={draft.full_name}
             onChange={(event) => setDraft((prev) => ({ ...prev, full_name: event.target.value }))}
           />
           <TextField
-            label="Provisional password"
+            label={t("Provisional password")}
             type="password"
             autoComplete="new-password"
             value={draft.password}
             onChange={(event) => setDraft((prev) => ({ ...prev, password: event.target.value }))}
             error={passwordProblemText(draft.password)}
-            hint="Shared once over a secure channel; the operator must replace it at first sign-in."
+            hint={t("Shared once over a secure channel; the operator must replace it at first sign-in.")}
             required
           />
           <SelectField
-            label="Role"
+            label={t("Role")}
             value={draft.role}
             options={ROLE_OPTIONS}
             onChange={(event) => setDraft((prev) => ({ ...prev, role: event.target.value as Role }))}
-            hint="Permissions are resolved from the role on every request."
+            hint={t("Permissions are resolved from the role on every request.")}
           />
         </div>
       </Modal>
@@ -635,31 +657,33 @@ export function SettingsPage() {
       <Modal
         open={editTarget !== null}
         onClose={() => setEditTarget(null)}
-        title="Manage account"
+        title={t("Manage account")}
         description={
           editTarget
-            ? `${editTarget.email}. Changing a role or disabling the account revokes every one of its sessions immediately.`
+            ? t("{email}. Changing a role or disabling the account revokes every one of its sessions immediately.", {
+                email: editTarget.email,
+              })
             : undefined
         }
         footer={
           <>
             <Button variant="ghost" onClick={() => setEditTarget(null)} disabled={updateUser.isPending}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button variant="primary" icon="shield" onClick={submitEdit} loading={updateUser.isPending}>
-              Save changes
+              {t("Save changes")}
             </Button>
           </>
         }
       >
         <div className="flex flex-col gap-3">
-          {updateUser.isError && <ErrorNotice error={updateUser.error} title="Account not updated" />}
+          {updateUser.isError && <ErrorNotice error={updateUser.error} title={t("Account not updated")} />}
           <SelectField
-            label="Role"
+            label={t("Role")}
             value={editDraft.role}
             options={ROLE_OPTIONS}
             onChange={(event) => setEditDraft((prev) => ({ ...prev, role: event.target.value as Role }))}
-            hint="The last active administrator cannot be demoted."
+            hint={t("The last active administrator cannot be demoted.")}
           />
           <label className="flex items-start gap-2.5 rounded-lg border border-line bg-surface-2 p-3">
             <input
@@ -669,10 +693,9 @@ export function SettingsPage() {
               onChange={(event) => setEditDraft((prev) => ({ ...prev, is_active: event.target.checked }))}
             />
             <span>
-              <span className="block text-[13px] font-medium text-ink-1">Account enabled</span>
+              <span className="block text-[13px] font-medium text-ink-1">{t("Account enabled")}</span>
               <span className="mt-0.5 block text-xs leading-relaxed text-ink-3">
-                Disabling blocks sign-in and ends all live sessions. The last active administrator
-                cannot be disabled.
+                {t("Disabling blocks sign-in and ends all live sessions. The last active administrator cannot be disabled.")}
               </span>
             </span>
           </label>
