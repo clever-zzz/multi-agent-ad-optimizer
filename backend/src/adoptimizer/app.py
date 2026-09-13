@@ -81,7 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=cfg.app.version,
         summary="Multi-agent advertising optimization platform",
         description=(
-            "Runs a five-agent LangGraph supervisor loop over campaign telemetry and "
+            "Runs a six-agent LangGraph supervisor loop over campaign telemetry and "
             "proposes budget, bid, creative and experiment changes. Nothing is executed "
             "without an explicit approval."
         ),

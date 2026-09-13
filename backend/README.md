@@ -1,6 +1,6 @@
 # Ad Optimizer Backend
 
-FastAPI + SQLAlchemy 2 (async) + LangGraph. Runs a five-agent optimization loop
+FastAPI + SQLAlchemy 2 (async) + LangGraph. Runs a six-agent optimization loop
 over campaign telemetry and proposes budget, bid, creative and experiment
 changes. Nothing reaches an ad platform without an explicit approval.
 
@@ -47,23 +47,30 @@ src/adoptimizer/
                  middleware, Prometheus metrics, composition root
   domain/        pure business rules - KPIs, pricing, budget allocation,
                  anomaly detection, creative scoring, statistics. No I/O.
-  agents/        the five agents plus the BaseAgent template method
+  agents/        the six agents plus the BaseAgent template method
+  tools/         capability catalogue and the executor that gates every call:
+                 validation, per-agent permission, per-run budget, idempotency,
+                 dry-run for agent writes, and a persisted audit trail
   orchestrator/  LangGraph supervisor graph, state reducers, event bus
   llm/           provider gateway: retry, timeout, structured output,
                  per-call spend accounting, monthly budget guardrail
   infra/         db (async engine + ORM models), cache, ClickHouse warehouse,
-                 ad platform adapters (mock / google / meta / tiktok)
+                 ad platform adapters (mock / google / meta / tiktok), and
+                 ingest/ - the metric feeds (synthetic, platform report) plus
+                 the registry that routes a pull to one of them
   repositories/  persistence access
   services/      application use cases and transaction boundaries
   api/           routers, health probes, DTO schemas
-  cli.py         operator commands (serve/migrate/revision/seed/run/healthcheck/token)
+  cli.py         operator commands (serve/migrate/revision/seed/ingest/
+                 scheduler/run/healthcheck/token/creds)
 migrations/      Alembic. env.py runs on the async engine; SQLite uses batch mode.
 tests/           unit/ (pure rules) + integration/ (full HTTP stack, temp SQLite)
 ```
 
 Dependencies point one way: `api → services → {repositories, domain,
-orchestrator, llm} → infra`. `domain/` imports no framework and no I/O, which
-is why it is fully unit-testable.
+orchestrator, llm, tools} → infra`. Agents reach the outside world only
+through `tools/`, never by importing an adapter directly. `domain/` imports no
+framework and no I/O, which is why it is fully unit-testable.
 
 ## Optional extras
 
@@ -81,7 +88,7 @@ The container image installs `[postgres,analytics,worker]`.
 ## Tests and quality gates
 
 ```bash
-.venv/Scripts/pytest --cov          # 591 tests, branch coverage floor 78%
+.venv/Scripts/pytest --cov          # 1072 tests, branch coverage floor 88%
 .venv/Scripts/ruff format --check src tests
 .venv/Scripts/ruff check src tests
 .venv/Scripts/mypy src              # strict
@@ -103,4 +110,14 @@ every gate CI runs, in the same order.
 - **`APP__ENVIRONMENT=production`** enables a startup validator that rejects
   weak JWT secrets, weak bootstrap passwords, wildcard CORS and SQLite. It also
   turns off `/docs` and `/redoc`.
+- **The metric pull is scheduled, not resident, in Kubernetes.**
+  `deploy/k8s/ingest-cronjob.yaml` runs `adoptimizer scheduler --once` every six
+  hours and the ConfigMap sets `INGEST__SCHEDULER_ENABLED=false`, because an
+  in-process loop would start one per API replica. `--once` ignores that flag on
+  purpose: being scheduled from outside the process is what it is for. The window
+  comes from the calendar rather than from a stored cursor, so a missed run is
+  closed by the next one up to `INGEST__MAX_CATCHUP_DAYS`; beyond that the tick
+  reports `gap_days` and names the backfill command instead of quietly narrowing
+  the window. Overlapping runs are arbitrated by a database lease, and
+  `GET /api/v1/ingest/schedule` reports all of it while pulling nothing.
 - Every configuration key is documented inline in [`.env.example`](.env.example).

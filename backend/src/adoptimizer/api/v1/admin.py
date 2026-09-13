@@ -24,6 +24,7 @@ from ...schemas.common import Page
 from ...services.audit import AuditService
 from ...services.auth import AuthService, user_to_dict
 from ...services.seed import seed_database
+from ...tools import DatabaseToolAudit
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -47,6 +48,9 @@ async def system_info(container: ContainerDep, _: Any = ADMIN_ONLY) -> SystemInf
         orchestrator_mode=container.orchestrator.execution_mode,
         cache_backend=container.cache.backend_name,
         uptime_seconds=container.uptime_seconds,
+        tools_enabled=bool(info["tools_enabled"]),
+        tools_dry_run=bool(info["tools_dry_run"]),
+        tools_allow_agent_writes=bool(info["tools_allow_agent_writes"]),
     )
 
 
@@ -54,6 +58,41 @@ async def system_info(container: ContainerDep, _: Any = ADMIN_ONLY) -> SystemInf
 async def dependency_health(container: ContainerDep, _: Any = ADMIN_ONLY) -> dict[str, Any]:
     """The same payload the readiness probe returns, without the status gate."""
     return await container.healthcheck()
+
+
+@router.get("/tools", summary="Agent capability catalogue")
+async def tool_catalogue(container: ContainerDep, _: Any = ADMIN_ONLY) -> dict[str, Any]:
+    """Every tool that exists, who may call it, and the guardrails in force.
+
+    This is the honest answer to "what can the agents actually do": the list is
+    generated from the registry the executor enforces, not maintained by hand.
+    """
+    catalogue = container.tools.registry.describe()
+    catalogue["guardrails"] = {
+        "enabled": container.tools.enabled,
+        "dry_run": container.settings.tools.dry_run,
+        "allow_agent_writes": container.settings.tools.allow_agent_writes,
+        "max_calls_per_run": container.settings.tools.max_calls_per_run,
+        "audit_persist": container.settings.tools.audit_persist,
+        "require_action_approval": container.settings.security.require_action_approval,
+        "data_mode": container.settings.data_mode.value,
+    }
+    return catalogue
+
+
+@router.get("/tools/invocations", summary="Tool invocation audit")
+async def tool_invocation_audit(
+    container: ContainerDep,
+    days: Annotated[int, Query(ge=1, le=365)] = 30,
+    run_id: Annotated[str | None, Query(max_length=40)] = None,
+    _: Any = ADMIN_ONLY,
+) -> dict[str, Any]:
+    """Who called what, what was refused, and what was only preflighted."""
+    audit = DatabaseToolAudit(container.database.session_factory)
+    payload = await audit.summary(run_id=run_id, days=days)
+    if run_id:
+        payload["invocations"] = await audit.for_run(run_id)
+    return payload
 
 
 @router.get("/audit", response_model=Page[AuditEntryOut], summary="Audit trail")

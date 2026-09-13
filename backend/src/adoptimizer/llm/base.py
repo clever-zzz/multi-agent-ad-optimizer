@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ..core.config import LLMProvider
 
-# USD per one million tokens. Only used for budget guardrails and reporting, so
-# an approximate table is acceptable; override via LLM__PRICING in production.
+# USD per one million tokens, prompt price first. Only used for budget
+# guardrails and reporting, so an approximate table is acceptable here -- but it
+# is a *fallback*, not the truth for a given deployment. Vendor list prices
+# drift and regional billing differs, so LLMSettings.pricing (LLM__PRICING)
+# overrides any entry; a model with no entry of its own falls back to "default".
 DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
@@ -17,8 +21,14 @@ DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "o4-mini": (1.10, 4.40),
     "deepseek-chat": (0.27, 1.10),
     "claude-sonnet-4": (3.00, 15.00),
+    "qwen-turbo": (0.05, 0.20),
+    "qwen-plus": (0.40, 1.20),
+    "qwen-max": (1.60, 6.40),
     "default": (1.00, 3.00),
 }
+
+PricingTable = Mapping[str, tuple[float, float]]
+"""Model name to (prompt, completion) USD per one million tokens."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +103,16 @@ class CompletionResult:
         }
 
 
+DeltaHandler = Callable[[str], Awaitable[None]]
+"""Awaitable sink for raw text fragments as a streaming provider emits them.
+
+Fragments are presentation sugar, not a second source of truth about the answer:
+they belong to whichever attempt produced them, a cache hit delivers the whole
+text as one fragment, and a degraded call delivers none at all. Consumers must
+treat CompletionResult.text as the authoritative response.
+"""
+
+
 class LanguageModel(Protocol):
     """Minimal contract every provider must satisfy."""
 
@@ -100,12 +120,42 @@ class LanguageModel(Protocol):
     model: str
     is_available: bool
 
-    async def complete(self, request: CompletionRequest) -> CompletionResult: ...
+    async def complete(
+        self, request: CompletionRequest, *, on_delta: DeltaHandler | None = None
+    ) -> CompletionResult: ...
 
     async def close(self) -> None: ...
 
 
-def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """Estimate USD cost from the pricing table."""
-    prompt_price, completion_price = DEFAULT_PRICING.get(model, DEFAULT_PRICING["default"])
+def resolve_pricing(model: str, overrides: PricingTable | None = None) -> tuple[float, float]:
+    """Return the (prompt, completion) USD price per million tokens for *model*.
+
+    Deployment overrides win over the built-in table. An explicit zero price is
+    honoured rather than read as "no entry" -- free tiers and promotional credit
+    are real, and quietly billing them at the default would defeat the point of
+    stating them.
+    """
+    table: PricingTable = {**DEFAULT_PRICING, **overrides} if overrides else DEFAULT_PRICING
+    prices = table.get(model)
+    if prices is None:
+        prices = table.get("default", DEFAULT_PRICING["default"])
+    return prices
+
+
+def is_priced(model: str, overrides: PricingTable | None = None) -> bool:
+    """True when *model* has a price of its own instead of the "default" fallback."""
+    if overrides and model in overrides:
+        return True
+    return model in DEFAULT_PRICING and model != "default"
+
+
+def estimate_cost(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    overrides: PricingTable | None = None,
+) -> float:
+    """Estimate USD cost from the pricing table plus any deployment overrides."""
+    prompt_price, completion_price = resolve_pricing(model, overrides)
     return (prompt_tokens * prompt_price + completion_tokens * completion_price) / 1_000_000.0

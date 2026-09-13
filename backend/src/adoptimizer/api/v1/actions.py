@@ -33,7 +33,10 @@ router = APIRouter(prefix="/actions", tags=["actions"])
 
 def _service(session: SessionDep, container: ContainerDep) -> ActionService:
     return ActionService(
-        session, platforms=container.platforms, security=container.settings.security
+        session,
+        platforms=container.platforms,
+        security=container.settings.security,
+        tools=container.tools,
     )
 
 

@@ -88,18 +88,26 @@ def detect(
     *,
     daily_budgets: dict[str, float] | None = None,
     reach_by_campaign: dict[str, int] | None = None,
+    window_days: int = 1,
 ) -> list[Alert]:
-    """Run every rule over the supplied snapshots."""
+    """Run every rule over the supplied snapshots.
+
+    ``window_days`` is the span the snapshots were aggregated over. Rules that
+    weigh spend against a *daily* budget need it: a snapshot carries window
+    totals only, so without the span a 21-day total reads as a single day of
+    spend and every campaign looks like a runaway spender.
+    """
     cfg = thresholds or AlertThresholds()
     budgets = daily_budgets or {}
     reach = reach_by_campaign or {}
+    days = max(1, int(window_days))
     alerts: list[Alert] = []
 
     for snapshot in snapshots:
         alerts.extend(_check_ctr(snapshot, cfg))
         alerts.extend(_check_cpa(snapshot, cfg))
         alerts.extend(_check_roas(snapshot, cfg))
-        alerts.extend(_check_burn_rate(snapshot, cfg, budgets))
+        alerts.extend(_check_burn_rate(snapshot, cfg, budgets, days))
         alerts.extend(_check_frequency(snapshot, cfg, reach))
 
     return sorted(alerts, key=lambda a: (_severity_rank(a.severity), a.campaign_id, a.rule.value))
@@ -192,12 +200,23 @@ def _check_roas(snapshot: PerformanceSnapshot, cfg: AlertThresholds) -> list[Ale
 
 
 def _check_burn_rate(
-    snapshot: PerformanceSnapshot, cfg: AlertThresholds, budgets: dict[str, float]
+    snapshot: PerformanceSnapshot,
+    cfg: AlertThresholds,
+    budgets: dict[str, float],
+    window_days: int = 1,
 ) -> list[Alert]:
+    """Compare average daily spend against the campaign's daily budget.
+
+    ``total_cost`` covers the whole window, so it has to be normalised before
+    the comparison. Dividing a multi-day total by a one-day budget is what made
+    every campaign in a long run trip this rule at once.
+    """
     daily_budget = budgets.get(snapshot.campaign_id)
     if not daily_budget or daily_budget <= 0:
         return []
-    ratio = safe_ratio(snapshot.total_cost, daily_budget)
+    days = max(1, window_days)
+    daily_spend = snapshot.total_cost / days
+    ratio = safe_ratio(daily_spend, daily_budget)
     if ratio <= cfg.burn_rate_multiplier:
         return []
     return [
@@ -212,12 +231,19 @@ def _check_burn_rate(
             message=(
                 "Campaign "
                 + snapshot.campaign_id
-                + " has spent "
+                + " is averaging "
                 + format(ratio, ".0%")
-                + " of its daily budget"
+                + " of its daily budget over "
+                + str(days)
+                + " days"
             ),
             dedup_key=snapshot.campaign_id + ":" + AlertRule.BURN_RATE.value,
-            context={"daily_budget": daily_budget, "total_cost": snapshot.total_cost},
+            context={
+                "daily_budget": daily_budget,
+                "total_cost": snapshot.total_cost,
+                "daily_spend": round(daily_spend, 2),
+                "window_days": days,
+            },
         )
     ]
 

@@ -238,7 +238,18 @@ export function RunDetailPage() {
           tone={(summary?.actions ?? 0) > 0 ? "brand" : "neutral"}
           loading={detail.isLoading}
           value={formatNumber(summary?.actions ?? actions.length)}
-          hint={summary ? t("{count} budget moves", { count: formatNumber(summary.budget_adjustments) }) : undefined}
+          hint={
+            summary
+              ? [
+                  t("{count} budget moves", { count: formatNumber(summary.budget_adjustments) }),
+                  summary.actions_suppressed > 0
+                    ? t("{count} withheld by the critic", { count: formatNumber(summary.actions_suppressed) })
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join(" \u00b7 ")
+              : undefined
+          }
         />
         <StatCard
           label={t("Alerts raised")}
@@ -395,6 +406,7 @@ export function RunDetailPage() {
                       [t("Bid decisions"), String(summary.bidding_decisions)],
                       [t("Budget adjustments"), String(summary.budget_adjustments)],
                       [t("Proposals"), String(summary.actions)],
+                      [t("Withheld by critic"), String(summary.actions_suppressed)],
                       [t("Alerts raised"), String(summary.alerts_raised)],
                       [t("Health score"), String((summary.health as { score?: number }).score ?? "—")],
                     ].map(([label, value]) => (

@@ -1,11 +1,20 @@
-"""Monitor Agent - telemetry collection, anomaly detection and health scoring."""
+"""Monitor Agent - telemetry collection, anomaly detection and health scoring.
+
+Detection runs on the warehouse, which is only ever a mirror of the networks.
+So after raising alerts the agent asks each affected network what it thinks,
+through the tool layer. That single read-only call is the difference between
+"the warehouse says this campaign is burning cash" and "the network agrees",
+and it is the reason a lagging ETL job does not become a paused campaign.
+"""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
+from ..core.clock import utc_today
 from ..core.logging import get_logger
-from ..domain.anomaly import AlertThresholds, deduplicate, detect
+from ..domain.anomaly import Alert, AlertThresholds, deduplicate, detect
 from ..domain.enums import AgentName, AlertSeverity
 from ..domain.kpi import (
     PerformanceSnapshot,
@@ -18,6 +27,20 @@ from .base import AgentContext, BaseAgent
 
 logger = get_logger(__name__)
 
+# How many campaigns to reconcile against their network in one iteration. Each
+# check is a real external call, so the bound lives here rather than being left
+# to the global per-run tool budget alone: a portfolio with forty critical
+# alerts should not turn one monitoring step into forty API requests.
+MAX_LIVE_CHECKS = 5
+
+# Worst first. Reconciling the alerts that can pause a campaign matters more
+# than reconciling the ones that only suggest a creative refresh.
+SEVERITY_RANK = {
+    AlertSeverity.CRITICAL.value: 0,
+    AlertSeverity.WARNING.value: 1,
+    AlertSeverity.INFO.value: 2,
+}
+
 
 class MonitorAgent(BaseAgent):
     """Turns raw delivery data into alerts and a portfolio health score."""
@@ -26,6 +49,7 @@ class MonitorAgent(BaseAgent):
 
     async def run(self, state: AgentState, context: AgentContext) -> dict[str, Any]:
         iteration = int(state.get("iteration", 0) or 0)
+        window_days = int(state.get("window_days", 7) or 7)
         snapshots = self._resolve_snapshots(state, context)
 
         thresholds = AlertThresholds(
@@ -39,6 +63,7 @@ class MonitorAgent(BaseAgent):
                 snapshots,
                 thresholds,
                 daily_budgets=context.daily_budgets,
+                window_days=window_days,
             )
         )
 
@@ -46,17 +71,21 @@ class MonitorAgent(BaseAgent):
         score = health_score(portfolio)
         critical = [a for a in alerts if a.severity == AlertSeverity.CRITICAL]
 
+        checks = await self._cross_check(alerts, context, window_days, iteration)
+
         health = {
             "status": health_status(score),
             "score": round(score, 2),
             "portfolio": portfolio.model_dump(),
             "alert_count": len(alerts),
             "critical_count": len(critical),
-            "window_days": int(state.get("window_days", 7) or 7),
+            "window_days": window_days,
             "campaigns_monitored": len(snapshots),
+            "live_checks": len(checks),
+            "live_checks_unresolved": sum(1 for c in checks if c["outcome"] == "unresolved"),
         }
 
-        message = self._build_message(portfolio.model_dump(), alerts, score, iteration)
+        message = self._build_message(portfolio.model_dump(), alerts, score, iteration, checks)
 
         logger.info(
             "monitor_completed",
@@ -64,11 +93,13 @@ class MonitorAgent(BaseAgent):
             campaigns=len(snapshots),
             alerts=len(alerts),
             health=round(score, 2),
+            live_checks=len(checks),
         )
 
         return {
             "metrics": [snapshot.model_dump() for snapshot in snapshots],
             "alerts": [alert.to_dict() for alert in alerts],
+            "platform_checks": checks,
             "health": health,
             "current_agent": self.name.value,
             "agent_messages": [message],
@@ -76,8 +107,89 @@ class MonitorAgent(BaseAgent):
                 "campaigns": len(snapshots),
                 "alerts": len(alerts),
                 "health_score": round(score, 2),
+                "live_checks": len(checks),
             },
         }
+
+    async def _cross_check(
+        self,
+        alerts: list[Alert],
+        context: AgentContext,
+        window_days: int,
+        iteration: int,
+    ) -> list[dict[str, Any]]:
+        """Ask each alerted campaign's own network whether it agrees with us.
+
+        Returns an empty list when the tool layer is off, so monitoring still
+        works in a deployment that has not enabled tools. An `unresolved` entry
+        is not a failure to report: it records that the campaign cannot be
+        reconciled because it carries no external id, which is itself something
+        an operator needs to see before trusting the alert.
+        """
+        if context.tools is None or not context.tools.enabled or not alerts:
+            return []
+
+        end = utc_today()
+        start = end - timedelta(days=max(1, window_days) - 1)
+        worst = sorted(alerts, key=lambda item: SEVERITY_RANK.get(item.severity.value, 9))
+
+        checks: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for alert in worst:
+            if len(checks) >= MAX_LIVE_CHECKS:
+                break
+            campaign_id = str(alert.campaign_id)
+            if campaign_id in seen:
+                continue
+            seen.add(campaign_id)
+
+            target = context.tool_target(campaign_id)
+            if target is None:
+                checks.append(
+                    {
+                        "campaign_id": campaign_id,
+                        "rule": alert.rule.value,
+                        "severity": alert.severity.value,
+                        "outcome": "unresolved",
+                        "error": "no platform external_id on record; cannot reconcile",
+                    }
+                )
+                continue
+
+            platform, external_id = target
+            result = await context.call_tool(
+                "platform.campaign_report",
+                {
+                    "platform": platform,
+                    "campaign_external_id": external_id,
+                    "start_date": start.isoformat(),
+                    "end_date": end.isoformat(),
+                },
+                agent=self.name,
+                idempotency_key="monitor-report:" + str(iteration) + ":" + campaign_id,
+            )
+            if result is None:
+                continue
+
+            data = result.data if isinstance(result.data, dict) else {}
+            rows = data.get("rows")
+            checks.append(
+                {
+                    "campaign_id": campaign_id,
+                    "platform": platform,
+                    "external_id": external_id,
+                    "rule": alert.rule.value,
+                    "severity": alert.severity.value,
+                    "tool": result.request.tool,
+                    "outcome": result.outcome.value,
+                    "served_by": str(data.get("served_by") or ""),
+                    "live_rows": len(rows) if isinstance(rows, list) else 0,
+                    "window": start.isoformat() + "/" + end.isoformat(),
+                    "duration_ms": round(result.duration_ms, 2),
+                    "error": result.error,
+                }
+            )
+        return checks
 
     def _resolve_snapshots(
         self, state: AgentState, context: AgentContext
@@ -103,6 +215,7 @@ class MonitorAgent(BaseAgent):
         alerts: list[Any],
         score: float,
         iteration: int,
+        checks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         status = health_status(score)
         parts = [
@@ -124,4 +237,16 @@ class MonitorAgent(BaseAgent):
             )
         else:
             parts.append("No anomalies detected.")
+        if checks:
+            answered = sum(1 for item in checks if item.get("served_by"))
+            blind = sum(1 for item in checks if item.get("outcome") == "unresolved")
+            parts.append(
+                "Cross-checked "
+                + str(len(checks))
+                + " alerted campaign(s) against their network: "
+                + str(answered)
+                + " answered, "
+                + str(blind)
+                + " without an external id."
+            )
         return self._message(" ".join(parts), iteration=iteration)

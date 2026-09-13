@@ -90,6 +90,22 @@ services:
         delay: 5s
         max_attempts: 5
 
+  # Same rule as api and frontend: production pulls a released image and never
+  # builds one. Profile-gated, so `up -d` does not start it - cron does.
+  ingest:
+    image: ${REGISTRY:-adoptimizer}/backend:${IMAGE_TAG}
+    build: !override null
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
   frontend:
     image: ${REGISTRY:-adoptimizer}/frontend:${IMAGE_TAG}
     build: !override null

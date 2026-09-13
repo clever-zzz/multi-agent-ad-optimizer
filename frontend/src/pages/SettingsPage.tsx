@@ -43,6 +43,7 @@ const ROLE_OPTIONS: Array<{ value: Role; label: string }> = [
   { value: "optimizer", label: "Optimizer — can approve and execute proposals" },
   { value: "analyst", label: "Analyst — read plus alert acknowledgement" },
   { value: "viewer", label: "Viewer — read only" },
+  { value: "ingestor", label: "Ingestor — metrics pipeline identity, can push data only" },
 ];
 
 interface HealthEntry {

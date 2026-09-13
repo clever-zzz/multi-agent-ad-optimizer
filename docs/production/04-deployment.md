@@ -19,7 +19,7 @@
      └─────────────────┘            └───┬──────────┬───┘
                                         ▼          ▼
                                   PostgreSQL     Redis
-                                  (14 张表)   (缓存/限流/会话)
+                                  (18 张表)   (缓存/限流/会话)
 
                                         ▼
                                   ClickHouse（可选，DATA_MODE=warehouse）
@@ -128,6 +128,10 @@ curl -sf http://localhost:8000/readyz | python -m json.tool
 
 # 3. 建真实账号，把引导 admin 停用（注意：系统不允许停用最后一个在职 admin，
 #    所以必须先建好替代的 admin 再停用引导账号）
+
+# 4. 有外部管道要推 POST /ingest/metrics 的话，给它建一个 ingestor 账号。
+#    这个角色只有 metrics:read + metrics:write：凭据泄露只能伪造数字，
+#    改不了活动、审批不了动作。别拿某个人的 optimizer/admin 账号去跑管道。
 ```
 
 ---
@@ -144,6 +148,7 @@ deploy/k8s/
   postgres.yaml          StatefulSet + PVC + Service
   redis.yaml             Deployment + Service
   migrate-job.yaml       CronJob（也用于部署流水线里手动创建 Job）
+  ingest-cronjob.yaml    CronJob：每 6 小时跑一趟 `adoptimizer scheduler --once`
   backend.yaml           Deployment + Service + HPA + PDB
   frontend.yaml          Deployment + Service
   ingress.yaml           两个 Ingress：常规 API(60s) 与 SSE(3600s + cookie 亲和)
@@ -178,6 +183,12 @@ kubectl -n adoptimizer wait --for=condition=complete job -l app.kubernetes.io/co
 kubectl apply -k deploy/k8s
 kubectl -n adoptimizer rollout status deploy/backend
 kubectl -n adoptimizer rollout status deploy/frontend
+
+# 5. 立刻拉一趟指标，不必等下一个整点（第一次上线建议做）
+kubectl -n adoptimizer create job adoptimizer-ingest-$(date +%s) \
+  --from=cronjob/adoptimizer-ingest
+kubectl -n adoptimizer wait --for=condition=complete job \
+  -l app.kubernetes.io/component=ingest --timeout=600s
 ```
 
 > `secret.example.yaml` **故意没有**列进 `kustomization.yaml`。把占位凭据 apply 进集群，要么被生产硬化校验直接拒绝启动，要么更糟——用一个已经公开在 Git 里的密钥启动集群。
@@ -207,6 +218,18 @@ kubectl -n adoptimizer rollout status deploy/frontend
 **PDB**：`minAvailable: 1`，保证节点维护时不会全部下线。
 
 **migrate CronJob**：每周日 03:00 兜底跑一次（`concurrencyPolicy: Forbid`），真正的迁移应在部署流水线里显式触发。`RUN_MIGRATIONS=false` 写在 ConfigMap 里，因此 API Pod **不会**自己跑迁移——多副本同时 ALTER TABLE 是要出事的。
+
+**ingest CronJob**：每 6 小时的第 10 分钟跑一趟 `adoptimizer scheduler --once`。`timeZone: Etc/UTC` 是必须的——窗口按日历日算，触发器就得和它同一个钟，否则各节点按本地时区解释 cron 表达式，一天里会漂出好几个不同的"6 点"。关键三项：
+
+| 配置 | 值 | 原因 |
+|---|---|---|
+| `concurrencyPolicy` | `Forbid` | 慢拉取不会在自己身后排队；数据库租约是第二道保险，覆盖跨来源的重叠（常驻循环撞上手工触发） |
+| `startingDeadlineSeconds` | `3600` | k8s 侧的错过策略：错过超过一小时就不补跑，因为晚跑的窗口和下一趟算出来的是同一个 |
+| `backoffLimit` | `2` | 重试两次后退出码非 0，由 `ingest_ticks_total{outcome="failed"}` 叫人；无限重试会把一个坏掉的数据源藏成一个永远不结束的 Job |
+
+Pod 标签沿用 `app.kubernetes.io/name: backend`，所以已有的 `backend` NetworkPolicy 直接覆盖它：出站到 postgres / redis / DNS / 443，入站不接受任何连接。
+
+> 用了 CronJob，就把 ConfigMap 里的 `INGEST__SCHEDULER_ENABLED` 设为 `false`（清单里已经是这个值）。否则每个 API 副本还会各起一份进程内循环：租约能防止重复写入，但会白花 N 份算力，而且节奏会随某个副本重启而丢掉。`--once` **不受**这个开关约束——被进程外调度器调起正是它的用途。没有 Kubernetes 的部署可以反过来，把开关打开用常驻循环；两条路径写的是同一套水位与租约，混用也不会重复灌。
 
 **NetworkPolicy**：默认拒绝入站，只放行 ingress→frontend、frontend→backend、backend→postgres/redis。
 
@@ -245,7 +268,12 @@ DATABASE__URL: "postgresql+asyncpg://adoptimizer@postgres:5432/adoptimizer"
 | `REDIS__URL` | 带口令 |
 | `LLM__PROVIDER` / `LLM__API_KEY` | 用真实模型时必填；`mock` 时留空 |
 | `LLM__MONTHLY_BUDGET_USD` | 成本护栏，按实际预算设 |
+| `LLM__PRICING` | JSON，按模型给出 USD/百万 token 的 `[prompt, completion]`。内置表是国际标价，区域计费不同（中国区 DashScope 按 CNY）时必须覆盖，否则预算护栏按错单价扣减 |
 | `OBSERVABILITY__LOG_LEVEL` | `INFO`。排障时临时调 `DEBUG`，注意 DEBUG 会打印更多上下文 |
+| `INGEST__SOURCES` | JSON 数组，**只放真实数据源**；默认值 `["synthetic"]` 是给演示环境的 |
+| `INGEST__SCHEDULER_ENABLED` | 用 CronJob 就设 `false`（见 §3.3），靠进程内常驻循环才设 `true` |
+| `INGEST__LOOKBACK_DAYS` / `INGEST__MAX_CATCHUP_DAYS` | 前者是平台修订昨日数字的重叠余量，后者是错过运行能自愈的上界。必须 `catchup >= lookback`，否则启动即报错 |
+| `INGEST__LEASE_TTL_SECONDS` | 必须大于一次完整拉取的耗时，否则慢拉取会被下一趟中途接管。默认 1800，与 CronJob 的 `activeDeadlineSeconds` 对齐 |
 
 **绝对不要**在生产改的：
 
@@ -254,6 +282,8 @@ DATABASE__URL: "postgresql+asyncpg://adoptimizer@postgres:5432/adoptimizer"
 | `SECURITY__REQUIRE_ACTION_APPROVAL` | `true` | 关掉等于让 Agent 无人审批直接改预算 |
 | `SECURITY__VERIFY_SESSION_ON_REQUEST` | `true` | 关掉后登出/停用不再即时生效，见 [ADR-0003](../adr/0003-session-revocation-on-request.md) |
 | `UVICORN_WORKERS` | `1` | >1 会让 run 与它的 SSE 订阅者分离，见 [ADR-0002](../adr/0002-in-process-run-dispatch.md) |
+| `INGEST__SOURCES` | `["synthetic"]` | **别把 `synthetic` 放进生产调度。**它是种子化 RNG 生成的数字，定时拉它等于凭空制造一段没有任何平台报告过的指标历史——而这恰恰是调度器要防止的失败模式 |
+| `INGEST__DRY_RUN` | `false` | 生产上设 `true` 会让每一趟都"成功"却什么都不写，水位也不推进，于是数据永远停在上线那天。演练完就关掉 |
 
 ---
 
@@ -325,7 +355,7 @@ nginx 运行时变量：
 
 | 阶段 | 内容 |
 |---|---|
-| backend | `ruff format --check` → `ruff check` → `mypy src`（strict）→ `pytest --cov`（覆盖率 <78% 即失败） |
+| backend | `ruff format --check` → `ruff check` → `mypy src`（strict）→ `pytest --cov`（覆盖率 <88% 即失败） |
 | frontend | `eslint --max-warnings 0` → `tsc` → `vitest run` → `vite build` |
 | images | push 时构建两个镜像（验证 Dockerfile 可用） |
 | manifests | `docker compose config` 与 `kustomize build` 渲染校验 |
@@ -358,6 +388,7 @@ main ─▶ 部署到 staging ─▶ 冒烟测试 ─▶ 部署到 production
 - [ ] `REDIS__URL` 带口令
 - [ ] `APP__CORS_ALLOW_ORIGINS` / `APP__TRUSTED_HOSTS` 是真实域名
 - [ ] `LLM__MONTHLY_BUDGET_USD` 按实际预算设置
+- [ ] `LLM__PRICING` 覆盖了实际使用的模型，启动日志里没有 `llm_model_has_no_pricing_entry`
 - [ ] `SECURITY__REQUIRE_ACTION_APPROVAL=true`
 - [ ] `SECURITY__VERIFY_SESSION_ON_REQUEST=true`
 - [ ] 单副本单 worker（`UVICORN_WORKERS=1`）
@@ -377,11 +408,15 @@ main ─▶ 部署到 staging ─▶ 冒烟测试 ─▶ 部署到 production
 - [ ] Prometheus 抓取 `/metrics`，能看到 `http_requests_total` 等指标
 - [ ] 日志采集器收到 JSON 日志，能按 `request_id` 检索
 - [ ] 告警规则已配（见运维手册 §3）
+- [ ] `ingest_ticks_total` 与 `ingest_lag_days` 有 series（`ingest_lag_days` 完全缺失 = 这个源从未被拉过，用 `absent()` 报）
 
 **验收**
 - [ ] `/healthz` 200，`/readyz` 200 且所有 check 为 ok
 - [ ] 引导管理员能登录，**并已改口令**
 - [ ] 已创建至少一个非引导的 admin 账号
+- [ ] `INGEST__SOURCES` 里没有 `synthetic`，且 `INGEST__SCHEDULER_ENABLED=false`（节奏归 CronJob）
+- [ ] 有外部推送管道时，它用的是 `ingestor` 账号而不是某个人的 optimizer / admin 账号（`audit_logs.actor_role` 可验证）
+- [ ] 手动跑一趟 `kubectl create job --from=cronjob/adoptimizer-ingest` 成功；`GET /api/v1/ingest/schedule` 里 `plan.reason` 变成 `covered`、`lease.held` 为 `false`
 - [ ] 触发一次 run 能跑完，SSE 时间线实时更新
 - [ ] 审批并执行一个动作成功，审计流水里有对应记录
 - [ ] 用 viewer 账号调写接口返回 403

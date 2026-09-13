@@ -9,7 +9,9 @@ from .alerts import AlertRepository
 from .audit import ABTestRepository, AuditRepository, IdempotencyRepository
 from .base import BaseRepository
 from .campaigns import CampaignRepository, CreativeRepository, MetricRepository
+from .ingest import IngestBatchRepository
 from .runs import RunRepository
+from .scheduling import LeaseRepository, WatermarkRepository
 from .users import UserRepository
 
 __all__ = [
@@ -20,7 +22,10 @@ __all__ = [
     "CampaignRepository",
     "CreativeRepository",
     "IdempotencyRepository",
+    "IngestBatchRepository",
+    "LeaseRepository",
     "MetricRepository",
     "RunRepository",
     "UserRepository",
+    "WatermarkRepository",
 ]

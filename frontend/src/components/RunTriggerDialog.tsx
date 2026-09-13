@@ -82,7 +82,7 @@ export function RunTriggerDialog({ open, onClose, initialCampaignIds }: RunTrigg
       open={open}
       onClose={onClose}
       title={t("Start an optimization run")}
-      description={t("The supervisor loops monitor → audience → creative → bidding → optimize. It produces proposals; nothing is applied without approval.")}
+      description={t("The supervisor loops monitor → audience → creative → bidding → optimize and then critic, which reconciles contradictory proposals. It produces proposals; nothing is applied without approval.")}
       size="lg"
       footer={
         <>

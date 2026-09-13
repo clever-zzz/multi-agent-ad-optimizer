@@ -104,6 +104,43 @@ ACTIONS_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+INGEST_RECORDS_TOTAL = Counter(
+    "ingest_records_total",
+    "Metric records offered to ingestion, by feed and disposition. "
+    "created + updated is what landed; rejected and unresolved are what the "
+    "producer has to fix, and a rising unresolved count means campaigns are "
+    "being created faster than they are being given external ids.",
+    labelnames=("source", "outcome"),
+    registry=REGISTRY,
+)
+
+INGEST_BATCHES_TOTAL = Counter(
+    "ingest_batches_total",
+    "Ingestion attempts by feed, including dry runs.",
+    labelnames=("source", "mode"),
+    registry=REGISTRY,
+)
+
+INGEST_TICKS_TOTAL = Counter(
+    "ingest_ticks_total",
+    "Scheduled ingestion attempts by feed and outcome. 'ran' pulled, 'skipped' "
+    "found the window already covered and 'lost_lease' found another holder "
+    "pulling it - all three are healthy. Only 'failed' should page.",
+    labelnames=("source", "outcome"),
+    registry=REGISTRY,
+)
+
+INGEST_LAG_DAYS = Gauge(
+    "ingest_lag_days",
+    "Days between the newest day a feed has covered and today, as of its last "
+    "scheduled attempt. The staleness alert lives here rather than on the tick "
+    "counter: ticks can keep succeeding while the window stays capped and the "
+    "data falls further behind. No series at all means the feed has never been "
+    "pulled, which absent() reports.",
+    labelnames=("source",),
+    registry=REGISTRY,
+)
+
 ACTIVE_RUNS = Gauge(
     "active_optimization_runs",
     "Optimization runs currently executing in this process.",

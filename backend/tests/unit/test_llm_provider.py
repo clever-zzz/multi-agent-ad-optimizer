@@ -16,7 +16,14 @@ from pydantic import ValidationError
 
 from adoptimizer.core.config import LLMProvider, LLMSettings
 from adoptimizer.core.errors import ExternalServiceError
-from adoptimizer.llm.base import CompletionRequest, estimate_cost
+from adoptimizer.llm.base import (
+    DEFAULT_PRICING,
+    CompletionRequest,
+    DeltaHandler,
+    estimate_cost,
+    is_priced,
+    resolve_pricing,
+)
 from adoptimizer.llm.openai_provider import DEFAULT_BASE_URLS, OpenAICompatibleModel
 
 
@@ -410,3 +417,298 @@ class TestClientLifecycle:
         await model.close()
 
         assert model._client is None
+
+
+def sse_body(*chunks: dict[str, Any], done: bool = True) -> bytes:
+    """Serialise chunks exactly the way an OpenAI-compatible SSE endpoint does."""
+    body = b""
+    for chunk in chunks:
+        body += b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n"
+    if done:
+        body += b"data: [DONE]\n\n"
+    return body
+
+
+def sse_handler(body: bytes, status: int = 200) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(status, content=body, headers={"content-type": "text/event-stream"})
+
+    return handler
+
+
+def collector() -> tuple[list[str], DeltaHandler]:
+    """A sink that records every fragment in arrival order."""
+    seen: list[str] = []
+
+    async def on_delta(fragment: str) -> None:
+        seen.append(fragment)
+
+    return seen, on_delta
+
+
+def delta_chunk(text: str, *, model: str | None = None) -> dict[str, Any]:
+    chunk: dict[str, Any] = {"choices": [{"delta": {"content": text}}]}
+    if model is not None:
+        chunk["model"] = model
+    return chunk
+
+
+def usage_chunk(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+    """The trailing usage-only chunk vendors send when include_usage is set."""
+    return {
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+class TestStreaming:
+    """Streamed completions: fragment order, usage accounting, failure mapping.
+
+    Streaming is the only transport some vendors offer for their reasoning
+    models, so the streamed path has to behave exactly like the buffered one:
+    same domain errors, same token accounting, same result contract.
+    """
+
+    async def test_fragments_arrive_in_order_and_rejoin_into_the_result_text(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        wire(
+            model,
+            sse_handler(
+                sse_body(
+                    delta_chunk('{"head'),
+                    delta_chunk("lines"),
+                    delta_chunk('": ["a"]}'),
+                    usage_chunk(120, 45),
+                )
+            ),
+        )
+        seen, on_delta = collector()
+
+        result = await model.complete(make_request(), on_delta=on_delta)
+
+        assert seen == ['{"head', "lines", '": ["a"]}']
+        assert "".join(seen) == result.text
+        assert result.text == '{"headlines": ["a"]}'
+        assert result.usage.prompt_tokens == 120
+        assert result.usage.completion_tokens == 45
+        assert result.usage.cost_usd == pytest.approx(estimate_cost("gpt-4o-mini", 120, 45))
+
+    async def test_a_streamed_payload_asks_for_usage_in_the_final_chunk(self) -> None:
+        """Without include_usage every streamed completion would be priced at zero."""
+        model = OpenAICompatibleModel(settings())
+        captured = wire(model, sse_handler(sse_body(delta_chunk("hi"), usage_chunk(1, 1))))
+        _, on_delta = collector()
+
+        await model.complete(make_request(), on_delta=on_delta)
+
+        payload = json.loads(captured[0].content)
+        assert payload["stream"] is True
+        assert payload["stream_options"] == {"include_usage": True}
+
+    async def test_a_buffered_call_never_asks_for_a_stream(self) -> None:
+        """Passing no handler must leave the request byte-for-byte as before."""
+        model = OpenAICompatibleModel(settings())
+        captured = wire(model, ok_handler())
+
+        await model.complete(make_request())
+
+        payload = json.loads(captured[0].content)
+        assert "stream" not in payload
+        assert "stream_options" not in payload
+
+    async def test_the_model_name_reported_by_the_stream_wins(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        wire(
+            model,
+            sse_handler(sse_body(delta_chunk("hi", model="qwen-plus"), usage_chunk(10, 5))),
+        )
+        _, on_delta = collector()
+
+        result = await model.complete(make_request(), on_delta=on_delta)
+
+        assert result.model == "qwen-plus"
+
+    async def test_reasoning_only_chunks_are_ignored_but_still_count_as_choices(self) -> None:
+        """Qwen thinking models stream reasoning_content before any content."""
+        model = OpenAICompatibleModel(settings())
+        wire(
+            model,
+            sse_handler(
+                sse_body(
+                    {"choices": [{"delta": {"reasoning_content": "thinking..."}}]},
+                    {"choices": [{"delta": {}}]},
+                    delta_chunk("answer"),
+                    usage_chunk(10, 5),
+                )
+            ),
+        )
+        seen, on_delta = collector()
+
+        result = await model.complete(make_request(), on_delta=on_delta)
+
+        assert seen == ["answer"]
+        assert result.text == "answer"
+
+    async def test_sse_comments_and_content_after_done_are_discarded(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        body = (
+            b": keep-alive\n\n"
+            b"event: message\n\n"
+            + sse_body(delta_chunk("kept"), done=False)
+            + b"data: [DONE]\n\n"
+            + sse_body(delta_chunk("dropped"))
+        )
+        wire(model, sse_handler(body))
+        seen, on_delta = collector()
+
+        result = await model.complete(make_request(), on_delta=on_delta)
+
+        assert seen == ["kept"]
+        assert result.text == "kept"
+
+    async def test_an_http_error_before_the_stream_opens_carries_the_body(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        wire(model, sse_handler(b'{"error": "rate limited"}', status=429))
+        _, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError) as caught:
+            await model.complete(make_request(), on_delta=on_delta)
+
+        assert "returned 429" in str(caught.value)
+        assert caught.value.detail["status"] == 429
+        assert "rate limited" in str(caught.value.detail["body"])
+
+    async def test_a_long_streamed_error_body_is_truncated(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        wire(model, sse_handler(b"e" * 5000, status=500))
+        _, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError) as caught:
+            await model.complete(make_request(), on_delta=on_delta)
+
+        assert len(str(caught.value.detail["body"])) == 400
+
+    async def test_a_truncated_chunk_is_refused_rather_than_skipped(self) -> None:
+        """Silently dropping half a JSON payload would corrupt the answer."""
+        model = OpenAICompatibleModel(settings())
+        wire(model, sse_handler(b"data: {truncated\n\ndata: [DONE]\n\n"))
+        _, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError) as caught:
+            await model.complete(make_request(), on_delta=on_delta)
+
+        assert "malformed chunk" in str(caught.value)
+
+    async def test_a_stream_that_never_reports_choices_is_refused(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        wire(model, sse_handler(sse_body(usage_chunk(10, 5))))
+        _, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError) as caught:
+            await model.complete(make_request(), on_delta=on_delta)
+
+        assert "no choices" in str(caught.value)
+
+    async def test_a_transport_failure_mid_stream_is_wrapped_not_leaked(self) -> None:
+        """The gateway retries on ExternalServiceError in either transport mode."""
+        model = OpenAICompatibleModel(settings())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            _ = request
+            raise httpx.ConnectError("dns")
+
+        wire(model, handler)
+        _, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError) as caught:
+            await model.complete(make_request(), on_delta=on_delta)
+
+        assert "LLM request failed" in str(caught.value)
+
+    async def test_a_provider_without_a_key_refuses_before_opening_a_stream(self) -> None:
+        model = OpenAICompatibleModel(settings())
+        model.is_available = False
+        seen, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError):
+            await model.complete(make_request(), on_delta=on_delta)
+
+        assert seen == []
+
+
+class TestPricing:
+    """How token counts become a dollar figure.
+
+    Cost accounting drives two things operators act on: the monthly budget hard
+    stop and /analytics/llm-spend. A model that is missing from the table, or
+    whose regional bill differs from the international list price, therefore has
+    to be correctable from configuration instead of from a code change.
+    """
+
+    def test_the_qwen_family_is_priced_from_its_own_entry(self) -> None:
+        """Before these rows existed, qwen landed on the 1.00/3.00 default."""
+        assert is_priced("qwen-turbo")
+        assert is_priced("qwen-plus")
+        assert is_priced("qwen-max")
+        assert resolve_pricing("qwen-turbo") == (0.05, 0.20)
+        assert resolve_pricing("qwen-plus") == (0.40, 1.20)
+        assert resolve_pricing("qwen-max") == (1.60, 6.40)
+
+    def test_an_unknown_model_falls_back_to_the_default_row(self) -> None:
+        assert is_priced("mystery-model") is False
+        assert resolve_pricing("mystery-model") == DEFAULT_PRICING["default"]
+        assert estimate_cost("mystery-model", 10**6, 10**6) == pytest.approx(4.0)
+
+    def test_the_default_row_is_not_itself_a_priced_model(self) -> None:
+        assert is_priced("default") is False
+
+    def test_a_deployment_override_beats_the_builtin_table(self) -> None:
+        overrides = {"qwen-plus": (0.113, 0.282)}
+
+        assert resolve_pricing("qwen-plus", overrides) == (0.113, 0.282)
+        # Models the override does not mention keep their built-in price.
+        assert resolve_pricing("qwen-turbo", overrides) == (0.05, 0.20)
+
+    def test_an_override_can_reprice_the_fallback_row_too(self) -> None:
+        assert resolve_pricing("mystery-model", {"default": (0.5, 1.5)}) == (0.5, 1.5)
+
+    def test_an_explicit_zero_price_is_honoured_rather_than_read_as_missing(self) -> None:
+        """Free tiers are real; quietly billing them at the default defeats them."""
+        free = {"free-tier": (0.0, 0.0)}
+
+        assert is_priced("free-tier", free)
+        assert resolve_pricing("free-tier", free) == (0.0, 0.0)
+        assert estimate_cost("free-tier", 10**6, 10**6, overrides=free) == 0.0
+
+    async def test_the_provider_bills_with_the_configured_override(self) -> None:
+        model = OpenAICompatibleModel(settings(pricing={"gpt-4o-mini": (0.01, 0.02)}))
+        wire(model, ok_handler(prompt_tokens=1_000_000, completion_tokens=1_000_000))
+
+        result = await model.complete(make_request())
+
+        assert result.usage.cost_usd == pytest.approx(0.03)
+
+    async def test_the_provider_bills_a_qwen_model_from_its_own_entry(self) -> None:
+        model = OpenAICompatibleModel(
+            settings(
+                model="qwen-plus",
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+        )
+        wire(
+            model,
+            ok_handler(
+                prompt_tokens=1_000_000,
+                completion_tokens=1_000_000,
+                model_name="qwen-plus",
+            ),
+        )
+
+        result = await model.complete(make_request())
+
+        assert result.usage.cost_usd == pytest.approx(1.60)

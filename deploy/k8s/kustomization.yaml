@@ -24,6 +24,7 @@ resources:
   - postgres.yaml
   - redis.yaml
   - migrate-job.yaml
+  - ingest-cronjob.yaml
   - backend.yaml
   - frontend.yaml
   - ingress.yaml

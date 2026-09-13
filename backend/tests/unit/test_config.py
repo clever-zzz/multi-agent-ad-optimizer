@@ -11,12 +11,14 @@ import os
 
 import pytest
 from pydantic import ValidationError
+from pydantic_settings import SettingsError
 
 from adoptimizer.core.config import (
     INSECURE_SECRET_SENTINELS,
     DatabaseSettings,
     DataMode,
     Environment,
+    IngestSettings,
     LLMProvider,
     LLMSettings,
     ObservabilitySettings,
@@ -38,11 +40,21 @@ LEAKY_KEYS = (
     "SECURITY__BOOTSTRAP_ADMIN_PASSWORD",
     "LLM__PROVIDER",
     "LLM__API_KEY",
+    "LLM__PRICING",
     "DATA_MODE",
     "REDIS__ENABLED",
     "CLICKHOUSE__ENABLED",
     "OPTIMIZATION__MAX_ITERATIONS",
     "OBSERVABILITY__LOG_LEVEL",
+    # A developer who has switched the resident loop on locally would otherwise
+    # hand that cadence to every test in the suite.
+    "INGEST__SCHEDULER_ENABLED",
+    "INGEST__SOURCES",
+    "INGEST__INTERVAL_MINUTES",
+    "INGEST__LOOKBACK_DAYS",
+    "INGEST__MAX_CATCHUP_DAYS",
+    "INGEST__LEASE_TTL_SECONDS",
+    "INGEST__DRY_RUN",
 )
 
 
@@ -216,6 +228,37 @@ class TestLLMSettings:
     def test_fail_open_to_mock_is_the_default(self) -> None:
         assert LLMSettings().fail_open_to_mock is True
 
+    def test_pricing_overrides_default_to_empty(self) -> None:
+        """No override means the built-in table in llm/base.py is used as-is."""
+        assert LLMSettings().pricing == {}
+
+    def test_pricing_is_parsed_from_a_json_environment_variable(
+        self, clean_env: pytest.MonkeyPatch
+    ) -> None:
+        """Regional bills differ from list prices, so this has to be tunable."""
+        clean_env.setenv("LLM__PRICING", '{"qwen-plus": [0.113, 0.282], "default": [0.5, 1.5]}')
+
+        pricing = load().llm.pricing
+
+        assert pricing["qwen-plus"] == (0.113, 0.282)
+        assert pricing["default"] == (0.5, 1.5)
+
+    def test_a_negative_price_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="must not be negative"):
+            LLMSettings(pricing={"qwen-plus": (-0.1, 0.282)})
+
+    def test_a_negative_price_is_refused_when_it_arrives_from_the_environment(
+        self, clean_env: pytest.MonkeyPatch
+    ) -> None:
+        clean_env.setenv("LLM__PRICING", '{"qwen-plus": [0.113, -1]}')
+
+        with pytest.raises(ValidationError, match="LLM__PRICING"):
+            load()
+
+    def test_a_zero_price_is_accepted(self) -> None:
+        """Free tiers and promotional credit are legitimate, not a typo."""
+        assert LLMSettings(pricing={"qwen-plus": (0.0, 0.0)}).pricing["qwen-plus"] == (0.0, 0.0)
+
 
 class TestObservability:
     def test_log_level_is_normalised(self) -> None:
@@ -251,3 +294,120 @@ class TestSettingsCache:
         reload_settings()
         clean_env.setenv("APP__NAME", "Second")
         assert reload_settings().app.name == "Second"
+
+
+class TestIngestSettings:
+    """The scheduled pull's policy knobs.
+
+    These are the values the deployment manifests publish, so a validator that
+    quietly rewrites one is a deployment that behaves differently from the file
+    describing it.
+    """
+
+    def test_the_defaults_pull_the_demo_feed_on_a_six_hour_cadence(self) -> None:
+        settings = IngestSettings()
+
+        assert settings.sources == ["synthetic"]
+        assert settings.interval_minutes == 360
+        assert settings.lookback_days == 3
+        assert settings.max_catchup_days == 14
+        assert settings.lease_ttl_seconds == 1800
+        assert settings.scheduler_enabled is True
+        assert settings.dry_run is False
+
+    def test_feed_names_are_trimmed_lowered_and_deduplicated(self) -> None:
+        """They become metric labels, so two spellings must not make two series."""
+        settings = IngestSettings(sources=[" Platform ", "platform", "meta.ads"])
+
+        assert settings.sources == ["platform", "meta.ads"]
+
+    def test_blank_entries_are_dropped(self) -> None:
+        assert IngestSettings(sources=["   ", "platform"]).sources == ["platform"]
+
+    def test_an_empty_feed_list_is_refused(self) -> None:
+        """A schedule with nothing to pull would report success forever."""
+        with pytest.raises(ValidationError, match="at least one feed"):
+            IngestSettings(sources=[])
+
+    def test_a_list_of_only_blanks_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="at least one feed"):
+            IngestSettings(sources=["  ", ""])
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "has space",
+            "-leading-dash",
+            ".leading-dot",
+            # strip() forgives the ends only: a tab in the middle still reaches
+            # the pattern, and the pattern is what bounds the metric label.
+            "tab\tinside",
+            "a" * 31,
+            "emoji\u9ad8",
+        ],
+    )
+    def test_a_shape_that_would_corrupt_a_label_is_refused(self, name: str) -> None:
+        with pytest.raises(ValidationError, match="must match"):
+            IngestSettings(sources=[name])
+
+    def test_a_recovery_bound_narrower_than_the_lookback_is_refused(self) -> None:
+        """Otherwise every ordinary run reports a gap it is not allowed to close."""
+        with pytest.raises(ValidationError, match="INGEST__MAX_CATCHUP_DAYS"):
+            IngestSettings(lookback_days=7, max_catchup_days=3)
+
+    def test_a_recovery_bound_equal_to_the_lookback_is_allowed(self) -> None:
+        assert IngestSettings(lookback_days=7, max_catchup_days=7).max_catchup_days == 7
+
+    def test_a_cadence_that_cannot_fire_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            IngestSettings(interval_minutes=0)
+
+
+class TestIngestEnvironment:
+    """The exact keys the ConfigMap and the compose anchor publish."""
+
+    def test_every_manifest_key_reaches_the_settings(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("INGEST__SCHEDULER_ENABLED", "false")
+        clean_env.setenv("INGEST__SOURCES", '["platform"]')
+        clean_env.setenv("INGEST__INTERVAL_MINUTES", "60")
+        clean_env.setenv("INGEST__LOOKBACK_DAYS", "5")
+        clean_env.setenv("INGEST__MAX_CATCHUP_DAYS", "30")
+        clean_env.setenv("INGEST__LEASE_TTL_SECONDS", "900")
+        clean_env.setenv("INGEST__DRY_RUN", "true")
+
+        settings = load().ingest
+
+        assert settings.scheduler_enabled is False
+        assert settings.sources == ["platform"]
+        assert settings.interval_minutes == 60
+        assert settings.lookback_days == 5
+        assert settings.max_catchup_days == 30
+        assert settings.lease_ttl_seconds == 900
+        assert settings.dry_run is True
+
+    def test_an_absent_block_leaves_the_defaults_alone(self, clean_env: pytest.MonkeyPatch) -> None:
+        assert load().ingest == IngestSettings()
+
+    def test_a_feed_list_that_is_not_json_fails_at_boot(
+        self, clean_env: pytest.MonkeyPatch
+    ) -> None:
+        """Refusing to start beats starting a schedule that pulls nothing.
+
+        A list field is parsed as JSON before the validators ever see it, so a
+        bare word raises pydantic-settings' own SettingsError rather than a
+        ValidationError. Either way the process does not come up, which is the
+        property that matters: the manifests must publish valid JSON.
+        """
+        clean_env.setenv("INGEST__SOURCES", "platform")
+
+        with pytest.raises(SettingsError):
+            load()
+
+    def test_an_unschedulable_combination_fails_at_boot(
+        self, clean_env: pytest.MonkeyPatch
+    ) -> None:
+        clean_env.setenv("INGEST__LOOKBACK_DAYS", "30")
+        clean_env.setenv("INGEST__MAX_CATCHUP_DAYS", "7")
+
+        with pytest.raises(ValidationError, match="INGEST__MAX_CATCHUP_DAYS"):
+            load()

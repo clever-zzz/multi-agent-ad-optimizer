@@ -6,7 +6,7 @@
 |---|---|
 | [01 快速开始](01-quickstart.md) | 在 Windows / macOS / Linux / Docker 四种路径下把系统跑起来，并验证它确实在工作 |
 | [02 架构](02-architecture.md) | 分层职责、Agent 编排细节、数据模型、事件流、并发模型 |
-| [03 API 参考](03-api-reference.md) | 全部 51 个端点、RBAC 权限矩阵、错误契约、幂等与分页约定、curl 示例 |
+| [03 API 参考](03-api-reference.md) | 全部 53 个端点、RBAC 权限矩阵、错误契约、幂等与分页约定、curl 示例 |
 | [04 部署](04-deployment.md) | Compose 与 Kubernetes 上线步骤、环境变量清单、PostgreSQL/Redis/ClickHouse 准备、上线检查单 |
 | [05 运维手册](05-operations-runbook.md) | 日常巡检、告警响应、常见故障处置、备份恢复、容量与保留期、升级与回滚 |
 | [06 安全](06-security.md) | 威胁模型、认证授权实现、密钥管理、审计、加固清单、渗透测试关注点 |

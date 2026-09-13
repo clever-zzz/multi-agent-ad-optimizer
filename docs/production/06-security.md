@@ -24,12 +24,13 @@
 | 凭据暴力破解 | Argon2id + 失败计数 + 账号锁定（5 次 / 15 分钟） | `services/auth.py` |
 | token 被盗后长期可用 | access token 30 分钟 + 每请求校验会话 + 登出/停用即时吊销 | `core/deps.py`，[ADR-0003](../adr/0003-session-revocation-on-request.md) |
 | refresh token 重放 | 每次刷新**轮换**，旧 token 立即失效 | `services/auth.py` |
-| 越权操作 | 13 权限 × 4 角色的 RBAC，路由级强制 | `core/security.py` |
+| 越权操作 | 14 权限 × 5 角色的 RBAC，路由级强制；前端那份副本由后端测试反向校验 | `core/security.py` |
 | 管理员误操作把自己锁死 | 拒绝停用/降级最后一个在职 admin | `services/auth.py` |
 | Agent 幻觉导致乱花钱 | 所有动作落 `optimization_actions`，默认需人工审批才执行 | `services/actions.py` |
 | 模型供应商不可用/超支 | 重试 + 超时 + 月度预算护栏 + 可配置降级到 mock | `llm/gateway.py` |
-| 重复提交造成双倍操作 | `Idempotency-Key` + 请求指纹校验 | `repositories/audit.py` |
+| 重复提交造成双倍操作 | `POST /runs` 的 `Idempotency-Key`，由唯一索引 `uq_run_idempotency` 在插入时仲裁并发重放；审批/执行类端点靠状态机（重复 approve / execute 返回 409）。**无请求指纹校验**，见 [08 §6.6](08-limitations-and-roadmap.md) | `services/optimization.py`、`services/actions.py` |
 | 无法追责 | 全量审计：actor、before/after、IP、UA、request_id | `services/audit.py` |
+| 指标数据投毒（喂假数字，让优化器去乱调真实预算） | `metrics:write` 只给 admin 与专用的 `ingestor` 机器身份（已从 optimizer 收回，泄露的采集凭据动不了活动与动作）；每行盖 `source` + `batch_id`，可回溯到断言它的那个源与那一次采集；批次台账 + 审计条目；即使数字被污染，写平台仍受人工审批门约束 | `services/ingest.py`、`api/v1/ingest.py`、`services/actions.py` |
 | XSS / 点击劫持 / MIME 嗅探 | CSP、`X-Frame-Options: DENY`、`nosniff`、Referrer/Permissions-Policy | `core/middleware.py` |
 | 中间人 | HSTS（https 请求）、ingress 强制 TLS 重定向 | `core/middleware.py`、`deploy/k8s/ingress.yaml` |
 | DoS | 令牌桶限流 + 请求体大小上限 + 请求超时 + gzip 最小尺寸 | `core/middleware.py` |
@@ -126,6 +127,8 @@ dependencies=[require_role(Role.ADMIN, Role.OPTIMIZER)]
 
 这样调整角色→权限映射只需要改 `core/security.py::_ROLE_PERMISSIONS` 一处，不必翻遍所有路由。`/admin/*` 是例外：那些是运维操作，用 `require_role(Role.ADMIN)` 直接断言角色更明确。
 
+前端 `stores/auth.ts` 里有一份矩阵副本（用来隐藏 API 会拒绝的控件）。副本必然漂移，所以 `tests/unit/test_security.py::TestFrontendMirror` 直接解析那个 TS 文件，逐角色比对权限集合，并校验 `types.ts` 里的 `Role` / `Permission` 联合类型与后端枚举一致——漂移在后端 CI 就红，不用等操作者在页面上撞 403。
+
 ### 3.2 最后一个 admin 护栏
 
 `AuthService.set_active` 与 `set_role` 在执行前统计在职 admin 数量。如果目标是最后一个，返回 `409 ConflictError`。
@@ -150,6 +153,7 @@ dependencies=[require_role(Role.ADMIN, Role.OPTIMIZER)]
 | 响应 | DTO（`schemas/`）与 ORM 模型分离，不会意外泄露 `hashed_password` 等字段 |
 | 错误 | 统一 problem document，`detail` 不暴露堆栈、SQL、内部路径 |
 | LLM 输出 | 结构化输出经 Pydantic 校验；不合法则回退确定性规则生成器，**不会把模型的自由文本直接写库或执行** |
+| 指标入口 | `extra="forbid"`：未知列名整批 422，某列被改名时不会静默按 0 写入；`source` 受正则约束（小写短名），因为它同时是 Prometheus 标签，自由文本会撑开序列基数；单批 5000 条上限；`rejected` / `unresolved` 明细截断到 200 条但计数精确 |
 | SSRF | 广告平台适配器的 base URL 来自配置，不接受用户输入 |
 
 关于 LLM 的一个关键设计：**Agent 只能"提案"，不能"执行"**。
@@ -305,10 +309,10 @@ LLM__PROVIDER=mock                        # 停止真实模型调用与花费
 
 | 方向 | 具体测试 |
 |---|---|
-| 授权 | 用 viewer token 打全部写端点；用 optimizer token 打 `/admin/*`；改 JWT 里的 `role`/`permissions` 字段（应被签名拦住） |
+| 授权 | 用 viewer token 打全部写端点；用 optimizer token 打 `/admin/*` 与 `POST /ingest/metrics`；用 ingestor token 打 `/campaigns`、`/runs`、`/actions/*`（应全部 403）；改 JWT 里的 `role`/`permissions` 字段（应被签名拦住） |
 | 会话 | 登出后继续用旧 access token；停用账号后用旧 token；改角色后用旧 token |
 | 审批门 | 未审批直接 `POST /actions/{id}/execute`；重复执行同一动作；approve 后再 reject |
-| 幂等 | 同一 `Idempotency-Key` 配不同 body；并发同 key |
+| 幂等 | 同一 `Idempotency-Key` 配不同 body（当前返回首次的 run，不是 409——这是已知缺口）。「并发同 key」已自动化：`test_concurrent_replays_create_exactly_one_run` |
 | 注入 | 活动名/创意文案/审计过滤参数里的 SQL 与 XSS 载荷（后者要看前端是否转义） |
 | 限流 | 登录爆破；`/runs` 触发频率；限流是否按主体而非按 IP |
 | LLM | 在创意文案、活动名里塞 prompt injection，看能否让 Agent 提出异常动作（预期：只能产生提案，且被审批门拦住） |

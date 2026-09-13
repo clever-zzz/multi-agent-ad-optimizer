@@ -179,6 +179,73 @@ async def add_breakdown_only_campaign(session: Any) -> str:
     return campaign.id
 
 
+class TestMetricRepositorySnapshots:
+    """The primary-datastore reader must honour the same slot contract.
+
+    This path, not the warehouse, is what ``collect_run_inputs`` reads, so it is
+    what every agent in a run actually reasons about.
+    """
+
+    async def test_both_granularities_are_not_summed_together(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        snapshots = await MetricRepository(session).snapshots(days=7)
+
+        alpha = next(item for item in snapshots if item.campaign_id == portfolio["alpha"])
+        # 10_000 + 8_000 from the two campaign-level slots. Adding today's two
+        # creative rows would report 28_000 impressions and 1_400 of spend.
+        assert alpha.impressions == 18_000
+        assert alpha.clicks == 640
+        assert alpha.conversions == 28
+        assert alpha.total_cost == 900.0
+        assert alpha.total_revenue == 2400.0
+
+    async def test_it_agrees_with_the_warehouse_reader(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        """Two readers over one table must not disagree about the numbers."""
+        repository = await MetricRepository(session).snapshots(days=7)
+        warehouse = await SqlAggregateWarehouse(session).campaign_snapshots(None, days=7)
+
+        def measures(items: list[Any]) -> dict[str, tuple[Any, ...]]:
+            return {
+                item.campaign_id: (
+                    item.impressions,
+                    item.clicks,
+                    item.conversions,
+                    item.total_cost,
+                    item.total_revenue,
+                )
+                for item in items
+            }
+
+        assert measures(repository) == measures(warehouse)
+
+    async def test_a_breakdown_only_campaign_is_still_counted(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        """Having no roll-up row must not make a campaign read as zero and vanish."""
+        campaign_id = await add_breakdown_only_campaign(session)
+
+        snapshots = await MetricRepository(session).snapshots(days=7)
+
+        only = next(item for item in snapshots if item.campaign_id == campaign_id)
+        assert only.impressions == 5_000
+        assert only.clicks == 140
+        assert only.conversions == 9
+        assert only.total_cost == 250.0
+        assert only.total_revenue == 680.0
+
+    async def test_the_window_still_bounds_the_sum(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        snapshots = await MetricRepository(session).snapshots([portfolio["alpha"]], days=1)
+
+        assert len(snapshots) == 1
+        assert snapshots[0].impressions == 10_000
+        assert snapshots[0].total_cost == 500.0
+
+
 class TestSqlAggregateWarehouse:
     async def test_snapshots_sum_only_the_requested_window(
         self, session: Any, portfolio: dict[str, str]

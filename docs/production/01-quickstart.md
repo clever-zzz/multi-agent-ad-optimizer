@@ -109,25 +109,33 @@ cp .env.example .env
 
 ```json
 {
-  "run_id": "run_...",
+  "run_id": "run_01M20W625V0P54D3VHRKB479TN",
   "completed": true,
   "status": "succeeded",
   "summary": {
     "status": "succeeded",
     "iterations": 2,
     "campaigns": 8,
-    "creatives_generated": 6,
+    "creatives_generated": 24,
     "bidding_decisions": 8,
     "budget_adjustments": 8,
-    "actions": 14,
-    "action_counts": {"adjust_budget": 5, "adjust_bid": 6, "pause_creative": 2, "start_ab_test": 1},
-    "alerts_raised": 7,
-    "health": {"Aurora Smart Watch - Search": 86.4, "...": 0},
-    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0},
-    "messages": ["monitor: detected 7 anomalies across 8 campaigns", "..."]
+    "actions": 11,
+    "actions_proposed": 58,
+    "actions_suppressed": 47,
+    "critic_findings": 51,
+    "tool_preflights": 36,
+    "preflights_blocked": 0,
+    "action_counts": {"pause_campaign": 8, "pause_creative": 2, "refresh_creative": 1},
+    "alerts_raised": 9,
+    "health": {"status": "warning", "score": 69.52, "portfolio": {"ctr": 0.01339, "roas": 11.5251}, "...": 0},
+    "usage": {"prompt_tokens": 1824, "completion_tokens": 1894, "total_tokens": 3718, "cost_usd": 0.0, "calls": 8, "duration_s": 1.335},
+    "messages": [{"agent": "monitor", "content": "Monitored 8 campaigns. Health 69.5/100 (warning)...", "iteration": 0}, "..."],
+    "tools": {"calls": 46, "writes": 36, "dry_runs": 36, "refusals": 0, "...": 0}
   }
 }
 ```
+
+`usage` 由网关按 run 归集，与 `llm_spend` 表逐行同源——控制台上的 token 数和花费不会和账本对不上。两点容易误读：mock provider 不计费，所以 `cost_usd` 恒为 `0.0`（token 数仍然是真实统计的）；缓存命中的调用不重复记账，因此同一批 prompt 紧接着再跑一次，`usage` 可能显示 0，这不是丢数据。
 
 再启动 API 并用 Swagger 手动点一遍：
 
@@ -148,6 +156,31 @@ cp .env.example .env
 .venv/Scripts/adoptimizer token --email admin@adoptimizer.dev
 # 口令走隐藏输入，不会进 shell history
 ```
+
+### 数据入口：采集与调度
+
+优化闭环吃的指标不只有种子数据这一条路。先干跑一趟，报告会逐条说明哪些记录会被拒、为什么：
+
+```bash
+.venv/Scripts/adoptimizer ingest --source synthetic --days 7 --dry-run
+```
+
+去掉 `--dry-run` 就真写库。落库是 upsert，一个 `(活动, 创意, 日期)` 槽位只有一行，所以重复拉不会把指标翻倍：
+
+```bash
+.venv/Scripts/adoptimizer ingest --source synthetic --days 7
+```
+
+调度器把这件事从"一次性命令"变成"按日历补窗口"：
+
+```bash
+.venv/Scripts/adoptimizer scheduler --once     # 跑一趟就退出，K8s CronJob 调的就是它
+.venv/Scripts/adoptimizer scheduler            # 常驻循环，需要 INGEST__SCHEDULER_ENABLED=true
+```
+
+窗口是从日历推出来的，不是从游标推的：漏跑一次，下一趟会往回补到"上一个已覆盖日的次日"；补不动了（超过 `INGEST__MAX_CATCHUP_DAYS`）就在 `plan.reason` 里报 `capped`、在 `plan.detail` 里给出确切的回填命令，而不是悄悄把窗口收窄。多副本同时跑也安全——数据库租约保证同一个 feed 同一时刻只有一趟在拉。
+
+干跑会留下一条 `dry_run=true` 的批次记录（这是刻意的：排练过和从没跑过必须能区分开），但一行指标都不写、水位也不推进。
 
 ---
 
@@ -185,7 +218,7 @@ docker compose -f deploy/compose/docker-compose.yml down -v
 
 ## 验证它真的在工作
 
-跑完上面任一路径后，按顺序确认这 6 件事：
+跑完上面任一路径后，按顺序确认这 7 件事：
 
 **1. 依赖健康**
 
@@ -254,6 +287,23 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 - 「动作」页有待审批提案，点「批准」→「执行」状态会变
 - 「告警」页有 open 告警，可以 ack / resolve
 - 「审计」页（admin）能看到你刚才每一步操作
+
+**7. 采集与调度能跑**
+
+```bash
+.venv/Scripts/adoptimizer scheduler --once     # 第一次：plan.reason 是 first / catchup，真的拉
+.venv/Scripts/adoptimizer scheduler --once     # 第二次：plan.reason 是 covered，不再重复拉
+```
+
+再看三个只读状态接口：
+
+```bash
+curl -s http://localhost:8000/api/v1/ingest/schedule -H "Authorization: Bearer $TOKEN" | python -m json.tool
+curl -s http://localhost:8000/api/v1/ingest/sources  -H "Authorization: Bearer $TOKEN" | python -m json.tool
+curl -s "http://localhost:8000/api/v1/ingest/batches?page_size=5" -H "Authorization: Bearer $TOKEN" | python -m json.tool
+```
+
+`/schedule` 是纯只读的——它只做计划、不拉数据，所以轮询它不会启动任何工作。三个 GET 都只要 `metrics:read`（viewer 也有），只有 `POST /ingest/metrics` 需要 `metrics:write`（admin / ingestor）。`plan.reason` 的完整取值与排查表见 [05 运维手册](05-operations-runbook.md)。
 
 ---
 

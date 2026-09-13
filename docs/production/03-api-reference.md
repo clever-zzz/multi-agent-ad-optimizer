@@ -62,32 +62,38 @@ Authorization: Bearer <access_token>
 
 ## 2. RBAC 权限矩阵
 
-13 个权限，4 个角色。路由断言**权限**而不是角色，因此角色→权限的映射可以在 `core/security.py::_ROLE_PERMISSIONS` 一处调整。
+14 个权限，5 个角色。路由断言**权限**而不是角色，因此角色→权限的映射可以在 `core/security.py::_ROLE_PERMISSIONS` 一处调整。
 
-| 权限 | admin | optimizer | analyst | viewer |
-|---|:--:|:--:|:--:|:--:|
-| `campaign:read` | ✅ | ✅ | ✅ | ✅ |
-| `campaign:write` | ✅ | ✅ | — | — |
-| `run:read` | ✅ | ✅ | ✅ | ✅ |
-| `run:trigger` | ✅ | ✅ | — | — |
-| `action:approve` | ✅ | ✅ | — | — |
-| `action:execute` | ✅ | ✅ | — | — |
-| `alert:read` | ✅ | ✅ | ✅ | ✅ |
-| `alert:ack` | ✅ | ✅ | ✅ | — |
-| `creative:write` | ✅ | ✅ | — | — |
-| `metrics:read` | ✅ | ✅ | ✅ | ✅ |
-| `system:read` | ✅ | ✅ | ✅ | — |
-| `user:manage` | ✅ | — | — | — |
-| `audit:read` | ✅ | — | — | — |
+| 权限 | admin | optimizer | analyst | viewer | ingestor |
+|---|:--:|:--:|:--:|:--:|:--:|
+| `campaign:read` | ✅ | ✅ | ✅ | ✅ | — |
+| `campaign:write` | ✅ | ✅ | — | — | — |
+| `run:read` | ✅ | ✅ | ✅ | ✅ | — |
+| `run:trigger` | ✅ | ✅ | — | — | — |
+| `action:approve` | ✅ | ✅ | — | — | — |
+| `action:execute` | ✅ | ✅ | — | — | — |
+| `alert:read` | ✅ | ✅ | ✅ | ✅ | — |
+| `alert:ack` | ✅ | ✅ | ✅ | — | — |
+| `creative:write` | ✅ | ✅ | — | — | — |
+| `metrics:read` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `metrics:write` | ✅ | — | — | — | ✅ |
+| `system:read` | ✅ | ✅ | ✅ | — | — |
+| `user:manage` | ✅ | — | — | — | — |
+| `audit:read` | ✅ | — | — | — | — |
 
 `/admin/*` 全部端点用 `require_role(Role.ADMIN)` 直接断言角色（而不仅是权限），因为这些是运维操作。
 
 **角色定位**
 
 - **admin** — 平台负责人。全部权限，含账号管理、审计查看、灌种子、保留期清理。
-- **optimizer** — 投放操盘手。能改活动、触发优化、审批并执行动作，但**看不到审计流水、管不了账号**。
+- **optimizer** — 投放操盘手。能改活动、触发优化、审批并执行动作，但**看不到审计流水、管不了账号、也不能灌指标**。
 - **analyst** — 分析师。只读全部业务数据 + 能确认告警，不能改任何东西。
 - **viewer** — 观察者。只读，连告警确认都不能做。
+- **ingestor** — 采集管道的**机器身份**，只有 `metrics:read` + `metrics:write` 两条。给定时任务或外部推送管道发这个角色的凭据：凭据泄露只能伪造数字，改不了活动、审批不了动作，也就没法把自己伪造的数字批成真实预算变更。它持有的权限比 viewer 还少，但其中一条是写权限——所以它的定位不是"权限最少"，而是"范围最窄"。
+
+> ⚠️ **行为变更**：`metrics:write` 已从 optimizer 收回。原本用 optimizer 账号推送 `POST /ingest/metrics` 的管道会开始收到 `403 permission_denied`；建一个 ingestor 账号并换掉那份凭据即可。用 `adoptimizer scheduler` / `adoptimizer ingest` 走进程内路径的采集不受影响，它根本不经过 HTTP 鉴权。
+
+前端 `frontend/src/stores/auth.ts` 里存着这张矩阵的一份副本，用来隐藏 API 会拒绝的控件。副本会与真身漂移（历史上漂过两次），所以 `backend/tests/unit/test_security.py::TestFrontendMirror` 会解析那个文件并与 `_ROLE_PERMISSIONS` 逐角色比对，不一致就让后端测试变红。
 
 ---
 
@@ -145,7 +151,7 @@ Authorization: Bearer <access_token>
 
 ### 4.2 幂等
 
-所有会产生副作用的 `POST` 接受 `Idempotency-Key` 请求头：
+目前**只有 `POST /api/v1/runs`** 接受 `Idempotency-Key` 请求头：
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/runs \
@@ -155,7 +161,15 @@ curl -X POST http://localhost:8000/api/v1/runs \
   -d '{"max_iterations":2}'
 ```
 
-同一个 key + 同一个 actor + 同一个请求指纹，第二次调用直接返回**首次的响应体和状态码**，不会重复执行。key 与请求指纹不匹配（同 key 不同 body）返回 409。记录带 `expires_at`，由 `POST /admin/prune` 或保留期任务清理。
+key 按 **actor** 作用域。同一个 key + 同一个 actor 第二次调用，返回**首次创建的那个 run**（202 + 该 run 的当前状态），不会再派发一次执行。
+
+守卫是 `optimization_runs` 上的唯一索引 `uq_run_idempotency (idempotency_key, requested_by)`。`start_run` 是先查后插，两个并发调用可能都查不到，因此由索引在**插入时**仲裁：输的一方回滚，然后拿回赢家的 run。带 key 但没有 actor 的调用返回 422——`(key, NULL)` 在 SQL 里互不相同，约束会静默失效，所以宁可拒绝。
+
+`background: false` 的重放不会 404。拿不到本地任务的调用方（并发重放、请求落到另一个副本）改为轮询数据库，直到 run 进入终态或超时。
+
+**没有请求指纹校验。** 同一个 key 配不同 body 会返回首次的 run，而不是 409，所以不要跨不同载荷复用同一个 key。`idempotency_records` 表为指纹与响应体重放预留了完整结构（PK、`request_fingerprint`、`response_body`、`expires_at`），但目前没有写入者，详见 [08 限制与路线图](08-limitations-and-roadmap.md) §6.6。
+
+其他会产生副作用的 `POST`（审批 / 执行 / 批量、创意、活动、告警）不读这个头，靠状态机防重复：重复 approve、重复 execute 都返回 409。
 
 ### 4.3 请求追踪
 
@@ -322,7 +336,146 @@ proposed ──approve──▶ approved ──execute──▶ executed
 | GET | `/analytics/llm-spend` | `system:read` | 按 provider/model 的模型花费 |
 | GET | `/analytics/detect` | `metrics:read` | 只跑异常检测，不做完整优化 |
 
-### 5.9 `/api/v1/admin`（全部需要 `admin` 角色）
+### 5.9 `/api/v1/ingest`
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| POST | `/ingest/metrics` | `metrics:write` | 推一批日粒度指标，逐条报告下落 |
+| GET | `/ingest/batches` | `metrics:read` | 采集批次台账（含干跑），`?source=` 可过滤 |
+| GET | `/ingest/sources` | `metrics:read` | 已注册数据源及其当下可用性 |
+| GET | `/ingest/schedule` | `metrics:read` | 定时拉取的**计划**与水位：每个源当下是 due / 已覆盖 / 在补 / 需要人工补数 |
+
+`POST /ingest/metrics` 请求体：
+
+```json
+{
+  "source": "warehouse.daily",
+  "dry_run": false,
+  "records": [
+    {
+      "platform": "google",
+      "external_id": "ext_google_1000",
+      "stat_date": "2026-09-08",
+      "impressions": 12000,
+      "clicks": 480,
+      "conversions": 31,
+      "cost": 912.4
+    },
+    { "campaign_id": "camp_01J8ZK...", "stat_date": "2026-09-08", "revenue": 4210.0 }
+  ]
+}
+```
+
+响应 **始终是 200**（即使有记录被拒）——批次被处理了，报告说明每条的下落。4xx 意味着**请求本身**不可用，这和"数据脏"是两件事，不该混为一谈：
+
+```json
+{
+  "batch_id": "ing_01J8ZK...",
+  "source": "warehouse.daily",
+  "dry_run": false,
+  "received": 2,
+  "created": 1,
+  "updated": 1,
+  "rejected_count": 0,
+  "unresolved_count": 0,
+  "rejected": [],
+  "unresolved": [],
+  "issues_truncated": false,
+  "window_start": "2026-09-08",
+  "window_end": "2026-09-08"
+}
+```
+
+`received == created + updated + rejected_count + unresolved_count`，服务在返回前会断言这一条（`IngestReportOut.reconciles()`）。对不上账的报告是运维最该怀疑的东西，所以它不允许离开这一层。
+
+**校验分两层**，因为两种"错"对值班的人意味着不同的事：
+
+| 层 | 谁拒 | 后果 | 含义 |
+|---|---|---|---|
+| 结构性 | Pydantic | **422，整批失败** | 生产端坏了：记录不是对象、`stat_date` 不是日期、出现了不认识的字段名 |
+| 语义 | `services/ingest.py` | **逐条进 `rejected`/`unresolved`，其余照常落地** | 某一行坏了：负数、未来日期、什么都没测、活动对不上 |
+
+`extra="forbid"` 是刻意的：某列被改名时宁可整批炸掉，也不要静默按 0 写进去——后者会让仪表盘看起来完全正常。
+
+**三个必须知道的语义**
+
+1. **缺列不覆盖。** 每个指标都可选，缺席 ≠ 0。广告平台不知道你的 revenue，电商 webhook 不知道你的 reach；不传（或 `null`）表示"这个源不测这一列"，写入时保留库里已有的值。传 `0` 才是"测了，结果是零"
+2. **两种寻址不能矛盾。** 记录可用 `platform`+`external_id`，也可用 `campaign_id`，也可两者都给（数仓导出通常都有）。两者都给时必须指向同一个活动，否则记为 `unresolved`——静默选一个会掩盖生产端的映射漂移
+3. **同批次槽位冲突不猜。** 一批里出现两条 `(活动, 创意, 日期)` 相同的记录，**两条都拒**，并在 `rejected` 里互相指名。last-write-wins 是对生产端意图的猜测
+
+`dry_run: true` 不写任何指标行，但**仍然记一条批次台账**（`dry_run: true`），这样"演练过"与"数据源根本没来"可区分。
+
+上限：单批 `MAX_BATCH_RECORDS = 5000` 条（一个事务）；`rejected` / `unresolved` 明细各截断到 200 条并置 `issues_truncated: true`，但**计数始终精确**。
+
+**拉取不走 HTTP。** `GET /ingest/sources` 里 `configured: true` 的源用 CLI 或定时器拉（见 §7），因为一次拉取的耗时取决于平台响应速度，不该挂在请求上。
+
+#### `GET /ingest/schedule`：为什么数字没更新
+
+这是排障时第一个要看的端点。它**只计划、不拉取**，所以仪表盘轮询它不会启动任何工作。响应给出配置、每个已配置源的计划、水位与租约：
+
+```json
+{
+  "enabled": false,
+  "interval_minutes": 360,
+  "lookback_days": 3,
+  "max_catchup_days": 14,
+  "dry_run": false,
+  "lease_ttl_seconds": 1800,
+  "today": "2026-09-09",
+  "sources": [
+    {
+      "source": "platform",
+      "registered": true,
+      "configured": true,
+      "plan": {
+        "start": "2026-08-27",
+        "end": "2026-09-09",
+        "days": 14,
+        "reason": "capped",
+        "detail": "the gap starts 2026-08-11 but INGEST__MAX_CATCHUP_DAYS stops the window at 2026-08-27; run adoptimizer ingest --start 2026-08-11 --end 2026-08-26 to backfill the rest",
+        "catchup_days": 11,
+        "gap_days": 16,
+        "covered": false
+      },
+      "watermark": {
+        "window_start": "2026-07-01",
+        "window_end": "2026-08-10",
+        "batch_id": "ing_01J8ZK...",
+        "received": 264,
+        "dry_run": false,
+        "updated_at": "2026-08-10T06:10:04Z",
+        "lag_days": 30
+      },
+      "lease": {
+        "name": "ingest:platform",
+        "holder": "",
+        "held": false,
+        "expires_at": null,
+        "last_outcome": "ran",
+        "last_batch_id": "ing_01J8ZK...",
+        "last_finished_at": "2026-08-10T06:10:04Z",
+        "consecutive_failures": 0
+      }
+    }
+  ]
+}
+```
+
+`plan.reason` 是这个端点存在的全部理由——它回答"为什么"，而不只是"最后一次是几点"：
+
+| `reason` | 含义 | 该做什么 |
+|---|---|---|
+| `first` | 这个源没有水位。窗口就是名义回溯期，**不会自己发明历史** | 需要更早的数据就显式跑 `adoptimizer ingest --start ... --end ...` |
+| `covered` | 已存水位已经覆盖这个窗口，再拉只是重复断言 | 什么都不用做；这一轮会被跳过 |
+| `nominal` | 水位与回溯期相接或重叠，重叠部分用来复核平台仍在修订的日子 | 正常状态 |
+| `catchup` | 错过过运行，窗口回溯到水位结束的次日（仍在 `INGEST__MAX_CATCHUP_DAYS` 内） | 正常状态，会自愈 |
+| `capped` | 缺口比 `INGEST__MAX_CATCHUP_DAYS` 更宽 | **必须人工补数**：`plan.detail` 里就是那条命令，`plan.gap_days` 是还欠几天 |
+
+`lease.held` 说明"此刻是不是有人在拉"；`watermark.lag_days` 是最新已覆盖日与今天的差值，也是 `ingest_lag_days` 这个告警指标的来源。
+
+`registered: false` 只会在 `INGEST__SOURCES` 写错名字时出现——它会被如实报出来，而不是被静默跳过。`registered: true` 但 `configured: false` 表示"装了但没凭据"（例如 mock 模式下的 `platform`），这两种状态必须能区分。
+
+### 5.10 `/api/v1/admin`（全部需要 `admin` 角色）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -380,6 +533,19 @@ curl -s $BASE/alerts/summary -H "$AUTH"
 # 审计流水（admin）
 curl -s "$BASE/admin/audit?page_size=20" -H "$AUTH" | python -m json.tool
 
+# 灌一批指标（先干跑，看会拒掉什么）
+curl -s -X POST "$BASE/ingest/metrics" -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "source": "manual.backfill", "dry_run": true,
+  "records": [{"platform":"google","external_id":"ext_google_1000","stat_date":"2026-09-08","cost":912.4}]
+}' | python -m json.tool
+
+# 采集台账与数据源可用性
+curl -s "$BASE/ingest/batches?page_size=10" -H "$AUTH" | python -m json.tool
+curl -s "$BASE/ingest/sources" -H "$AUTH" | python -m json.tool
+
+# 定时拉取的计划与水位（只读，不会启动拉取）
+curl -s "$BASE/ingest/schedule" -H "$AUTH" | python -m json.tool
+
 # 健康与指标
 curl -s http://localhost:8000/readyz | python -m json.tool
 curl -s http://localhost:8000/metrics | head -40
@@ -397,6 +563,8 @@ curl -s http://localhost:8000/metrics | head -40
 | `adoptimizer migrate [--revision] [--offline]` | 应用迁移；`--offline` 只输出 SQL 供评审 |
 | `adoptimizer revision --message "..."` | 从 ORM 元数据 autogenerate 迁移 |
 | `adoptimizer seed` | 灌确定性种子数据集 |
+| `adoptimizer ingest [--source NAME] [--days N 或 --start/--end] [--dry-run] [--file PATH]` | 灌日粒度指标：从已注册数据源拉，或推一个 JSON 文件（完整批次信封或裸记录数组都行）。**非空批次一条都没落地时退出码 1**，可直接挂 cron 告警 |
+| `adoptimizer scheduler [--once] [--source NAME]... [--dry-run] [--force] [--interval N]` | 定时拉取指标。`--once` 跑一趟就退出（**CronJob 用的就是这个**），不加则按 `INGEST__INTERVAL_MINUTES` 常驻。**任一次 tick 失败、或拉到了行却一条没落地时退出码 1** |
 | `adoptimizer run [--campaign ...] [--max-iterations N] [--window-days N] [--no-wait]` | 跑一轮优化并打印 summary |
 | `adoptimizer healthcheck [--url]` | 探活；未就绪时退出码非 0，可直接用于部署脚本 |
 | `adoptimizer token --email ...` | 取 access token（口令走隐藏输入），方便 curl |

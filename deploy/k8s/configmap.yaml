@@ -42,6 +42,32 @@ data:
   OPTIMIZATION__MAX_ITERATIONS: "3"
   OPTIMIZATION__USE_CONVEX_SOLVER: "true"
   OPTIMIZATION__MAX_BUDGET_CHANGE_PCT: "50"
+  # ---- Scheduled metric ingestion ----
+  # false on purpose. In Kubernetes the cadence belongs to the CronJob in
+  # ingest-cronjob.yaml, not to a loop inside every API replica; leaving this on
+  # would start one loop per replica and the schedule would die with whichever
+  # pod restarted. `adoptimizer scheduler --once`, which is what the CronJob
+  # runs, ignores this flag by design.
+  INGEST__SCHEDULER_ENABLED: "false"
+  # Real feeds only. "synthetic" manufactures numbers, so scheduling it here
+  # would invent metric history that no platform ever reported - precisely the
+  # failure this scheduler exists to prevent. Synthetic stays a demo path:
+  # `adoptimizer ingest --source synthetic`.
+  INGEST__SOURCES: '["platform"]'
+  INGEST__INTERVAL_MINUTES: "360"
+  # Overlap that absorbs platforms revising yesterday for days afterwards. It
+  # costs one query and cannot corrupt a value: ingestion upserts one slot per
+  # (campaign, creative, date) and an absent column never overwrites a number.
+  INGEST__LOOKBACK_DAYS: "3"
+  # How far back a missed run may reach by itself. Beyond it the tick reports
+  # gap_days and names `adoptimizer ingest --start ... --end ...` rather than
+  # quietly narrowing the window.
+  INGEST__MAX_CATCHUP_DAYS: "14"
+  # Must exceed one pass, or a slow pull is stolen mid-flight by the next one.
+  # 1800s matches activeDeadlineSeconds in ingest-cronjob.yaml.
+  INGEST__LEASE_TTL_SECONDS: "1800"
+  # Rehearse mode: plan, pull, report what would land, write nothing.
+  INGEST__DRY_RUN: "false"
   OBSERVABILITY__LOG_LEVEL: "INFO"
   OBSERVABILITY__JSON_LOGS: "true"
   OBSERVABILITY__METRICS_ENABLED: "true"

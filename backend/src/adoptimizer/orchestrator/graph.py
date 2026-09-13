@@ -1,4 +1,4 @@
-"""Supervisor graph: wires the five agents into a loop with conditional routing.
+"""Supervisor graph: wires the agents into a loop with conditional routing.
 
 Why the Supervisor pattern rather than a pipeline or a swarm:
 - a pipeline cannot loop back after the optimizer finds new anomalies
@@ -18,6 +18,7 @@ from ..agents.audience import AudienceAgent
 from ..agents.base import AgentContext, BaseAgent, RunCancelled
 from ..agents.bidding import BiddingAgent
 from ..agents.creative import CreativeAgent
+from ..agents.critic import CriticAgent
 from ..agents.monitor import MonitorAgent
 from ..agents.optimize import OptimizeAgent
 from ..core.logging import get_logger
@@ -66,8 +67,11 @@ _REDUCERS: dict[str, Any] = {
     "bidding_decisions": replace_list,
     "budget_allocations": replace_list,
     "optimization_actions": append_list,
+    "critic_findings": append_list,
     "alerts": replace_list,
     "alert_fingerprints": append_list,
+    "platform_checks": replace_list,
+    "tool_preflights": append_list,
     "agent_messages": append_list,
     "iteration": max_int,
 }
@@ -84,6 +88,7 @@ class OptimizationOrchestrator:
         creative: CreativeAgent | None = None,
         bidding: BiddingAgent | None = None,
         optimize: OptimizeAgent | None = None,
+        critic: CriticAgent | None = None,
         checkpointer: Any = None,
     ) -> None:
         self.monitor = monitor or MonitorAgent()
@@ -91,6 +96,7 @@ class OptimizationOrchestrator:
         self.creative = creative or CreativeAgent()
         self.bidding = bidding or BiddingAgent()
         self.optimize = optimize or OptimizeAgent()
+        self.critic = critic or CriticAgent()
         self._checkpointer = checkpointer
         self._graph = self._compile() if HAS_LANGGRAPH else None
 
@@ -106,6 +112,7 @@ class OptimizationOrchestrator:
             (AgentName.CREATIVE, self.creative),
             (AgentName.BIDDING, self.bidding),
             (AgentName.OPTIMIZE, self.optimize),
+            (AgentName.CRITIC, self.critic),
         ]
 
     def _node_for(self, agent: BaseAgent) -> Any:
@@ -139,17 +146,22 @@ class OptimizationOrchestrator:
         graph.add_edge(AgentName.AUDIENCE.value, AgentName.CREATIVE.value)
         graph.add_edge(AgentName.CREATIVE.value, AgentName.BIDDING.value)
         graph.add_edge(AgentName.BIDDING.value, AgentName.OPTIMIZE.value)
+        graph.add_edge(AgentName.OPTIMIZE.value, AgentName.CRITIC.value)
         graph.add_conditional_edges(
-            AgentName.OPTIMIZE.value,
-            self._route_after_optimize,
+            AgentName.CRITIC.value,
+            self._route_after_critic,
             {"continue": AgentName.MONITOR.value, "end": END},
         )
 
         return graph.compile(checkpointer=self._checkpointer)
 
     @staticmethod
-    def _route_after_optimize(state: AgentState) -> Literal["continue", "end"]:
-        """Loop while anomalies remain and the iteration budget is unspent."""
+    def _route_after_critic(state: AgentState) -> Literal["continue", "end"]:
+        """Loop while anomalies remain and the iteration budget is unspent.
+
+        Routing reads the post-critic state, so the loop continues only when
+        unreconciled anomalies survive rather than when any rule fired.
+        """
         if state.get("is_complete"):
             return "end"
         iteration = int(state.get("iteration", 0) or 0)
@@ -216,6 +228,16 @@ class OptimizationOrchestrator:
         AGENT_RUNS_TOTAL.labels(status=status.value).inc()
         AGENT_RUN_DURATION_SECONDS.observe(elapsed)
 
+        # Folded in before the summary is built so the run.succeeded event, the
+        # persisted summary and the run's token columns all report one set of
+        # numbers. The gateway is the authority: it sees every completion,
+        # including retries and fallbacks an agent never reports upward.
+        final_state["usage"] = {
+            **dict(final_state.get("usage") or {}),
+            **context.gateway.usage(context.run_id),
+            "duration_s": round(elapsed, 3),
+        }
+
         summary = summarise_state(final_state, status=status)
         await context.bus.publish(
             context.run_id,
@@ -231,10 +253,6 @@ class OptimizationOrchestrator:
             actions=summary["actions"],
         )
 
-        final_state["usage"] = {
-            **dict(final_state.get("usage") or {}),
-            "duration_s": round(elapsed, 3),
-        }
         return final_state
 
     async def _invoke_graph(self, state: AgentState, context: AgentContext) -> AgentState:
@@ -242,7 +260,7 @@ class OptimizationOrchestrator:
         assert self._graph is not None
         config: RunnableConfig = {
             "configurable": {"thread_id": context.run_id, CONTEXT_CONFIG_KEY: context},
-            "recursion_limit": 4 * int(state.get("max_iterations", 3) or 3) + 8,
+            "recursion_limit": 6 * int(state.get("max_iterations", 3) or 3) + 8,
         }
         final: AgentState = await self._graph.ainvoke(state, config=config)
         return final

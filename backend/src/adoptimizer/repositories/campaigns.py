@@ -15,6 +15,10 @@ from ..domain.kpi import PerformanceSnapshot
 from ..infra.db.models import Campaign, Creative, DailyMetric
 from .base import BaseRepository
 
+# The measures a snapshot folds up. ``unique_reach`` is deliberately absent:
+# reach is not additive across days, so summing it would be meaningless.
+_MEASURE_COLUMNS = ("impressions", "clicks", "conversions", "cost", "revenue")
+
 
 class CampaignRepository(BaseRepository[Campaign]):
     model = Campaign
@@ -94,6 +98,67 @@ class CampaignRepository(BaseRepository[Campaign]):
             for row in rows
         }
 
+    async def syncable(self, *, limit: int = 500) -> list[Campaign]:
+        """Campaigns a feed can name: those carrying a platform external id.
+
+        A campaign with no external id cannot be addressed by any platform report,
+        so it is not a pull target. It is still reachable by internal id, which is
+        why it is excluded here rather than flagged.
+        """
+        statement = (
+            select(Campaign)
+            .where(Campaign.external_id.is_not(None), Campaign.external_id != "")
+            .order_by(Campaign.name.asc())
+            .limit(limit)
+        )
+        return list((await self.session.execute(statement)).scalars().all())
+
+    async def ids_by_external(self, pairs: Sequence[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        """Resolve (platform, external_id) to the internal campaign id.
+
+        One query for the whole batch. The ``IN`` lists form a cross product, so
+        the result is filtered back down to the pairs actually asked about;
+        ``uq_campaign_platform_external`` guarantees at most one campaign per
+        pair, which is what makes the mapping a dict rather than a list.
+        """
+        if not pairs:
+            return {}
+        wanted = {(platform, external_id) for platform, external_id in pairs}
+        statement = select(Campaign.platform, Campaign.external_id, Campaign.id).where(
+            Campaign.platform.in_(sorted({platform for platform, _ in wanted})),
+            Campaign.external_id.in_(sorted({external for _, external in wanted})),
+        )
+        rows = (await self.session.execute(statement)).all()
+        found = {(str(row[0]), str(row[1])): str(row[2]) for row in rows}
+        return {pair: found[pair] for pair in wanted if pair in found}
+
+    async def existing_ids(self, campaign_ids: Sequence[str]) -> set[str]:
+        """Which of these internal ids actually exist."""
+        if not campaign_ids:
+            return set()
+        statement = select(Campaign.id).where(Campaign.id.in_(list(campaign_ids)))
+        return {str(row[0]) for row in (await self.session.execute(statement)).all()}
+
+    async def refs(self, campaign_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Map internal campaign id to the coordinates a tool call needs.
+
+        Agents reason in internal ids because that is what the warehouse and the
+        proposal tables use; ad networks only recognise their own external ids.
+        Resolving that bridge once per run, here, is what lets an agent call a
+        tool without being handed database access. A campaign with no external id
+        is reported with an empty string rather than dropped, so the caller can
+        tell "not synced yet" apart from "not in this run".
+        """
+        return {
+            campaign.id: {
+                "platform": campaign.platform,
+                "external_id": campaign.external_id or "",
+                "name": campaign.name,
+                "status": campaign.status,
+            }
+            for campaign in await self.by_ids(campaign_ids)
+        }
+
 
 class CreativeRepository(BaseRepository[Creative]):
     model = Creative
@@ -145,6 +210,21 @@ class CreativeRepository(BaseRepository[Creative]):
         statement = select(Creative).where(Creative.id.in_(list(creative_ids)))
         return list((await self.session.execute(statement)).scalars().all())
 
+    async def campaign_by_id(self, creative_ids: Sequence[str]) -> dict[str, str]:
+        """Map creative id to the campaign that owns it.
+
+        Ingestion needs the owner, not just existence: a metric row that names a
+        creative belonging to a different campaign would put spend under one
+        campaign and its breakdown under another, and both totals would then be
+        wrong in a way no single query reveals.
+        """
+        if not creative_ids:
+            return {}
+        statement = select(Creative.id, Creative.campaign_id).where(
+            Creative.id.in_(list(creative_ids))
+        )
+        return {str(row[0]): str(row[1]) for row in (await self.session.execute(statement)).all()}
+
 
 class MetricRepository(BaseRepository[DailyMetric]):
     model = DailyMetric
@@ -155,15 +235,29 @@ class MetricRepository(BaseRepository[DailyMetric]):
         *,
         campaign_id: str,
         stat_date: date,
-        impressions: int,
-        clicks: int,
-        conversions: int,
-        cost: float,
-        revenue: float,
+        impressions: int | None = None,
+        clicks: int | None = None,
+        conversions: int | None = None,
+        cost: float | None = None,
+        revenue: float | None = None,
         creative_id: str | None = None,
-        unique_reach: int = 0,
+        unique_reach: int | None = None,
+        source: str | None = None,
+        batch_id: str | None = None,
     ) -> DailyMetric:
-        """Insert or update one daily aggregate slot."""
+        """Insert or update one daily aggregate slot.
+
+        ``None`` never overwrites. On an insert it becomes the column default; on
+        an update the stored value is left alone. That single rule is what lets
+        feeds that measure different things share one table: an ad network can
+        assert cost without erasing the revenue a commerce feed supplied, and a
+        genuine zero still lands as a zero because zero is not ``None``.
+
+        ``source`` and ``batch_id`` are provenance, not identity: they never take
+        part in locating the slot, they only record who last asserted it, and
+        they follow the same rule so an internal correction cannot wipe the stamp
+        of the feed that originally delivered the number.
+        """
         statement = select(DailyMetric).where(
             DailyMetric.campaign_id == campaign_id,
             DailyMetric.stat_date == stat_date,
@@ -179,32 +273,62 @@ class MetricRepository(BaseRepository[DailyMetric]):
                 campaign_id=campaign_id,
                 creative_id=creative_id,
                 stat_date=stat_date,
-                impressions=impressions,
-                clicks=clicks,
-                conversions=conversions,
-                cost=cost,
-                revenue=revenue,
-                unique_reach=unique_reach,
+                impressions=0 if impressions is None else impressions,
+                clicks=0 if clicks is None else clicks,
+                conversions=0 if conversions is None else conversions,
+                cost=0.0 if cost is None else cost,
+                revenue=0.0 if revenue is None else revenue,
+                unique_reach=0 if unique_reach is None else unique_reach,
+                source=source,
+                batch_id=batch_id,
             )
             return await self.add(record)
 
-        existing.impressions = impressions
-        existing.clicks = clicks
-        existing.conversions = conversions
-        existing.cost = cost
-        existing.revenue = revenue
-        existing.unique_reach = unique_reach
+        supplied: dict[str, Any] = {
+            "impressions": impressions,
+            "clicks": clicks,
+            "conversions": conversions,
+            "cost": cost,
+            "revenue": revenue,
+            "unique_reach": unique_reach,
+            "source": source,
+            "batch_id": batch_id,
+        }
+        for column, value in supplied.items():
+            if value is not None:
+                setattr(existing, column, value)
         await self.flush()
         return existing
 
-    async def snapshots(
-        self, campaign_ids: Sequence[str] | None = None, *, days: int = 7
-    ) -> list[PerformanceSnapshot]:
-        """Aggregate daily rows into per-campaign performance snapshots."""
-        cutoff = utc_today() - timedelta(days=max(1, days) - 1)
+    async def existing_slots(
+        self, campaign_ids: Sequence[str], dates: Sequence[date]
+    ) -> set[tuple[str, str | None, date]]:
+        """Which (campaign, creative, day) slots already hold a row.
+
+        One query instead of one per record, so an ingestion batch can report how
+        many slots it created versus overwrote without paying for a SELECT each.
+        """
+        if not campaign_ids or not dates:
+            return set()
+        statement = select(
+            DailyMetric.campaign_id, DailyMetric.creative_id, DailyMetric.stat_date
+        ).where(
+            DailyMetric.campaign_id.in_(list(campaign_ids)),
+            DailyMetric.stat_date.in_(list(dates)),
+        )
+        return {(row[0], row[1], row[2]) for row in (await self.session.execute(statement)).all()}
+
+    async def _daily_slots(
+        self, cutoff: date, campaign_ids: Sequence[str] | None, *, breakdown: bool
+    ) -> dict[tuple[str, date], dict[str, Any]]:
+        """Delivery per (campaign, day) from exactly one of the two granularities."""
+        granularity = (
+            DailyMetric.creative_id.is_not(None) if breakdown else DailyMetric.creative_id.is_(None)
+        )
         statement: Select[Any] = (
             select(
                 DailyMetric.campaign_id,
+                DailyMetric.stat_date,
                 Campaign.name.label("campaign_name"),
                 func.sum(DailyMetric.impressions).label("impressions"),
                 func.sum(DailyMetric.clicks).label("clicks"),
@@ -213,27 +337,62 @@ class MetricRepository(BaseRepository[DailyMetric]):
                 func.sum(DailyMetric.revenue).label("revenue"),
             )
             .join(Campaign, Campaign.id == DailyMetric.campaign_id)
-            .where(DailyMetric.stat_date >= cutoff)
-            .group_by(DailyMetric.campaign_id, Campaign.name)
+            .where(DailyMetric.stat_date >= cutoff, granularity)
+            .group_by(DailyMetric.campaign_id, DailyMetric.stat_date, Campaign.name)
         )
         if campaign_ids:
             statement = statement.where(DailyMetric.campaign_id.in_(list(campaign_ids)))
 
-        rows = (await self.session.execute(statement)).all()
+        return {
+            (str(row.campaign_id), row.stat_date): {
+                "campaign_name": str(row.campaign_name or ""),
+                **{column: float(getattr(row, column) or 0.0) for column in _MEASURE_COLUMNS},
+            }
+            for row in (await self.session.execute(statement)).all()
+        }
+
+    async def snapshots(
+        self, campaign_ids: Sequence[str] | None = None, *, days: int = 7
+    ) -> list[PerformanceSnapshot]:
+        """Aggregate daily rows into per-campaign performance snapshots.
+
+        ``daily_metrics`` stores two granularities side by side: a campaign-level
+        slot with ``creative_id IS NULL`` holding the day's total, and one row per
+        creative holding the breakdown of that same total. Summing both inflates
+        every KPI, so slots are merged with the campaign-level row winning and the
+        breakdown only filling (campaign, day) buckets that have no roll-up. That
+        is the same contract ``SqlAggregateWarehouse`` implements, and merging per
+        bucket rather than per campaign is what keeps a mixed portfolio exact.
+        """
+        cutoff = utc_today() - timedelta(days=max(1, days) - 1)
+        slots = await self._daily_slots(cutoff, campaign_ids, breakdown=False)
+        breakdown = await self._daily_slots(cutoff, campaign_ids, breakdown=True)
+        for key, measures in breakdown.items():
+            slots.setdefault(key, measures)
+
+        names: dict[str, str] = {}
+        totals: dict[str, dict[str, float]] = {}
+        for (campaign_id, _day), measures in slots.items():
+            names.setdefault(campaign_id, str(measures["campaign_name"]))
+            bucket = totals.setdefault(campaign_id, dict.fromkeys(_MEASURE_COLUMNS, 0.0))
+            for column in _MEASURE_COLUMNS:
+                bucket[column] += float(measures[column])
+
         snapshots: list[PerformanceSnapshot] = []
-        for row in rows:
-            impressions = int(row.impressions or 0)
-            clicks = min(int(row.clicks or 0), impressions)
-            conversions = min(int(row.conversions or 0), clicks)
+        for campaign_id in sorted(totals):
+            bucket = totals[campaign_id]
+            impressions = int(bucket["impressions"])
+            clicks = min(int(bucket["clicks"]), impressions)
+            conversions = min(int(bucket["conversions"]), clicks)
             snapshots.append(
                 PerformanceSnapshot(
-                    campaign_id=str(row.campaign_id),
-                    campaign_name=str(row.campaign_name or ""),
+                    campaign_id=campaign_id,
+                    campaign_name=names.get(campaign_id, ""),
                     impressions=impressions,
                     clicks=clicks,
                     conversions=conversions,
-                    total_cost=float(row.cost or 0.0),
-                    total_revenue=float(row.revenue or 0.0),
+                    total_cost=round(bucket["cost"], 4),
+                    total_revenue=round(bucket["revenue"], 4),
                 )
             )
         return snapshots

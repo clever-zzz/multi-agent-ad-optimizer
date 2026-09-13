@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import sys
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, TextIO
 
 import structlog
 
@@ -37,6 +37,67 @@ def _inject_context(
     return event_dict
 
 
+class LiveStdoutHandler(logging.StreamHandler[TextIO]):
+    """A stream handler that resolves ``sys.stdout`` when it emits.
+
+    ``logging.StreamHandler`` captures its stream at construction, and
+    ``configure_logging`` is called again by every CLI command and every
+    application boot. Each of those calls leaves the root logger holding a stream
+    that belonged to whoever configured it last - a short-lived command's stdout,
+    a supervisor's redirected pipe, a test runner's per-test buffer. Once that
+    stream is closed the handler cannot emit, and the failure is silent in the
+    worst way: logging prints its own diagnosis to the *current* stderr instead of
+    the record, so the line is lost and something unrelated gets noise appended
+    to it.
+
+    Resolving the stream per record costs one attribute read and means a log line
+    always goes to the stdout the process has right now.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(sys.stdout)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        stream = _current_stdout()
+        if stream is None:
+            # Nowhere to put it. Dropping the record is the only safe move:
+            # raising inside ``emit`` makes logging print its own diagnosis to
+            # stderr for every single record, which is louder than the outage.
+            return
+        self.stream = stream
+        super().emit(record)
+
+
+def _current_stdout() -> TextIO | None:
+    """The stdout this process has right now, or None when it has none at all.
+
+    ``sys.stdout`` is regularly swapped for something that is already closed - a
+    CLI command's redirected buffer, a supervisor's pipe, a test runner's
+    per-test stream - and on a console-less Windows process (``pythonw``, a
+    service) both it and ``sys.__stdout__`` are ``None``. ``sys.stderr`` is
+    tried before giving up, because a record that reaches a human on the wrong
+    stream still beats one that vanishes.
+    """
+    for stream in (sys.stdout, sys.__stdout__, sys.stderr):
+        if stream is not None and not getattr(stream, "closed", False):
+            return stream
+    return None
+
+
+def _is_tty(stream: TextIO | None) -> bool:
+    """Whether ``stream`` is an interactive terminal, tolerating a missing one.
+
+    ``sys.stderr`` is ``None`` on the same console-less process that leaves
+    ``sys.stdout`` unusable, and ``isatty()`` on a *closed* stream raises instead
+    of answering ``False``. "Should I colourise the output?" has to be answerable
+    on every process the app can boot on, or the colour preference becomes a
+    startup crash.
+    """
+    if stream is None or getattr(stream, "closed", False):
+        return False
+    return stream.isatty()
+
+
 def configure_logging(*, level: str = "INFO", json_logs: bool = True) -> None:
     """Idempotently configure structlog and the stdlib bridge."""
     global _configured
@@ -56,7 +117,7 @@ def configure_logging(*, level: str = "INFO", json_logs: bool = True) -> None:
     renderer: Any = (
         structlog.processors.JSONRenderer()
         if json_logs
-        else structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
+        else structlog.dev.ConsoleRenderer(colors=_is_tty(sys.stderr))
     )
 
     structlog.configure(
@@ -77,7 +138,7 @@ def configure_logging(*, level: str = "INFO", json_logs: bool = True) -> None:
         ],
     )
 
-    handler = logging.StreamHandler(sys.stdout)
+    handler = LiveStdoutHandler()
     handler.setFormatter(formatter)
 
     root = logging.getLogger()

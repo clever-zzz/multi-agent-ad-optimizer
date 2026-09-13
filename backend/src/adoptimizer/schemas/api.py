@@ -352,6 +352,11 @@ class SystemInfo(BaseModel):
     orchestrator_mode: str
     cache_backend: str
     uptime_seconds: float
+    # Tool-layer guardrails, so the status page states plainly whether an agent
+    # is able to touch a live ad account right now.
+    tools_enabled: bool = True
+    tools_dry_run: bool = False
+    tools_allow_agent_writes: bool = False
 
 
 TokenResponse.model_rebuild()

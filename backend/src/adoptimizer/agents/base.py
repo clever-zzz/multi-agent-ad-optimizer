@@ -21,6 +21,8 @@ from ..domain.enums import AgentName
 from ..llm.gateway import LLMGateway
 from ..orchestrator.events import EventBus
 from ..orchestrator.state import AgentState
+from ..tools.executor import ToolExecutor
+from ..tools.spec import ToolRequest, ToolResult
 
 logger = get_logger(__name__)
 
@@ -48,12 +50,68 @@ class AgentContext:
     actor: str = "system"
     warehouse: Any = None
     platforms: Any = None
+    tools: ToolExecutor | None = None
     snapshots: list[Any] = field(default_factory=list)
     audience_observations: list[Any] = field(default_factory=list)
     existing_creatives: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     daily_budgets: dict[str, float] = field(default_factory=dict)
     campaign_targets: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Internal campaign id -> {platform, external_id, name, status}. This is the
+    # only place an agent can learn what a campaign is called on its ad network,
+    # which is what keeps it from needing a database session of its own.
+    campaign_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
     cancellation_check: CancellationCheck | None = None
+
+    def campaign_ref(self, campaign_id: str) -> dict[str, Any] | None:
+        """Network coordinates for one campaign, or None when it is not in the run."""
+        ref = self.campaign_refs.get(str(campaign_id))
+        return dict(ref) if isinstance(ref, dict) else None
+
+    def tool_target(self, campaign_id: str) -> tuple[str, str] | None:
+        """Resolve `(platform, external_id)` for a tool call, or None.
+
+        Returning None instead of raising is deliberate: a campaign that has never
+        been synced to a network simply cannot be acted on remotely, and the
+        caller decides whether that means "skip the preflight" or "report it".
+        """
+        ref = self.campaign_ref(campaign_id)
+        if ref is None:
+            return None
+        platform = str(ref.get("platform") or "")
+        external_id = str(ref.get("external_id") or "")
+        if not platform or not external_id:
+            return None
+        return platform, external_id
+
+    async def call_tool(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        agent: AgentName,
+        idempotency_key: str = "",
+        dry_run: bool | None = None,
+    ) -> ToolResult | None:
+        """Ask the tool layer to run one capability on this agent's behalf.
+
+        Returns None when the tool layer is absent or switched off, so an agent
+        written against tools still runs in a degraded deployment instead of
+        failing the run. Every other outcome - refusals included - comes back as
+        a result the caller can inspect and report.
+        """
+        if self.tools is None or not self.tools.enabled:
+            return None
+        return await self.tools.call(
+            ToolRequest(
+                tool=tool,
+                arguments=arguments,
+                agent=agent,
+                run_id=self.run_id,
+                actor=self.actor,
+                idempotency_key=idempotency_key,
+                dry_run=dry_run,
+            )
+        )
 
     async def raise_if_cancelled(self) -> None:
         """Abort the run when it was closed while this step was pending.
@@ -158,13 +216,3 @@ class BaseAgent(ABC):
         if extra:
             message.update(extra)
         return message
-
-    async def _accumulate_usage(self, context: AgentContext, result: Any) -> dict[str, Any]:
-        """Fold one completion's token usage into the run totals."""
-        usage = result.usage
-        return {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "cost_usd": usage.cost_usd,
-            "calls": 1,
-        }

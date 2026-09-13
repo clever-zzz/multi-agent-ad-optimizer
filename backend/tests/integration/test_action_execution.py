@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from adoptimizer.core.config import DatabaseSettings, SecuritySettings
+from adoptimizer.core.config import DatabaseSettings, DataMode, SecuritySettings, ToolSettings
 from adoptimizer.core.errors import (
     ActionRequiresApprovalError,
     ConflictError,
@@ -27,6 +27,7 @@ from adoptimizer.core.security import Role, TokenClaims
 from adoptimizer.domain.enums import (
     ActionStatus,
     ActionType,
+    AgentName,
     CampaignStatus,
     CreativeStatus,
     Platform,
@@ -34,10 +35,19 @@ from adoptimizer.domain.enums import (
 from adoptimizer.domain.statistics import required_sample_size
 from adoptimizer.infra.ads.base import AdsPlatformClient
 from adoptimizer.infra.ads.mock import MockAdsClient
+from adoptimizer.infra.ads.registry import PlatformRegistry
 from adoptimizer.infra.db.models import ABTest, AuditLog, Campaign, OptimizationAction, User
 from adoptimizer.infra.db.session import Database
 from adoptimizer.repositories.campaigns import CampaignRepository, CreativeRepository
+from adoptimizer.repositories.runs import RunRepository
 from adoptimizer.services.actions import ActionService, _parse_float
+from adoptimizer.tools import (
+    ToolAuditSink,
+    ToolExecutor,
+    ToolRequest,
+    ToolResult,
+    build_tool_executor,
+)
 
 OPERATOR_ID = "usr_operator"
 
@@ -159,6 +169,7 @@ async def add_action(
     confidence: float = 0.8,
     reason: str = "proposed by the optimizer",
     action_id: str | None = None,
+    run_id: str | None = None,
 ) -> OptimizationAction:
     action = OptimizationAction(
         id=action_id or "act_" + action_type.value + "_" + str(confidence).replace(".", ""),
@@ -171,6 +182,7 @@ async def add_action(
         reason=reason,
         confidence=confidence,
         proposed_by="optimize",
+        run_id=run_id,
     )
     session.add(action)
     await session.flush()
@@ -192,6 +204,79 @@ async def audit_actions(session: Any, resource_id: str) -> list[str]:
     )
     rows = (await session.execute(statement)).scalars().all()
     return [row.action for row in rows]
+
+
+RUN_ID = "run_execution_test"
+
+
+@pytest.fixture
+async def run(session: Any, operator: User, campaign: Campaign) -> Any:
+    """A run row, so an action can carry the run that proposed it."""
+    return await RunRepository(session).create(
+        campaign_ids=[campaign.id],
+        parameters={"window_days": 7},
+        max_iterations=1,
+        requested_by=operator.id,
+        run_id=RUN_ID,
+    )
+
+
+class RecordingSink:
+    """Captures invocation records so attribution can be asserted directly."""
+
+    def __init__(self) -> None:
+        self.results: list[ToolResult] = []
+
+    async def record(self, result: ToolResult) -> None:
+        self.results.append(result)
+
+
+def build_tools(
+    adapter: MockAdsClient, *, sink: ToolAuditSink | None = None, **overrides: Any
+) -> ToolExecutor:
+    """A real executor over the recording adapter, in mock data mode."""
+    registry = PlatformRegistry({Platform.MOCK: adapter}, data_mode=DataMode.MOCK)
+    return build_tool_executor(registry, ToolSettings(**overrides), sink=sink)
+
+
+def build_tool_service(
+    session: Any,
+    *,
+    adapter: MockAdsClient,
+    security: SecuritySettings,
+    executor: ToolExecutor | None,
+) -> ActionService:
+    """The service as the composition root builds it: adapter and executor alike."""
+    return ActionService(
+        session, platforms=StubRegistry(adapter), security=security, tools=executor
+    )
+
+
+async def approved_budget_action(
+    session: Any, campaign: Campaign, security: SecuritySettings
+) -> OptimizationAction:
+    """One approved budget change, waiting for an operator to execute it."""
+    action = await add_action(
+        session,
+        campaign.id,
+        ActionType.ADJUST_BUDGET,
+        after_value="1500.00",
+        run_id=RUN_ID,
+    )
+    approver = build_service(session, adapter=None, security=security)
+    await approver.approve(action.id, claims=make_claims())
+    return action
+
+
+async def audit_after(session: Any, resource_id: str, action: str) -> dict[str, Any]:
+    """The recorded after-state of one audit entry."""
+    await session.flush()
+    statement = select(AuditLog).where(
+        AuditLog.resource_id == resource_id, AuditLog.action == action
+    )
+    row = (await session.execute(statement)).scalars().first()
+    assert row is not None, "no audit entry " + action + " for " + resource_id
+    return dict(row.after or {})
 
 
 class TestValueParsing:
@@ -824,3 +909,292 @@ class TestQueriesAndBulkApproval:
             await service.bulk_approve([action.id], claims=make_claims(Role.VIEWER))
 
         assert action.status == ActionStatus.PROPOSED.value
+
+
+class TestExecutionGoesThroughTheToolLayer:
+    """An approval is a human decision; the write is still a tool call.
+
+    Routing execution through the executor means one switch decides whether a
+    deployment touches money and one ledger records that it did, instead of the
+    action service holding its own private path to the ad network.
+    """
+
+    async def test_an_approved_write_reaches_the_network_through_the_executor(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        executor = build_tools(adapter)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        executed, result = await service.execute(action.id, claims=make_claims())
+
+        assert [call["operation"] for call in adapter.calls] == ["update_budget"]
+        assert adapter.calls[0]["external_id"] == "ext_camp_1"
+        assert adapter.calls[0]["daily_budget"] == 1500.0
+        assert result is not None
+        assert result.success is True
+        assert result.dry_run is False
+        assert result.external_reference
+        assert executed.status == ActionStatus.EXECUTED.value
+        assert executed.external_reference == result.external_reference
+        assert campaign.daily_budget == 1500.0
+        usage = executor.usage(run.id)
+        assert usage["invocations"] == 1
+        assert usage["writes"] == 1
+        assert usage["dry_runs"] == 0
+
+    async def test_the_write_is_attributed_to_the_approver_not_to_an_agent(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        sink = RecordingSink()
+        executor = build_tools(adapter, sink=sink)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        await service.execute(action.id, claims=make_claims())
+
+        assert len(sink.results) == 1
+        request = sink.results[0].request
+        assert request.tool == "platform.set_daily_budget"
+        assert request.agent is None
+        assert request.from_agent is False
+        assert request.actor == OPERATOR_ID
+        assert request.run_id == run.id
+        # Keyed on the approval, so a retried execute replays instead of paying
+        # the ad network twice for one human decision.
+        assert request.idempotency_key == "action:" + action.id
+        assert request.arguments["platform"] == Platform.MOCK.value
+        assert request.arguments["campaign_external_id"] == "ext_camp_1"
+        assert request.arguments["reason"] == "proposed by the optimizer"
+        # The per-run call budget bounds what a model may do on its own
+        # initiative; an approved execution is audited but not charged to it.
+        usage = executor.usage(run.id)
+        assert usage["calls"] == 0
+        assert usage["invocations"] == 1
+
+    async def test_the_agent_write_interlock_does_not_dry_run_an_approval(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        executor = build_tools(adapter)  # allow_agent_writes stays False
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        _, result = await service.execute(action.id, claims=make_claims())
+        rehearsal = await executor.call(
+            ToolRequest(
+                tool="platform.set_daily_budget",
+                arguments={
+                    "platform": Platform.MOCK.value,
+                    "campaign_external_id": "ext_camp_1",
+                    "daily_budget": 1500.0,
+                    "reason": "the agent would like to spend more",
+                },
+                agent=AgentName.OPTIMIZE,
+                run_id=run.id,
+            )
+        )
+
+        assert result is not None and result.dry_run is False
+        assert rehearsal.dry_run is True
+        # Only the approved write reached the network.
+        assert [call["operation"] for call in adapter.calls] == ["update_budget"]
+        assert executor.usage(run.id)["dry_runs"] == 1
+
+    async def test_paper_trading_settles_locally_without_asking_the_network(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        executor = build_tools(adapter, dry_run=True)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        executed, result = await service.execute(action.id, claims=make_claims())
+
+        assert adapter.calls == []
+        assert result is not None
+        assert result.dry_run is True
+        assert result.success is True
+        assert executed.status == ActionStatus.EXECUTED.value
+        # Nothing was accepted by a network, so nothing may claim a reference.
+        assert executed.external_reference is None
+        assert campaign.daily_budget == 1500.0
+        assert executor.usage(run.id)["dry_runs"] == 1
+        recorded = await audit_after(session, action.id, "action.executed")
+        assert recorded["dry_run"] is True
+        assert recorded["external_reference"] is None
+
+    async def test_a_live_deployment_records_that_it_really_wrote(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+    ) -> None:
+        executor = build_tools(adapter)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        await service.execute(action.id, claims=make_claims())
+
+        recorded = await audit_after(session, action.id, "action.executed")
+        assert recorded["dry_run"] is False
+        assert recorded["after_value"] == "1500.00"
+
+    async def test_disabling_the_tool_layer_falls_back_to_the_adapter(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        executor = build_tools(adapter, enabled=False)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        executed, result = await service.execute(action.id, claims=make_claims())
+
+        assert [call["operation"] for call in adapter.calls] == ["update_budget"]
+        assert result is not None and result.success is True and result.dry_run is False
+        assert executed.status == ActionStatus.EXECUTED.value
+        # The executor was never asked, so it has nothing to report.
+        assert executor.usage(run.id)["invocations"] == 0
+
+    async def test_a_platform_failure_is_reported_the_same_way_as_before(
+        self,
+        session: Any,
+        campaign: Campaign,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        failing = MockAdsClient(Platform.MOCK, fail_operations={"update_budget"})
+        executor = build_tools(failing)
+        service = build_tool_service(session, adapter=failing, security=security, executor=executor)
+        action = await approved_budget_action(session, campaign, security)
+
+        executed, result = await service.execute(action.id, claims=make_claims())
+
+        assert result is not None
+        assert result.success is False
+        assert "Simulated platform failure" in (result.error or "")
+        assert result.operation == "update_budget"
+        # Parity with the direct adapter path: the network refusing is a settled
+        # execution carrying a failed result, not an exception and not a retry.
+        assert executed.status == ActionStatus.EXECUTED.value
+        assert executed.external_reference is None
+        assert campaign.daily_budget == 1500.0
+        usage = executor.usage(run.id)
+        assert usage["invocations"] == 1
+        assert usage["failures"] == 0
+        assert usage["by_outcome"] == {"success": 1}
+
+    async def test_a_status_change_is_rehearsed_by_the_matching_tool(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+        run: Any,
+    ) -> None:
+        sink = RecordingSink()
+        executor = build_tools(adapter, sink=sink)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await add_action(
+            session,
+            campaign.id,
+            ActionType.PAUSE_CAMPAIGN,
+            status=ActionStatus.APPROVED,
+            run_id=RUN_ID,
+        )
+
+        executed, result = await service.execute(action.id, claims=make_claims())
+
+        assert sink.results[0].request.tool == "platform.pause_campaign"
+        assert [call["operation"] for call in adapter.calls] == ["pause_campaign"]
+        assert result is not None and result.success is True
+        assert executed.status == ActionStatus.EXECUTED.value
+        assert campaign.status == CampaignStatus.PAUSED.value
+        # The rationale travels with the write, so the network log explains itself.
+        assert sink.results[0].request.arguments["reason"] == "proposed by the optimizer"
+
+    async def test_a_creative_pause_names_the_creative_not_the_campaign(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+    ) -> None:
+        sink = RecordingSink()
+        executor = build_tools(adapter, sink=sink)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        creative = await add_creative(session, campaign.id)
+        action = await add_action(
+            session,
+            campaign.id,
+            ActionType.PAUSE_CREATIVE,
+            status=ActionStatus.APPROVED,
+            creative_id=creative.id,
+            run_id=RUN_ID,
+        )
+
+        await service.execute(action.id, claims=make_claims())
+
+        assert sink.results[0].request.tool == "platform.pause_creative"
+        assert sink.results[0].request.arguments["creative_external_id"] == creative.id
+        assert [call["operation"] for call in adapter.calls] == ["pause_creative"]
+        assert creative.status == CreativeStatus.PAUSED.value
+
+    async def test_a_campaign_that_was_never_synced_is_changed_locally_only(
+        self,
+        session: Any,
+        operator: User,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+    ) -> None:
+        local = await CampaignRepository(session).create(
+            name="Local only campaign",
+            platform=Platform.MOCK,
+            daily_budget=500.0,
+            total_budget=5000.0,
+            target_cpa=60.0,
+            target_roas=2.0,
+            start_date=date(2026, 1, 1),
+            external_id=None,
+            status=CampaignStatus.ACTIVE,
+            created_by=operator.id,
+        )
+        executor = build_tools(adapter)
+        service = build_tool_service(session, adapter=adapter, security=security, executor=executor)
+        action = await add_action(
+            session,
+            local.id,
+            ActionType.ADJUST_BUDGET,
+            after_value="900.00",
+            status=ActionStatus.APPROVED,
+        )
+
+        executed, result = await service.execute(action.id, claims=make_claims())
+
+        assert result is None
+        assert adapter.calls == []
+        assert executed.status == ActionStatus.EXECUTED.value
+        assert local.daily_budget == 900.0

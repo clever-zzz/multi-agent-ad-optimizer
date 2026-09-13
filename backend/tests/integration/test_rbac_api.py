@@ -26,15 +26,34 @@ ENDPOINT_MATRIX: list[tuple[str, str, frozenset[str]]] = [
     ("POST", "/actions/whatever/execute", frozenset({"admin", "optimizer"})),
     ("GET", "/alerts", frozenset({"admin", "optimizer", "analyst", "viewer"})),
     ("POST", "/alerts/whatever/acknowledge", frozenset({"admin", "optimizer", "analyst"})),
-    ("GET", "/analytics/overview", frozenset({"admin", "optimizer", "analyst", "viewer"})),
+    # Gated on metrics:read, which is the same permission the ingestion ledger
+    # uses, so the pipeline identity can see the reporting built over the numbers
+    # it writes. Read-only either way - nothing here can start a pull.
+    (
+        "GET",
+        "/analytics/overview",
+        frozenset({"admin", "optimizer", "analyst", "viewer", "ingestor"}),
+    ),
+    # Ingestion can silently corrupt every downstream decision, so writing it is
+    # held by admin and by the dedicated pipeline identity only - an optimizer
+    # token reads the numbers it optimises and cannot fabricate them. Reading the
+    # ledger is open to every role that has metrics:read, ingestor included.
+    ("POST", "/ingest/metrics", frozenset({"admin", "ingestor"})),
+    ("GET", "/ingest/batches", frozenset({"admin", "optimizer", "analyst", "viewer", "ingestor"})),
+    ("GET", "/ingest/sources", frozenset({"admin", "optimizer", "analyst", "viewer", "ingestor"})),
+    # Read-only: it plans without pulling, so the read roles may see the schedule
+    # but cannot start a pull by polling it.
+    ("GET", "/ingest/schedule", frozenset({"admin", "optimizer", "analyst", "viewer", "ingestor"})),
     ("GET", "/creatives", frozenset({"admin", "optimizer", "analyst", "viewer"})),
     ("GET", "/admin/system", frozenset({"admin"})),
+    ("GET", "/admin/tools", frozenset({"admin"})),
+    ("GET", "/admin/tools/invocations", frozenset({"admin"})),
     ("GET", "/admin/audit", frozenset({"admin"})),
     ("GET", "/admin/ab-tests", frozenset({"admin"})),
     ("POST", "/admin/prune", frozenset({"admin"})),
 ]
 
-ALL_ROLES = ("admin", "optimizer", "analyst", "viewer")
+ALL_ROLES = ("admin", "optimizer", "analyst", "viewer", "ingestor")
 
 # Bodies that satisfy schema validation so a 403 is about permission, not payload.
 BODIES: dict[str, dict[str, Any]] = {
@@ -50,6 +69,14 @@ BODIES: dict[str, dict[str, Any]] = {
     "POST /actions/whatever/approve": {},
     "POST /actions/whatever/execute": {},
     "POST /alerts/whatever/acknowledge": {},
+    # Names a campaign that does not exist so the row is reported unresolved
+    # rather than written, and the assertion stays about permission.
+    "POST /ingest/metrics": {
+        "source": "rbac.probe",
+        "records": [
+            {"campaign_id": "campaign_rbac_probe", "stat_date": "2026-01-01", "impressions": 1}
+        ],
+    },
     "POST /admin/prune": {},
 }
 
@@ -61,7 +88,7 @@ async def role_headers(client: httpx.AsyncClient) -> dict[str, dict[str, str]]:
         "admin": bearer(await access_token(client, ADMIN_EMAIL, ADMIN_PASSWORD))
     }
     admin = headers["admin"]
-    for role in ("optimizer", "analyst", "viewer"):
+    for role in ("optimizer", "analyst", "viewer", "ingestor"):
         email = role + ".rbac@adoptimizer.dev"
         created = await client.post(
             API + "/auth/users",

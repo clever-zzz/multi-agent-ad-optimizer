@@ -149,6 +149,67 @@ class TestAllocate:
         assert "scaling spend up" in by_id["winner"].reason
         assert "pulling spend back" in by_id["loser"].reason
 
+    def test_daily_budgets_set_the_baseline_not_window_spend(self) -> None:
+        """Regression: sizing from window spend inflated every recommendation.
+
+        The recommendation lands in ``platform.set_daily_budget``, so the
+        baseline has to be the configured daily budget rather than what the
+        whole window happened to cost.
+        """
+        plan = allocate(
+            [WINNER, LOSER],
+            daily_budgets={"winner": 200.0, "loser": 100.0},
+            max_change_pct=0.5,
+            cross_check_with_solver=False,
+        )
+        by_id = {a.campaign_id: a for a in plan}
+        # Both campaigns spent 1000 over the window; no baseline may be 1000.
+        assert by_id["winner"].current_budget == pytest.approx(200.0)
+        assert by_id["loser"].current_budget == pytest.approx(100.0)
+        for allocation in plan:
+            assert allocation.recommended_budget <= allocation.current_budget * 1.5 + 0.01
+
+    def test_a_campaign_without_budget_config_falls_back_to_spend(self) -> None:
+        plan = allocate([WINNER], daily_budgets={}, cross_check_with_solver=False)
+        assert plan[0].current_budget == pytest.approx(1_000.0)
+
+    def test_reasons_are_relative_to_the_portfolio_not_absolute(self) -> None:
+        """A strong campaign that still loses budget must not be called inefficient.
+
+        The reallocation is zero-sum, so "pulling spend back" only ever means
+        "behind the rest of the portfolio". The previous wording labelled a ROAS
+        of 13 inefficient, which was simply untrue.
+        """
+        boutique = PerformanceSnapshot(
+            campaign_id="boutique",
+            campaign_name="boutique",
+            impressions=100,
+            clicks=10,
+            conversions=2,
+            total_cost=100.0,
+            total_revenue=1_300.0,
+        )
+        proven = PerformanceSnapshot(
+            campaign_id="proven",
+            campaign_name="proven",
+            impressions=500_000,
+            clicks=25_000,
+            conversions=1_000,
+            total_cost=50_000.0,
+            total_revenue=200_000.0,
+        )
+        plan = allocate(
+            [boutique, proven],
+            daily_budgets={"boutique": 100.0, "proven": 100.0},
+            cross_check_with_solver=False,
+        )
+        by_id = {a.campaign_id: a for a in plan}
+        assert boutique.roas > 3.0
+        assert by_id["boutique"].change_pct < 0
+        assert "inefficient" not in by_id["boutique"].reason
+        assert "trails the portfolio" in by_id["boutique"].reason
+        assert "leads the portfolio" in by_id["proven"].reason
+
 
 class TestTotalDelta:
     def test_counts_increases_and_decreases(self) -> None:

@@ -70,6 +70,18 @@ _ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.METRICS_READ,
         }
     ),
+    # A machine identity for the metrics pipeline and for nothing else.
+    #
+    # Ingestion can silently corrupt every downstream decision, so the capability
+    # has to be reachable without an admin token - a cron job authenticating as
+    # admin is the worse failure. It used to live on OPTIMIZER, on the argument
+    # that an optimizer token already carries CAMPAIGN_WRITE and ACTION_EXECUTE so
+    # granting it adds no escalation. That is true about the *role* and beside the
+    # point about the *credential*: the one that gets copied into a pipeline
+    # runner, a git secret store and a dozen log files. Splitting it out means a
+    # leaked ingestion credential can fabricate numbers, and cannot approve its
+    # own fabricated numbers into a real budget change.
+    Role.INGESTOR: frozenset({Permission.METRICS_READ, Permission.METRICS_WRITE}),
 }
 
 

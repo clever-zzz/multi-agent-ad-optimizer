@@ -128,6 +128,8 @@ class TestSystemInfo:
             "/analytics/overview",
             "/creatives",
             "/admin/system",
+            "/admin/tools",
+            "/admin/tools/invocations",
         ):
             assert API + path in schema["paths"], path
 

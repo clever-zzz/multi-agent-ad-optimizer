@@ -8,6 +8,9 @@ failure cannot be used in a deploy script or an alert runbook.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator, Sequence
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +18,28 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from adoptimizer.cli import app
-from adoptimizer.core.config import get_settings
-from adoptimizer.domain.enums import RunStatus
+from adoptimizer.cli import _mask, app
+from adoptimizer.core.clock import utc_today
+from adoptimizer.core.config import DataMode, dotenv_path, get_settings, load_environment
+from adoptimizer.core.errors import ExternalServiceError, NotFoundError
+from adoptimizer.domain.enums import Platform, RunStatus
+from adoptimizer.infra.ads.registry import PlatformRegistry, build_platform_clients
+from adoptimizer.infra.ingest import MetricSourceRegistry, SourceRecord, SourceTarget
 
 runner = CliRunner()
 
-COMMANDS = ("serve", "migrate", "revision", "seed", "run", "healthcheck", "token")
+COMMANDS = (
+    "serve",
+    "migrate",
+    "revision",
+    "seed",
+    "ingest",
+    "scheduler",
+    "run",
+    "healthcheck",
+    "token",
+    "creds",
+)
 
 
 @pytest.fixture
@@ -220,6 +238,456 @@ class TestSeed:
 
         assert second.exit_code == 0, second.output
         assert payload(second.output)["skipped"] is True
+
+
+class TestIngest:
+    """The scheduled data path.
+
+    Asserted against the seeded portfolio, whose 8 campaigns and 21 days of
+    history are fixed, so the expected counts are arithmetic rather than a
+    snapshot that silently drifts.
+    """
+
+    def seed(self) -> None:
+        assert runner.invoke(app, ["seed"]).exit_code == 0
+
+    def test_a_dry_run_reports_without_writing(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["ingest", "--source", "synthetic", "--days", "3", "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["dry_run"] is True
+        assert body["source"] == "synthetic"
+        assert body["received"] == 8 * 3
+        assert body["updated"] == 8 * 3
+        assert body["created"] == 0
+        assert body["batch_id"].startswith("ing_")
+
+    def test_the_days_the_seed_does_not_cover_are_created(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["ingest", "--source", "synthetic", "--days", "25"])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["received"] == 8 * 25
+        assert body["updated"] == 8 * 21
+        assert body["created"] == 8 * 4
+        assert body["dry_run"] is False
+
+    def test_a_second_run_updates_what_the_first_created(self, cli_env: Path) -> None:
+        self.seed()
+        assert runner.invoke(app, ["ingest", "--days", "25"]).exit_code == 0
+
+        second = runner.invoke(app, ["ingest", "--days", "25"])
+
+        assert second.exit_code == 0, second.output
+        body = payload(second.output)
+        assert body["created"] == 0
+        assert body["updated"] == 8 * 25
+
+    def test_an_explicit_window_overrides_the_day_count(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(
+            app, ["ingest", "--days", "99", "--start", "2026-01-01", "--end", "2026-01-02"]
+        )
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["received"] == 8 * 2
+        assert (body["window_start"], body["window_end"]) == ("2026-01-01", "2026-01-02")
+        # Two years of history the seed never wrote.
+        assert body["created"] == 8 * 2
+
+    def test_an_unknown_feed_is_refused_by_name(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["ingest", "--source", "google"])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, NotFoundError)
+
+    def test_the_platform_feed_refuses_to_run_in_mock_mode(self, cli_env: Path) -> None:
+        """It has no rows to give, so it must fail rather than report a clean zero."""
+        self.seed()
+
+        result = runner.invoke(app, ["ingest", "--source", "platform"])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, ExternalServiceError)
+
+    def test_a_json_batch_can_be_pushed_from_a_file(self, cli_env: Path, tmp_path: Path) -> None:
+        self.seed()
+        export = tmp_path / "backfill.json"
+        export.write_text(
+            json.dumps(
+                {
+                    "source": "backfill.file",
+                    "records": [
+                        {
+                            "platform": "google",
+                            "external_id": "ext_google_1000",
+                            "stat_date": utc_today().isoformat(),
+                            "cost": 12.5,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["ingest", "--file", str(export)])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        # The file names its own feed; --source is only the fallback.
+        assert body["source"] == "backfill.file"
+        assert body["created"] + body["updated"] == 1
+
+    def test_a_bare_list_of_records_takes_the_source_from_the_flag(
+        self, cli_env: Path, tmp_path: Path
+    ) -> None:
+        self.seed()
+        export = tmp_path / "rows.json"
+        export.write_text(
+            json.dumps(
+                [
+                    {
+                        "platform": "google",
+                        "external_id": "ext_google_1000",
+                        "stat_date": utc_today().isoformat(),
+                        "clicks": 7,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["ingest", "--source", "rows.file", "--file", str(export)])
+
+        assert result.exit_code == 0, result.output
+        assert payload(result.output)["source"] == "rows.file"
+
+    def test_a_file_can_ask_for_a_dry_run_itself(self, cli_env: Path, tmp_path: Path) -> None:
+        self.seed()
+        export = tmp_path / "rehearsal.json"
+        export.write_text(
+            json.dumps(
+                {
+                    "source": "rehearsal.file",
+                    "dry_run": True,
+                    "records": [
+                        {
+                            "platform": "google",
+                            "external_id": "ext_google_1000",
+                            "stat_date": utc_today().isoformat(),
+                            "clicks": 7,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["ingest", "--file", str(export)])
+
+        assert result.exit_code == 0, result.output
+        assert payload(result.output)["dry_run"] is True
+
+    def test_a_batch_that_lands_nothing_exits_non_zero(self, cli_env: Path, tmp_path: Path) -> None:
+        """So a cron job alerting on exit status notices a feed that stopped matching."""
+        self.seed()
+        export = tmp_path / "orphan.json"
+        export.write_text(
+            json.dumps(
+                [
+                    {
+                        "platform": "google",
+                        "external_id": "ext_never_imported",
+                        "stat_date": utc_today().isoformat(),
+                        "clicks": 7,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["ingest", "--file", str(export)])
+
+        assert result.exit_code == 1, result.output
+        body = payload(result.output)
+        assert body["received"] == 1
+        assert body["unresolved_count"] == 1
+
+    def test_a_partially_dirty_batch_still_exits_zero(self, cli_env: Path, tmp_path: Path) -> None:
+        """Losing one row is worth reporting but not worth failing a cron job over."""
+        self.seed()
+        export = tmp_path / "mixed.json"
+        export.write_text(
+            json.dumps(
+                [
+                    {
+                        "platform": "google",
+                        "external_id": "ext_google_1000",
+                        "stat_date": utc_today().isoformat(),
+                        "clicks": 7,
+                    },
+                    {
+                        "platform": "google",
+                        "external_id": "ext_never_imported",
+                        "stat_date": utc_today().isoformat(),
+                        "clicks": 7,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["ingest", "--file", str(export)])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["created"] + body["updated"] == 1
+        assert body["unresolved_count"] == 1
+
+    def test_an_empty_feed_exits_zero(self, cli_env: Path) -> None:
+        """Nothing to pull is a normal day, not an incident."""
+        result = runner.invoke(app, ["ingest", "--source", "synthetic", "--days", "1"])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["received"] == 0
+        assert body["batch_id"].startswith("ing_")
+
+
+class OrphanFeed:
+    """A feed that names campaigns this database does not have.
+
+    The signature of a mapping that quietly broke - an account renamed, a
+    customer id rotated - and the reason the scheduler exits non-zero on "pulled
+    rows, landed none" rather than only on an exception.
+    """
+
+    name = "orphan.feed"
+
+    @property
+    def is_configured(self) -> bool:
+        return True
+
+    async def fetch(
+        self, *, start: date, end: date, targets: Sequence[SourceTarget] = ()
+    ) -> list[SourceRecord]:
+        """One unattributable row per day, so the counts stay arithmetic."""
+        days = (end - start).days + 1
+        return [
+            SourceRecord(
+                stat_date=start + timedelta(days=offset),
+                platform=Platform.MOCK,
+                external_id="ext_nobody_has_this",
+                impressions=100,
+                clicks=4,
+                cost=10.0,
+            )
+            for offset in range(days)
+        ]
+
+
+@pytest.fixture
+def orphan_feed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap the whole feed registry for the orphan, leaving the CLI wiring intact."""
+
+    def only_the_orphan(platforms: PlatformRegistry) -> MetricSourceRegistry:
+        return MetricSourceRegistry([OrphanFeed()])
+
+    monkeypatch.setattr("adoptimizer.core.container.build_metric_sources", only_the_orphan)
+
+
+class TestScheduler:
+    """The scheduled pull, driven the way a CronJob drives it.
+
+    Counts come from the seeded portfolio: 8 campaigns and a 3-day nominal
+    lookback, so a first pass touches 24 slots. The seed already stores 21 days
+    of history, which means those 24 are updates rather than inserts - a fact
+    worth asserting, because a scheduler that reported them as new rows would be
+    double-counting.
+    """
+
+    LOOKBACK_DAYS = 3
+    SEEDED_CAMPAIGNS = 8
+
+    def seed(self) -> None:
+        assert runner.invoke(app, ["seed"]).exit_code == 0
+
+    def test_the_first_pass_pulls_the_nominal_lookback(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once"])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["ran"] == 1
+        assert body["failed"] == 0
+        tick = body["ticks"][0]
+        assert tick["source"] == "synthetic"
+        assert tick["outcome"] == "ran"
+        assert tick["reason"] == "first"
+        assert tick["received"] == self.SEEDED_CAMPAIGNS * self.LOOKBACK_DAYS
+        assert tick["created"] == 0
+        assert tick["updated"] == self.SEEDED_CAMPAIGNS * self.LOOKBACK_DAYS
+        assert tick["batch_id"].startswith("ing_")
+
+    def test_a_second_pass_finds_the_window_covered(self, cli_env: Path) -> None:
+        """Re-running is cheap, which is what makes the schedule safe to retry."""
+        self.seed()
+        assert runner.invoke(app, ["scheduler", "--once"]).exit_code == 0
+
+        second = runner.invoke(app, ["scheduler", "--once"])
+
+        assert second.exit_code == 0, second.output
+        body = payload(second.output)
+        assert body["skipped"] == 1
+        assert body["ran"] == 0
+        assert body["ticks"][0]["outcome"] == "skipped"
+        assert body["ticks"][0]["reason"] == "covered"
+        assert body["ticks"][0]["batch_id"] is None
+
+    def test_force_re_pulls_a_window_that_is_already_covered(self, cli_env: Path) -> None:
+        self.seed()
+        assert runner.invoke(app, ["scheduler", "--once"]).exit_code == 0
+
+        forced = runner.invoke(app, ["scheduler", "--once", "--force"])
+
+        assert forced.exit_code == 0, forced.output
+        body = payload(forced.output)
+        assert body["ran"] == 1
+        # Forcing re-asserts stored numbers; it does not invent new slots.
+        assert body["ticks"][0]["created"] == 0
+        assert body["ticks"][0]["updated"] == self.SEEDED_CAMPAIGNS * self.LOOKBACK_DAYS
+
+    def test_a_dry_run_leaves_the_next_pass_with_the_same_window(self, cli_env: Path) -> None:
+        """A rehearsal that advanced the watermark would make the real run skip."""
+        self.seed()
+
+        rehearsal = runner.invoke(app, ["scheduler", "--once", "--dry-run"])
+        assert rehearsal.exit_code == 0, rehearsal.output
+        assert payload(rehearsal.output)["ticks"][0]["outcome"] == "ran"
+
+        real = runner.invoke(app, ["scheduler", "--once"])
+
+        assert real.exit_code == 0, real.output
+        assert payload(real.output)["ticks"][0]["reason"] == "first"
+
+    def test_the_source_flag_overrides_the_configured_feeds(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--source", "synthetic"])
+
+        assert result.exit_code == 0, result.output
+        ticks = payload(result.output)["ticks"]
+        assert [tick["source"] for tick in ticks] == ["synthetic"]
+
+    def test_an_unknown_feed_is_a_failed_tick_and_not_a_crash(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--source", "nope"])
+
+        assert result.exit_code == 1, result.output
+        tick = payload(result.output)["ticks"][0]
+        assert tick["outcome"] == "failed"
+        assert "Unknown metric source" in (tick["error"] or "")
+
+    def test_the_platform_feed_fails_loudly_in_mock_mode(self, cli_env: Path) -> None:
+        """A feed that cannot run must say so rather than report an empty success."""
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--source", "platform"])
+
+        assert result.exit_code == 1, result.output
+        body = payload(result.output)
+        assert body["failed"] == 1
+        assert body["ticks"][0]["outcome"] == "failed"
+        assert body["ticks"][0]["error"]
+
+    def test_a_feed_that_lands_nothing_exits_non_zero(
+        self, cli_env: Path, orphan_feed: None
+    ) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--source", "orphan.feed"])
+
+        assert result.exit_code == 1, result.output
+        tick = payload(result.output)["ticks"][0]
+        assert tick["outcome"] == "ran"
+        assert tick["received"] == self.LOOKBACK_DAYS
+        assert tick["created"] == 0
+        assert tick["updated"] == 0
+        assert tick["unresolved_count"] == self.LOOKBACK_DAYS
+
+    def test_the_disabled_loop_pulls_nothing_on_its_own(self, cli_env: Path) -> None:
+        """Without --once the flag is a real off switch, not a warning to ignore."""
+        self.seed()
+        os.environ["INGEST__SCHEDULER_ENABLED"] = "false"
+
+        try:
+            get_settings.cache_clear()
+            result = runner.invoke(app, ["scheduler"])
+
+            assert result.exit_code == 0, result.output
+            assert "resident loop is off" in payload(result.output)["warning"]
+
+            # Nothing was pulled, so the next real pass still sees a first window.
+            os.environ["INGEST__SCHEDULER_ENABLED"] = "true"
+            get_settings.cache_clear()
+            after = runner.invoke(app, ["scheduler", "--once"])
+            assert payload(after.output)["ticks"][0]["reason"] == "first"
+        finally:
+            os.environ.pop("INGEST__SCHEDULER_ENABLED", None)
+            get_settings.cache_clear()
+
+    def test_once_is_not_gated_by_the_loop_switch(self, cli_env: Path) -> None:
+        """This is what lets Kubernetes own the cadence in production."""
+        self.seed()
+        os.environ["INGEST__SCHEDULER_ENABLED"] = "false"
+
+        try:
+            get_settings.cache_clear()
+            result = runner.invoke(app, ["scheduler", "--once"])
+
+            assert result.exit_code == 0, result.output
+            body = payload(result.output)
+            assert "warning" not in body
+            assert body["ran"] == 1
+        finally:
+            os.environ.pop("INGEST__SCHEDULER_ENABLED", None)
+            get_settings.cache_clear()
+
+    def test_an_out_of_range_cadence_is_refused_before_anything_is_pulled(
+        self, cli_env: Path
+    ) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--interval", "99999"])
+
+        assert result.exit_code != 0
+
+    def test_a_feed_name_that_cannot_be_a_label_is_refused(self, cli_env: Path) -> None:
+        """--source becomes a Prometheus label, so it obeys the same shape rule."""
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--source", "Bad Name"])
+
+        assert result.exit_code != 0
+
+    def test_a_zero_interval_keeps_the_configured_cadence(self, cli_env: Path) -> None:
+        self.seed()
+
+        result = runner.invoke(app, ["scheduler", "--once", "--interval", "0"])
+
+        assert result.exit_code == 0, result.output
+        assert payload(result.output)["ran"] == 1
 
 
 class TestRunOptimization:
@@ -446,3 +914,315 @@ class TestToken:
         assert result.exit_code == 0, result.output
         assert seen["body"]["password"] == "Adm1n!ChangeMe"
         assert "Adm1n!ChangeMe" not in result.output
+
+
+CREDENTIAL_ENV_KEYS = (
+    "GOOGLE_ADS_CLIENT_ID",
+    "GOOGLE_ADS_CLIENT_SECRET",
+    "GOOGLE_ADS_REFRESH_TOKEN",
+    "GOOGLE_ADS_DEVELOPER_TOKEN",
+    "GOOGLE_ADS_CUSTOMER_ID",
+    "META_ACCESS_TOKEN",
+    "META_AD_ACCOUNT_ID",
+    "META_APP_SECRET",
+    "TIKTOK_ACCESS_TOKEN",
+    "TIKTOK_ADVERTISER_ID",
+)
+
+
+@pytest.fixture
+def clean_credentials(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Start and finish with no platform credentials in the environment.
+
+    `load_dotenv` writes straight into `os.environ` and bypasses monkeypatch, so
+    teardown has to remove the keys explicitly or one test's fake token leaks
+    into the next.
+    """
+    for key in CREDENTIAL_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    yield
+    for key in CREDENTIAL_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+class TestMasking:
+    """The whole point of `creds` is that its output is safe to share."""
+
+    def test_an_absent_value_reports_only_its_absence(self) -> None:
+        assert _mask("") == {"present": False}
+
+    def test_a_present_value_reports_length_and_fingerprint_only(self) -> None:
+        masked = _mask("super-secret-token-value")
+
+        assert masked["present"] is True
+        assert masked["length"] == len("super-secret-token-value")
+        assert len(masked["sha256_8"]) == 8
+        assert masked["warnings"] == []
+        assert "super-secret-token-value" not in json.dumps(masked)
+
+    def test_the_fingerprint_is_stable_and_value_specific(self) -> None:
+        assert _mask("abc")["sha256_8"] == _mask("abc")["sha256_8"]
+        assert _mask("abc")["sha256_8"] != _mask("abd")["sha256_8"]
+
+    def test_surrounding_whitespace_is_called_out(self) -> None:
+        assert any("whitespace" in item for item in _mask("  padded-token  ")["warnings"])
+
+    def test_quoting_is_called_out(self) -> None:
+        assert any("quoted" in item for item in _mask('"token"')["warnings"])
+        assert any("quoted" in item for item in _mask("'token'")["warnings"])
+
+    def test_an_unfilled_placeholder_is_called_out(self) -> None:
+        assert any("placeholder" in item for item in _mask("<your-client-id>")["warnings"])
+        assert any("placeholder" in item for item in _mask("CHANGEME")["warnings"])
+
+    def test_a_plausible_value_draws_no_warnings(self) -> None:
+        assert _mask("1//0gAbCdEfGh-real-looking-token")["warnings"] == []
+
+
+class TestDotenvLoading:
+    """A credential in `.env` must reach the adapters, which read os.getenv."""
+
+    def test_the_dotenv_is_found_from_the_working_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / ".env").write_text("DATA_MODE=warehouse\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        assert dotenv_path() == tmp_path / ".env"
+
+    def test_load_environment_exports_dotenv_into_os_environ(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        clean_credentials: None,
+    ) -> None:
+        (tmp_path / ".env").write_text(
+            "GOOGLE_ADS_DEVELOPER_TOKEN=token-from-the-dotenv-file\n", encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        loaded = load_environment()
+
+        assert loaded == tmp_path / ".env"
+        assert os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN") == "token-from-the-dotenv-file"
+
+    def test_a_real_environment_variable_beats_the_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        clean_credentials: None,
+    ) -> None:
+        """`override=False` is what keeps a container deployment authoritative."""
+        (tmp_path / ".env").write_text("META_AD_ACCOUNT_ID=from-file\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("META_AD_ACCOUNT_ID", "from-environment")
+
+        load_environment()
+
+        assert os.getenv("META_AD_ACCOUNT_ID") == "from-environment"
+
+    def test_a_dotenv_credential_makes_the_adapter_configured(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        clean_credentials: None,
+    ) -> None:
+        """The regression this whole command exists to catch."""
+        (tmp_path / ".env").write_text(
+            "GOOGLE_ADS_CLIENT_ID=fake-client-id\n"
+            "GOOGLE_ADS_CLIENT_SECRET=fake-client-secret\n"
+            "GOOGLE_ADS_REFRESH_TOKEN=fake-refresh-token\n"
+            "GOOGLE_ADS_DEVELOPER_TOKEN=fake-developer-token\n"
+            "GOOGLE_ADS_CUSTOMER_ID=123-456-7890\n"
+            "META_ACCESS_TOKEN=fake-meta-token\n"
+            "META_AD_ACCOUNT_ID=act_1234567890\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        load_environment()
+
+        status = build_platform_clients(DataMode.WAREHOUSE).status()
+
+        assert status["google"]["configured"] is True
+        assert status["meta"]["configured"] is True
+        assert status["tiktok"]["configured"] is False
+
+    def test_a_missing_file_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        nowhere = tmp_path / "nowhere"
+        empty = tmp_path / "nothing-here"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        assert dotenv_path(project_root=nowhere) is None
+        assert load_environment(project_root=nowhere) is None
+
+    def test_the_packaged_backend_env_is_the_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Launch from anywhere and `backend/.env` is still found."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (tmp_path / ".env").write_text("DATA_MODE=mock\n", encoding="utf-8")
+        monkeypatch.chdir(elsewhere)
+
+        assert dotenv_path(project_root=tmp_path) == tmp_path / ".env"
+
+
+class TestCredsCommand:
+    """`adoptimizer creds` is how an operator hands secrets over without showing them."""
+
+    def test_missing_credentials_are_reported_per_platform(
+        self, cli_env: Path, clean_credentials: None
+    ) -> None:
+        result = runner.invoke(app, ["creds"])
+
+        assert result.exit_code == 0, result.output
+        body = payload(result.output)
+        assert body["platforms"]["google"]["ready"] is False
+        assert "GOOGLE_ADS_DEVELOPER_TOKEN" in body["platforms"]["google"]["missing"]
+        assert body["platforms"]["meta"]["ready"] is False
+        assert body["platforms"]["tiktok"]["ready"] is False
+
+    def test_a_filled_platform_is_reported_ready(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, clean_credentials: None
+    ) -> None:
+        monkeypatch.setenv("META_ACCESS_TOKEN", "fake-meta-token")
+        monkeypatch.setenv("META_AD_ACCOUNT_ID", "act_1234567890")
+
+        body = payload(runner.invoke(app, ["creds"]).output)
+
+        assert body["platforms"]["meta"]["ready"] is True
+        assert body["platforms"]["meta"]["missing"] == []
+        assert body["platforms"]["google"]["ready"] is False
+
+    def test_no_secret_value_reaches_the_output(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, clean_credentials: None
+    ) -> None:
+        secret = "fake-meta-token-do-not-print"
+        monkeypatch.setenv("META_ACCESS_TOKEN", secret)
+
+        output = runner.invoke(app, ["creds"]).output
+
+        assert secret not in output
+        reported = payload(output)["platforms"]["meta"]["required"]["META_ACCESS_TOKEN"]
+        assert reported["length"] == len(secret)
+        assert reported["present"] is True
+
+    def test_mock_data_mode_is_called_out(self, cli_env: Path, clean_credentials: None) -> None:
+        body = payload(runner.invoke(app, ["creds"]).output)
+
+        assert body["data_mode"] == "mock"
+        assert any("DATA_MODE=mock" in note for note in body["notes"])
+
+    def test_the_guardrails_are_reported_alongside(
+        self, cli_env: Path, clean_credentials: None
+    ) -> None:
+        body = payload(runner.invoke(app, ["creds"]).output)
+
+        assert body["tool_guardrails"] == {
+            "enabled": True,
+            "dry_run": False,
+            "allow_agent_writes": False,
+            "require_action_approval": True,
+        }
+
+    def test_agent_writes_are_warned_about_when_enabled(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch, clean_credentials: None
+    ) -> None:
+        monkeypatch.setenv("TOOLS__ALLOW_AGENT_WRITES", "true")
+        get_settings.cache_clear()
+
+        body = payload(runner.invoke(app, ["creds"]).output)
+
+        assert body["tool_guardrails"]["allow_agent_writes"] is True
+        assert any("ALLOW_AGENT_WRITES" in note for note in body["notes"])
+        get_settings.cache_clear()
+
+    def test_the_llm_key_is_masked_too(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LLM__API_KEY", "")
+        # Pinned rather than deleted: load_dotenv exports a developer .env into
+        # os.environ with override=False, so an unset LLM__API_BASE here would
+        # still inherit whatever base URL the local .env declares and this test
+        # would fail on that machine only.
+        monkeypatch.setenv("LLM__API_BASE", "")
+        get_settings.cache_clear()
+
+        body = payload(runner.invoke(app, ["creds"]).output)
+
+        assert body["llm"]["provider"] == "mock"
+        assert body["llm"]["api_key"] == {"present": False}
+        assert body["llm"]["api_base"] in (None, "")
+        get_settings.cache_clear()
+
+    def test_a_custom_endpoint_reports_its_base_url(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """api_base is not a secret, and forgetting it is the classic
+
+        openai_compatible misconfiguration: the provider raises at call time and
+        the gateway degrades to mock. So "creds" shows the base URL plainly,
+        while the key beside it stays masked."""
+        monkeypatch.setenv("LLM__PROVIDER", "openai_compatible")
+        monkeypatch.setenv("LLM__API_KEY", "fake-compatible-key-do-not-print")
+        monkeypatch.setenv("LLM__API_BASE", "https://api.deepseek.com/v1")
+        get_settings.cache_clear()
+
+        output = runner.invoke(app, ["creds"]).output
+
+        assert "fake-compatible-key-do-not-print" not in output
+        body = payload(output)
+        assert body["llm"]["provider"] == "openai_compatible"
+        assert body["llm"]["api_base"] == "https://api.deepseek.com/v1"
+        assert body["llm"]["api_key"]["present"] is True
+        assert body["llm"]["api_key"]["length"] == len("fake-compatible-key-do-not-print")
+        get_settings.cache_clear()
+
+    def test_probe_exits_non_zero_when_nothing_is_configured(
+        self, cli_env: Path, clean_credentials: None
+    ) -> None:
+        """Unconfigured adapters are refused before any socket is opened."""
+        result = runner.invoke(app, ["creds", "--probe", "--external-id", "ext_google_1000"])
+
+        assert result.exit_code == 1, result.output
+        body = payload(result.output)
+        for platform in ("google", "meta", "tiktok"):
+            entry = body["probe"]["platforms"][platform]
+            assert entry["ok"] is False
+            assert "not configured" in entry["error"]
+
+    def test_probe_reports_the_external_id_it_used(
+        self, cli_env: Path, clean_credentials: None
+    ) -> None:
+        body = payload(
+            runner.invoke(app, ["creds", "--probe", "--external-id", "ext_probe_1"]).output
+        )
+
+        assert body["probe"]["external_id"] == "ext_probe_1"
+
+    def test_probe_needs_an_external_id_when_the_database_is_empty(
+        self, cli_env: Path, clean_credentials: None
+    ) -> None:
+        """An empty database must say so rather than probe with an empty id."""
+        from adoptimizer.infra.db.session import init_database
+
+        settings = get_settings()
+
+        async def create_empty_schema() -> None:
+            database = await init_database(settings.database)
+            await database.create_all()
+            await database.dispose()
+
+        import asyncio
+
+        asyncio.run(create_empty_schema())
+
+        body = payload(runner.invoke(app, ["creds", "--probe"]).output)
+
+        assert body["probe"]["external_id"] == ""
+        assert "no campaign carries an external_id" in body["probe"]["error"]
+        assert body["probe"]["platforms"] == {}
+        _ = init_database

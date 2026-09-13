@@ -35,7 +35,9 @@ interface PersistedSlice {
 
 // Mirrors _ROLE_PERMISSIONS in backend/src/adoptimizer/core/security.py. Admin is
 // granted the full Permission enum server side, which is why "*" stands in here.
-// Changing one side without the other shows operators controls the API rejects.
+// Changing one side without the other shows operators controls the API rejects,
+// so backend/tests/unit/test_security.py::TestFrontendMirror parses this object
+// and fails when the two diverge.
 const ROLE_PERMISSIONS: Record<Role, Permission[] | "*"> = {
   admin: "*",
   optimizer: [
@@ -60,6 +62,9 @@ const ROLE_PERMISSIONS: Record<Role, Permission[] | "*"> = {
     "system:read",
   ],
   viewer: ["campaign:read", "run:read", "alert:read", "metrics:read"],
+  // A machine identity for the metrics pipeline. It signs in only if a human
+  // picks the role by hand, and then sees the dashboard and nothing else.
+  ingestor: ["metrics:read", "metrics:write"],
 };
 
 export function selectPermissions(user: User | null): Permission[] | "*" {

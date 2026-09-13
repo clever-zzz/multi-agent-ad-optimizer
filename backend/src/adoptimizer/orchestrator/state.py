@@ -67,9 +67,16 @@ class AgentState(TypedDict, total=False):
     bidding_decisions: Annotated[list[dict[str, Any]], replace_list]
     budget_allocations: Annotated[list[dict[str, Any]], replace_list]
     optimization_actions: Annotated[list[dict[str, Any]], append_list]
+    critic_findings: Annotated[list[dict[str, Any]], append_list]
 
     alerts: Annotated[list[dict[str, Any]], replace_list]
     alert_fingerprints: Annotated[list[str], append_list]
+
+    # Tool-layer evidence. Both channels are written by agents that called a
+    # tool, and both are what makes "the agent checked with the network" a
+    # inspectable fact rather than a claim in a log line.
+    platform_checks: Annotated[list[dict[str, Any]], replace_list]
+    tool_preflights: Annotated[list[dict[str, Any]], append_list]
     agent_messages: Annotated[list[dict[str, Any]], append_list]
 
     current_agent: str
@@ -100,8 +107,11 @@ def initial_state(
         "bidding_decisions": [],
         "budget_allocations": [],
         "optimization_actions": [],
+        "critic_findings": [],
         "alerts": [],
         "alert_fingerprints": [],
+        "platform_checks": [],
+        "tool_preflights": [],
         "agent_messages": [],
         "current_agent": "",
         "iteration": 0,
@@ -111,11 +121,46 @@ def initial_state(
     return state
 
 
+def suppressed_action_ids(state: AgentState) -> set[str]:
+    """Action ids the critic withheld, collected from its findings.
+
+    The isinstance guard is not decoration: a checkpointed or replayed run
+    restores this channel from JSON, where nothing enforces the shape.
+    """
+    return {
+        str(action_id)
+        for finding in (state.get("critic_findings") or [])
+        if isinstance(finding, dict)
+        for action_id in (finding.get("suppressed_action_ids") or [])
+    }
+
+
+def surviving_actions(state: AgentState) -> list[dict[str, Any]]:
+    """Proposals the critic let through, in proposal order.
+
+    The critic marks rather than deletes, because `optimization_actions`
+    accumulates and no node may rewrite history. Every consumer that persists or
+    counts proposals has to go through this filter, otherwise a withheld action
+    still reaches the approval queue and from there an ad platform.
+    """
+    dropped = suppressed_action_ids(state)
+    actions = [
+        action for action in (state.get("optimization_actions") or []) if isinstance(action, dict)
+    ]
+    if not dropped:
+        return actions
+    return [action for action in actions if str(action.get("id") or "") not in dropped]
+
+
 def summarise_state(state: AgentState, *, status: RunStatus) -> dict[str, Any]:
     """Flatten the final state into the run summary stored in the database."""
-    actions = list(state.get("optimization_actions") or [])
+    proposed = [
+        action for action in (state.get("optimization_actions") or []) if isinstance(action, dict)
+    ]
+    actions = surviving_actions(state)
     allocations = list(state.get("budget_allocations") or [])
     alerts = list(state.get("alerts") or [])
+    preflights = [item for item in (state.get("tool_preflights") or []) if isinstance(item, dict)]
     health = dict(state.get("health") or {})
     usage = dict(state.get("usage") or {})
 
@@ -132,6 +177,12 @@ def summarise_state(state: AgentState, *, status: RunStatus) -> dict[str, Any]:
         "bidding_decisions": len(state.get("bidding_decisions") or []),
         "budget_adjustments": len(allocations),
         "actions": len(actions),
+        "actions_proposed": len(proposed),
+        "actions_suppressed": len(proposed) - len(actions),
+        "critic_findings": len(state.get("critic_findings") or []),
+        "platform_checks": len(state.get("platform_checks") or []),
+        "tool_preflights": len(preflights),
+        "preflights_blocked": sum(1 for item in preflights if item.get("blocking")),
         "action_counts": action_counts,
         "alerts_raised": len(alerts),
         "health": health,

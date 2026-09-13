@@ -21,6 +21,12 @@ curl -s "https://ads.example.com/api/v1/alerts/summary" -H "Authorization: Beare
 
 # 待审批动作堆积情况
 curl -s "https://ads.example.com/api/v1/actions?status=proposed&page_size=1" -H "Authorization: Bearer $TOKEN"
+
+# 昨天的数据到了吗、落了多少（含干跑批次）
+curl -s "https://ads.example.com/api/v1/ingest/batches?page_size=5" -H "Authorization: Bearer $TOKEN"
+
+# 调度本身健康吗：每个源是 due / 已覆盖 / 在补 / 需要人工补数（只读，不会启动拉取）
+curl -s "https://ads.example.com/api/v1/ingest/schedule" -H "Authorization: Bearer $TOKEN"
 ```
 
 判断标准：
@@ -31,11 +37,13 @@ curl -s "https://ads.example.com/api/v1/actions?status=proposed&page_size=1" -H 
 | `running` 状态的 run | 0–2 个，且 started_at 在 30 分钟内 | 有超过 30 分钟的 → §4.3 |
 | `open` 告警 | 与业务波动相符 | `critical` 级别超过 24h 未 ack → §3 |
 | `proposed` 动作 | 有人在看 | 持续堆积说明审批流程没人负责 |
+| `ingest/batches` 最新一条 | `created_at` 在预期窗口内，`unresolved` / `rejected` 为 0 或可解释 | 没有新批次、或 `unresolved` 持续 > 0 → §4.7 |
+| `ingest/schedule` 里每个源的 `plan.reason` | `covered` / `nominal` / `catchup`（错过一次会自愈） | `capped`（`gap_days` > 0，必须人工补数）、`lease.held` 长期为 `true`、或 `registered: false` → §4.7 |
 
 ### 1.2 每周
 
-- [ ] 检查 LLM 花费：`GET /api/v1/analytics/llm-spend`，与 `LLM__MONTHLY_BUDGET_USD` 对比
-- [ ] 检查数据库增长：`run_events`、`audit_logs`、`daily_metrics`、`llm_spend` 四张表的行数
+- [ ] 检查 LLM 花费：`GET /api/v1/analytics/llm-spend`，与 `LLM__MONTHLY_BUDGET_USD` 对比；与厂商账单交叉核对一次，偏差大说明 `LLM__PRICING` 的单价该更新了
+- [ ] 检查数据库增长：`run_events`、`audit_logs`、`daily_metrics`、`llm_spend`、`ingest_batches` 五张表的行数
 - [ ] 跑一次保留期清理：`POST /api/v1/admin/prune?audit_days=365`
 - [ ] 确认备份可恢复（不只是"备份成功了"，要真的试过恢复）
 - [ ] 检查是否有账号该停用（离职、转岗）
@@ -55,8 +63,14 @@ curl -s "https://ads.example.com/api/v1/actions?status=proposed&page_size=1" -H 
 | `actions_total` | 提案动作数 | 突增或长期为 0 都异常 |
 | `db_query_duration_seconds` | 数据库查询耗时 | p95 > 200ms |
 | `cache_ops_total` | 缓存操作 | 命中率骤降说明 Redis 有问题 |
+| `ingest_records_total{outcome="unresolved"}` | 采集到的记录对不上任何活动 | 持续 > 0：活动没导入，或 `external_id` 与平台漂移了 |
+| `ingest_records_total{outcome="rejected"}` | 记录本身不合法（负数、未来日期、同批重复） | 突然 > 0 通常意味着生产端改过口径 |
+| `ingest_batches_total` | 采集批次数（`mode="dry"` 是演练） | 该来的时间点没来 |
+| `ingest_ticks_total{outcome="failed"}` | 定时拉取失败的趟数 | 任意一次都值得看。**`ran` / `skipped` / `lost_lease` 都是健康的**，不要拿这个计数器整体告警 |
+| `ingest_lag_days` | 最新已覆盖日与今天的差值 | > `INGEST__LOOKBACK_DAYS + 1` 说明数据在变陈旧。用这个而不是 tick 计数器：窗口被上界卡住时 tick 会一直"成功"，数据却越落越远 |
+| `absent(ingest_lag_days)` | 这个源从未被拉过 | 上线后就该有值。缺失通常是 `INGEST__SOURCES` 写错了名字，或 CronJob 根本没起来 |
 
-建议的 Grafana 面板分四行：**流量与延迟** / **Agent 与 run** / **模型与成本** / **依赖（DB、缓存）**。
+建议的 Grafana 面板分五行：**流量与延迟** / **Agent 与 run** / **模型与成本** / **数据入口** / **依赖（DB、缓存）**。
 
 ---
 
@@ -77,6 +91,16 @@ adoptimizer revision --message "add xxx column"
 
 # 灌种子数据（仅演示/测试环境）
 adoptimizer seed
+
+# 灌指标数据：先干跑看会拒掉什么，再真写
+adoptimizer ingest --source synthetic --days 7 --dry-run
+adoptimizer ingest --source synthetic --days 7
+adoptimizer ingest --source platform --start 2026-09-01 --end 2026-09-07   # 需 DATA_MODE=warehouse
+adoptimizer ingest --file ./backfill.json                                  # 回数仓导出/历史补数
+
+# 看采集台账与数据源可用性
+curl -s ".../api/v1/ingest/batches?page_size=20" -H "Authorization: Bearer $TOKEN"
+curl -s ".../api/v1/ingest/sources" -H "Authorization: Bearer $TOKEN"
 
 # 跑一次优化
 adoptimizer run --max-iterations 2 --window-days 7
@@ -208,6 +232,7 @@ docker compose logs --tail=200 api
 | `[entrypoint] migrations failed after 30 attempts` | 迁移一直连不上库或报错 | 先看 postgres 是否健康，再单独跑 `alembic upgrade head` 看真实错误 |
 | `(psycopg/asyncpg) UndefinedTableError` | 迁移没跑 | 确认 `RUN_MIGRATIONS` 或 migrate Job |
 | `address already in use` | 端口冲突 | 改 `API_PORT` |
+| `llm_model_has_no_pricing_entry` | 该模型不在内置价目表里，花费按 `default` 行估算 | 不阻塞启动，但预算护栏与 `/analytics/llm-spend` 会偏。设 `LLM__PRICING` 给出真实单价 |
 
 ### 4.3 run 卡在 `running` 不动
 
@@ -247,6 +272,7 @@ kubectl -n adoptimizer rollout restart deploy/backend
 | 全员 401 | `SECURITY__JWT_SECRET` 变了（重启后从环境重新读取），或 Redis/会话存储不可达导致会话校验失败 |
 | 某个人 401 | 会话被吊销：改过密码、被停用、角色被改。重新登录即可 |
 | 某人 403 | 角色被改了，或该端点需要的权限他本来就没有。对照 [03 API 参考](03-api-reference.md) §2 的权限矩阵 |
+| 采集管道突然全部 403 | 它用的是 optimizer 账号。`metrics:write` 已从 optimizer 收回，只有 admin 与 `ingestor` 能写；建一个 ingestor 账号换凭据即可 |
 | 登录后立刻 401 | 系统时钟漂移导致 `exp` 判定错误。检查 NTP |
 
 ### 4.6 429 变多
@@ -267,6 +293,55 @@ RATE_LIMIT__OPTIMIZE_RUNS_PER_HOUR=40
 
 > 令牌桶状态在**进程内**。N 个副本的实际全局上限是 `limit × N`。反过来，如果某个用户被限流而你算不出为什么，先确认请求是不是分散到了多个副本。
 
+### 4.7 数据没进来，或进来了没落地
+
+症状通常是"仪表盘看着不对"而不是报错，所以按顺序排除，别一上来就怀疑优化器。
+
+**第一步永远是 `GET /ingest/schedule`。** 它一次给出配置、每个源的计划与理由、水位、以及谁正持有锁——"为什么数字没更新"的绝大多数答案都在 `plan.reason` 和 `plan.detail` 里，不需要翻日志。它**只计划不拉取**，所以随便轮询。
+
+```bash
+# 1. 计划与水位：reason 说明为什么是这个窗口，detail 里通常直接写着该跑什么
+curl -s ".../api/v1/ingest/schedule" -H "Authorization: Bearer $TOKEN" | python -m json.tool
+
+# 2. 最近的采集尝试。没有新批次 = 调度没跑
+curl -s ".../api/v1/ingest/batches?page_size=10" -H "Authorization: Bearer $TOKEN"
+
+# 3. 数据源当下能不能用（configured=false 的源拉不动）
+curl -s ".../api/v1/ingest/sources" -H "Authorization: Bearer $TOKEN"
+
+# 4. 手动补一趟（--once 不受 INGEST__SCHEDULER_ENABLED 约束，这正是 CronJob 用的形式）
+adoptimizer scheduler --once --source platform
+
+# 5. 干跑一遍，报告会逐条说明哪些被拒、为什么
+adoptimizer ingest --source platform --days 3 --dry-run
+```
+
+`plan.reason` 直接给出处置动作：
+
+| `plan.reason` | 含义 | 处置 |
+|---|---|---|
+| `covered` | 已覆盖，本轮会跳过 | 数据没问题，去别处找原因 |
+| `nominal` / `catchup` | 正常，或正在补一次错过的运行 | 不用管；`catchup` 会在下一趟回到 `nominal` |
+| `capped` 且 `gap_days > 0` | 缺口比 `INGEST__MAX_CATCHUP_DAYS` 宽，**调度器刻意不猜** | 跑 `plan.detail` 里那条 `adoptimizer ingest --start ... --end ...`。补完水位会自动放宽，之后的 tick 恢复正常 |
+| `first` | 这个源从没有水位 | 上线后第一次是正常的；之后一直是 `first` 说明每趟都在失败，看 `lease.last_outcome` 与 `last_message` |
+
+`lease` 那一段回答"是不是有人在拉、上一次拉得怎么样"：`held: true` 且长时间不变，说明有一趟卡住了（或持有者崩了但 TTL 还没到，`INGEST__LEASE_TTL_SECONDS` 之后会被接管）；`consecutive_failures` 持续增长就是同一个源在反复失败，`last_message` 里有原因。`registered: false` 只有一种可能：`INGEST__SOURCES` 里的名字写错了。
+
+| 台账上的现象 | 含义 | 处置 |
+|---|---|---|
+| 没有新批次 | 调度没跑，或跑了但失败了 | 看 cron / CronJob 的退出码与日志；`kubectl -n adoptimizer get jobs -l app.kubernetes.io/component=ingest` 与 `ingest_ticks_total` 能区分"没触发"和"触发了但失败" |
+| `ingest/schedule` 显示 `capped` | 缺口超过 `INGEST__MAX_CATCHUP_DAYS`，调度器拒绝自己猜 | 按 `plan.detail` 补数（见上表） |
+| `lease.held` 长期为 `true` | 有一趟还在拉，或持有者崩了 | 等 `INGEST__LEASE_TTL_SECONDS`；到期会被自动接管，不需要人工删行 |
+| `received: 0` | 源连通但没有行 | `platform` 源在 `DATA_MODE=mock` 或凭据不全时**报错而不是返回 0**；真返回 0 说明平台侧这个窗口没有数据，或活动的 `external_id` 与平台不一致 |
+| `unresolved` 持续 > 0 | 记录指的活动库里没有 | 报告里每条都带 `identity`。补导入活动，或 `PATCH /campaigns/{id}` 补 `external_id` |
+| `rejected` 里是 `same campaign/creative/day` | 生产端在一批里对同一天断言了两次 | 修生产端。服务端刻意不猜哪条对 |
+| `rejected` 里是 `negative` / `ahead of today` | 生产端口径或时钟有问题 | 同上。**不要**靠放宽服务端校验让它过去 |
+| 计数都对但数字仍然不对 | 某个源覆盖了它不该覆盖的列 | 查 `daily_metrics.source` / `batch_id` 定位是谁写的。`upsert_daily` 的契约是**缺列不覆盖**，所以真出现覆盖说明那个源传了值 |
+
+> ⚠️ `adoptimizer ingest` 与 `adoptimizer scheduler --once` 都在**非空批次一条都没落地**时退出码 1，部分脏数据退出码 0；`scheduler` 另外在**任一趟 tick 失败**时退出码 1。挂 cron 时按退出码告警即可；不要因为偶尔非 0 就把整条采集停掉——那会把"一行脏数据"放大成"完全没有数据"。
+>
+> `scheduler --once` 的退出码把"某个源拉不到"和"拉到了但对不上账"合并成一个信号，具体是哪一个看它打印的 JSON：`ticks[].outcome == "failed"` 是前者（`error` 里有原因），`received > 0` 而 `created == updated == 0` 是后者（通常是 `external_id` 与平台漂移了）。
+
 ---
 
 ## 5. 容量与数据增长
@@ -281,6 +356,9 @@ RATE_LIMIT__OPTIMIZE_RUNS_PER_HOUR=40
 | `idempotency_records` | 每次带幂等键的写请求 | ✅ 同上（按 `expires_at`） |
 | `daily_metrics` | 活动数 × 创意数 × 天数 | 业务数据，通常保留 |
 | `refresh_sessions` | 每次登录一行 | 过期后仍可查，无自动清理 |
+| `ingest_batches` | 每次采集尝试一行（干跑也记） | ❌ 无。行很小（十几个整数），但和 `run_events` 一样需要保留期，见 [08 §3.2](08-limitations-and-roadmap.md) |
+| `ingest_watermarks` | 每个数据源**一行**，原地更新 | ✅ 不增长（上界 = `INGEST__SOURCES` 的长度） |
+| `scheduler_leases` | 每个 `ingest:<source>` **一行**，原地更新；释放时清空而**不删除**，为的是留住"上次是谁跑的、结果如何" | ✅ 不增长 |
 
 监控它们：
 
@@ -314,7 +392,7 @@ COMMIT;
 |---|---|---|
 | `http_request_duration_seconds` p95 上升，但 `db_query_duration_seconds` 平稳 | 应用层 CPU 饱和 | 加副本 |
 | `db_query_duration_seconds` p95 > 200ms | 数据库成为瓶颈 | 查缺失索引、连接池、PG 资源 |
-| `agent_step_duration_seconds` 中 `creative`/`audience` 偏高 | LLM 延迟 | 调 `LLM__CONCURRENCY`、`LLM__TIMEOUT_SECONDS`，或换更快的模型 |
+| `agent_step_duration_seconds` 中 `creative`/`audience` 偏高 | LLM 延迟 | 调 `LLM__CONCURRENCY`、`LLM__TIMEOUT_SECONDS`，或换更快的模型；只接受流式调用的思考模型（Qwen3 thinking）需要 `LLM__STREAM=true` |
 | `active_runs` 长期接近 `OPTIMIZE_RUNS_PER_HOUR` 上限 | 优化任务排队 | 加副本（注意 ADR-0002 的亲和性要求） |
 | Redis 内存接近 `maxmemory` | 缓存被 LRU 淘汰，命中率下降 | 扩 Redis 或调低 `REDIS__CACHE_TTL_SECONDS` |
 
@@ -416,6 +494,7 @@ curl -sf https://ads.example.com/readyz | python -m json.tool
 |---|---|
 | 审批 Agent 提出的预算/出价/暂停动作 | 花的是真钱。`SECURITY__REQUIRE_ACTION_APPROVAL=true` 是硬性要求 |
 | 创建/停用账号、改角色 | `user:manage` 仅 admin；且有"最后一个 admin"护栏 |
+| 给采集管道签发凭据 | 应该发 `ingestor` 角色（只有 `metrics:read` + `metrics:write`），不是某个人的 optimizer/admin 账号——泄露时炸不到活动与动作，审计里也追得到是管道灌的 |
 | 执行保留期清理 | 删数据不可逆，且合规要求因组织而异 |
 | 调整 `OPTIMIZATION__*` 业务阈值 | 这是业务判断，不是技术判断 |
 | 从 mock 切到真实广告平台 | 需要逐平台沙箱验证，见 [08 限制](08-limitations-and-roadmap.md) |

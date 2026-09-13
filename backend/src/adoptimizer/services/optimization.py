@@ -13,12 +13,13 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents.base import AgentContext, CancellationCheck, RunCancelled
 from ..core.config import Settings
 from ..core.container import Container
-from ..core.errors import ConflictError, NotFoundError, RunInProgressError
+from ..core.errors import ConflictError, NotFoundError, RunInProgressError, ValidationFailure
 from ..core.ids import new_id
 from ..core.logging import get_logger
 from ..domain.anomaly import Alert as DomainAlert
@@ -26,7 +27,12 @@ from ..domain.anomaly import AlertThresholds, deduplicate, detect
 from ..domain.enums import AlertRule, AlertSeverity, RunStatus
 from ..infra.db.models import OptimizationRun, RunEvent
 from ..orchestrator.events import AgentEvent, EventSink
-from ..orchestrator.state import AgentState, initial_state, summarise_state
+from ..orchestrator.state import (
+    AgentState,
+    initial_state,
+    summarise_state,
+    surviving_actions,
+)
 from ..repositories.alerts import AlertRepository
 from ..repositories.runs import RunRepository
 from .campaigns import CampaignService
@@ -86,6 +92,14 @@ class OptimizationService:
         runs = RunRepository(session)
         campaigns = CampaignService(session)
 
+        if idempotency_key and not actor_id:
+            # The index that arbitrates a replay is (key, actor). With no actor the
+            # pair contains a NULL, SQL treats it as distinct, and the guarantee
+            # silently evaporates - so refuse rather than pretend to deduplicate.
+            raise ValidationFailure(
+                "An Idempotency-Key requires an actor: the key is scoped to whoever sent it"
+            )
+
         if idempotency_key and actor_id:
             existing = await runs.find_by_idempotency_key(idempotency_key, actor_id)
             if existing is not None:
@@ -110,19 +124,32 @@ class OptimizationService:
                 + " campaigns"
             )
 
-        run = await runs.create(
-            campaign_ids=selected,
-            parameters={
-                "max_iterations": iterations,
-                "window_days": window_days,
-                "campaign_count": len(selected),
-            },
-            max_iterations=iterations,
-            trigger_type=trigger_type,
-            requested_by=actor_id,
-            idempotency_key=idempotency_key,
-        )
-        await session.commit()
+        try:
+            run = await runs.create(
+                campaign_ids=selected,
+                parameters={
+                    "max_iterations": iterations,
+                    "window_days": window_days,
+                    "campaign_count": len(selected),
+                },
+                max_iterations=iterations,
+                trigger_type=trigger_type,
+                requested_by=actor_id,
+                idempotency_key=idempotency_key,
+            )
+            await session.commit()
+        except IntegrityError:
+            # The lookup above is a read-then-insert, so two concurrent callers can
+            # both miss it. The unique index is the arbiter: roll the loser back and
+            # hand back the winner's run without dispatching a second execution.
+            await session.rollback()
+            winner: OptimizationRun | None = None
+            if idempotency_key is not None and actor_id is not None:
+                winner = await runs.find_by_idempotency_key(idempotency_key, actor_id)
+            if winner is None:
+                raise
+            logger.info("idempotent_run_reused_after_race", run_id=winner.id)
+            return winner
 
         # Always dispatch in-process. `background` only decides whether the caller
         # blocks on completion; skipping dispatch here left synchronous mode with no
@@ -184,10 +211,12 @@ class OptimizationService:
             gateway=self._container.gateway,
             bus=bus,
             actor=actor,
+            tools=self._container.tools,
             snapshots=list((inputs or {}).get("snapshots") or []),
             daily_budgets=dict((inputs or {}).get("daily_budgets") or {}),
             campaign_targets=dict((inputs or {}).get("campaign_targets") or {}),
             existing_creatives=dict((inputs or {}).get("existing_creatives") or {}),
+            campaign_refs=dict((inputs or {}).get("campaign_refs") or {}),
             cancellation_check=self._cancellation_check(run_id),
         )
 
@@ -251,12 +280,13 @@ class OptimizationService:
     ) -> dict[str, Any]:
         """Persist actions, allocations, alerts and the terminal run state."""
         summary = summarise_state(state, status=status)
+        summary["tools"] = self._container.tools.usage(run_id)
 
         async with self._container.database.unit_of_work() as session:
             runs = RunRepository(session)
 
             if status == RunStatus.SUCCEEDED:
-                actions = list(state.get("optimization_actions") or [])
+                actions = surviving_actions(state)
                 allocations = list(state.get("budget_allocations") or [])
                 if actions:
                     await runs.add_actions(run_id, actions)
@@ -265,7 +295,15 @@ class OptimizationService:
                 await self._persist_alerts(session, state, run_id)
                 await self._persist_generated_creatives(session, state, run_id)
 
-            usage = dict(state.get("usage") or {})
+            # The gateway owns token accounting, so it is the authority here too.
+            # A failed or cancelled run never reaches the supervisor's fold-in,
+            # and without this its columns would stay at zero even though the
+            # ledger already recorded what the calls cost.
+            usage = {
+                **dict(state.get("usage") or {}),
+                **self._container.gateway.usage(run_id),
+            }
+            summary["usage"] = usage
             await runs.mark_finished(
                 run_id,
                 status=status,
@@ -416,18 +454,48 @@ class OptimizationService:
             roas_floor=optimization.alert_roas_floor,
             min_impressions=optimization.min_impressions_for_alerts,
         )
-        alerts = deduplicate(detect(snapshots, thresholds, daily_budgets=budgets))
+        alerts = deduplicate(detect(snapshots, thresholds, daily_budgets=budgets, window_days=days))
         return [alert.to_dict() for alert in alerts]
 
     # This is the implementation of the wait, not a coroutine that should be
     # wrapped in asyncio.timeout() by its caller, which is what ASYNC109 assumes.
     async def wait_for(self, run_id: str, *, timeout: float = 300.0) -> bool:  # noqa: ASYNC109
-        """Block until a dispatched run finishes. Used by tests and the CLI."""
+        """Block until a run reaches a terminal state. Used by the API and the CLI.
+
+        Whoever dispatched the run awaits its own task. Everybody else has no task
+        to await - a concurrent replay of the same idempotency key, a request that
+        landed on another replica, a CLI invoked after the fact - and used to get a
+        404 for a run that plainly exists. Those callers poll the row instead.
+        """
         task = self._tasks.get(run_id)
         if task is None:
-            raise NotFoundError("Run " + run_id + " is not executing in this process")
+            return await self._poll_until_terminal(run_id, timeout=timeout)
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             return True
         except TimeoutError:
             return False
+
+    # Same reasoning as wait_for above: this implements the wait rather than
+    # accepting a task to wrap, so ASYNC109 does not apply.
+    async def _poll_until_terminal(self, run_id: str, *, timeout: float) -> bool:  # noqa: ASYNC109
+        """Watch the persisted status until the run settles or the budget runs out.
+
+        Each look uses its own short-lived session. Reusing the caller's session
+        would pin a transaction open for the whole wait, and that snapshot predates
+        the worker's commit - the run would read as pending forever.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        interval = 0.05
+        while True:
+            async with self._container.database.unit_of_work() as session:
+                run = await session.get(OptimizationRun, run_id)
+            if run is None:
+                raise NotFoundError("Run " + run_id + " does not exist")
+            if RunStatus(run.status).is_terminal:
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(interval)
+            interval = min(interval * 1.5, 1.0)

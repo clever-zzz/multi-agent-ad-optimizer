@@ -1,11 +1,14 @@
 """Unit tests for RBAC, JWT handling, password hashing and the password policy.
 
 The permission matrix here is the contract the frontend mirrors, so any change
-must be made in both places.
+must be made in both places - and ``TestFrontendMirror`` is what turns that
+sentence from a comment into a failing test.
 """
 
 from __future__ import annotations
 
+import pathlib
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -47,6 +50,8 @@ class TestRoleMatrix:
         assert permissions_for(Role.ADMIN) == frozenset(Permission)
 
     def test_privileges_are_strictly_ordered(self) -> None:
+        # The four human roles. INGESTOR is not on this axis: it holds fewer
+        # permissions than a viewer and one of them is a write.
         assert len(permissions_for(Role.ADMIN)) > len(permissions_for(Role.OPTIMIZER))
         assert len(permissions_for(Role.OPTIMIZER)) > len(permissions_for(Role.ANALYST))
         assert len(permissions_for(Role.ANALYST)) > len(permissions_for(Role.VIEWER))
@@ -72,6 +77,29 @@ class TestRoleMatrix:
                 Permission.METRICS_READ,
             }
         )
+
+    def test_ingestor_contract(self) -> None:
+        assert permissions_for(Role.INGESTOR) == frozenset(
+            {Permission.METRICS_READ, Permission.METRICS_WRITE}
+        )
+
+    def test_ingestor_is_narrow_rather_than_low(self) -> None:
+        # The point of the role is blast radius, not rank: a leaked pipeline
+        # credential can fabricate numbers, and cannot approve those same numbers
+        # into a budget change on a real ad platform.
+        assert len(permissions_for(Role.INGESTOR)) < len(permissions_for(Role.VIEWER))
+        for permission in Permission:
+            if permission in (Permission.METRICS_READ, Permission.METRICS_WRITE):
+                continue
+            assert role_has_permission(Role.INGESTOR, permission) is False, permission
+
+    def test_writing_metrics_is_not_bundled_with_operating(self) -> None:
+        # The capability moved off OPTIMIZER when INGESTOR arrived. An optimizer
+        # keeps read access to the numbers it optimises, and no more.
+        assert role_has_permission(Role.OPTIMIZER, Permission.METRICS_READ) is True
+        assert role_has_permission(Role.OPTIMIZER, Permission.METRICS_WRITE) is False
+        writers = {role for role in Role if role_has_permission(role, Permission.METRICS_WRITE)}
+        assert writers == {Role.ADMIN, Role.INGESTOR}
 
     def test_viewer_is_read_only(self) -> None:
         for permission in (
@@ -110,6 +138,64 @@ class TestRoleMatrix:
     def test_unknown_role_is_denied(self) -> None:
         with pytest.raises(PermissionDeniedError, match="Unknown role"):
             permissions_for("superuser")
+
+    def test_every_role_is_mapped(self) -> None:
+        # permissions_for() indexes the mapping directly, so a Role added to the
+        # enum without an entry surfaces as a KeyError during a request instead
+        # of a 403 - a 500 for what is really an authorisation question.
+        for role in Role:
+            assert isinstance(permissions_for(role), frozenset)
+
+
+FRONTEND = pathlib.Path(__file__).resolve().parents[3] / "frontend" / "src"
+
+
+def _frontend_matrix() -> dict[str, frozenset[str]]:
+    """Parse ``ROLE_PERMISSIONS`` out of the frontend auth store."""
+    block = (FRONTEND / "stores" / "auth.ts").read_text(encoding="utf-8")
+    block = block.split("const ROLE_PERMISSIONS", 1)[1].split("\n};", 1)[0]
+    found = re.findall(r'(\w+):\s*("\*"|\[[^\]]*\])', block)
+    return {
+        role: (
+            {permission.value for permission in Permission}
+            if body.startswith('"')
+            else set(re.findall(r'"([^"]+)"', body))
+        )
+        for role, body in found
+    }
+
+
+class TestFrontendMirror:
+    """The UI hides controls the API would reject, so it keeps a copy of the matrix.
+
+    The frontend's own test can only compare that copy against a second copy in
+    the same repository, which is how the two silently diverged once already. The
+    check that the copy matches *this* file has to live on this side.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_the_frontend_checkout(self) -> None:
+        if not FRONTEND.is_dir():
+            pytest.skip("frontend/ is not checked out alongside backend/")
+
+    def test_the_mirrored_matrix_matches_role_permissions(self) -> None:
+        mirrored = _frontend_matrix()
+        assert set(mirrored) == {role.value for role in Role}
+        for role in Role:
+            assert mirrored[role.value] == {p.value for p in permissions_for(role)}, role.value
+
+    def test_the_role_union_matches_the_enum(self) -> None:
+        source = (FRONTEND / "lib" / "types.ts").read_text(encoding="utf-8")
+        line = next(item for item in source.splitlines() if item.startswith("export type Role"))
+        assert set(re.findall(r'"([^"]+)"', line)) == {role.value for role in Role}
+
+    def test_the_permission_union_matches_the_enum(self) -> None:
+        # A permission the union cannot name is a permission the mirrored matrix
+        # cannot grant, and the omission is invisible: the UI simply never shows
+        # the control. metrics:write was missing this way.
+        source = (FRONTEND / "lib" / "types.ts").read_text(encoding="utf-8")
+        block = source.split("export type Permission =", 1)[1].split(";", 1)[0]
+        assert set(re.findall(r'"([^"]+)"', block)) == {item.value for item in Permission}
 
     def test_unknown_permission_is_denied_not_raised(self) -> None:
         assert role_has_permission(Role.ADMIN, "not:a:permission") is False

@@ -134,10 +134,19 @@ class RunSummaryOut(BaseModel):
     bidding_decisions: int = 0
     budget_adjustments: int = 0
     actions: int = 0
+    # `actions` is the post-review count. The pair below lets an operator see
+    # how much the critic withheld, and why the queue is shorter than the raw
+    # proposal count. Both default to 0 for runs persisted before the critic.
+    actions_proposed: int = 0
+    actions_suppressed: int = 0
+    critic_findings: int = 0
     action_counts: dict[str, int] = Field(default_factory=dict)
     alerts_raised: int = 0
     health: dict[str, Any] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)
+    # Tool-layer counters for this run: how many calls were made, how many were
+    # dry-run preflights, and whether agent writes were permitted at all.
+    tools: dict[str, Any] = Field(default_factory=dict)
 
 
 class BudgetAllocationOut(BaseModel):

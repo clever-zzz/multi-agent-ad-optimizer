@@ -113,11 +113,20 @@ def _cvxpy_optimum(
     return clipped
 
 
+def _baseline(snapshot: PerformanceSnapshot, budgets: dict[str, float]) -> float:
+    """The daily budget this campaign is managed against, or spend as a proxy."""
+    configured = budgets.get(snapshot.campaign_id)
+    if configured and configured > 0:
+        return float(configured)
+    return float(snapshot.total_cost)
+
+
 def allocate(
     snapshots: list[PerformanceSnapshot],
     *,
     total_budget: float | None = None,
     max_change_pct: float = 0.5,
+    daily_budgets: dict[str, float] | None = None,
     floor: float = MIN_BUDGET_FLOOR,
     cross_check_with_solver: bool = True,
 ) -> list[BudgetAllocation]:
@@ -125,13 +134,21 @@ def allocate(
 
     ``max_change_pct`` is a fraction (0.5 == plus/minus 50 percent). The total
     is preserved exactly whenever the bounds permit it.
+
+    ``daily_budgets`` maps campaign id to the budget it is actually managed
+    against, and is the baseline every recommendation is measured from. The
+    result is written through ``platform.set_daily_budget``, so the baseline has
+    to be a daily figure too: sizing it from window spend inflated every
+    recommendation by the length of the window. Callers with no campaign record
+    to read from fall back to spend, which keeps this usable standalone.
     """
     eligible = [s for s in snapshots if s.total_cost > 0]
     if not eligible:
         return []
 
+    budgets = daily_budgets or {}
     change = clamp(max_change_pct, 0.0, 10.0)
-    current = np.array([max(s.total_cost, floor) for s in eligible], dtype=float)
+    current = np.array([max(_baseline(s, budgets), floor) for s in eligible], dtype=float)
     scores = np.array([max(allocation_score(s), 1e-6) for s in eligible], dtype=float)
     lower = np.maximum(current * (1.0 - change), floor)
     upper = current * (1.0 + change)
@@ -171,10 +188,15 @@ def _to_allocation(
     solver: str,
 ) -> BudgetAllocation:
     change_pct = safe_ratio(recommended - current_budget, current_budget) * 100.0
+    # The reallocation is zero-sum, so a strong campaign can still lose budget
+    # to a stronger one. The reason therefore has to be phrased relative to the
+    # portfolio; labelling a ROAS of 13 "inefficient" was simply untrue.
     if change_pct > 5:
-        reason = "ROAS " + format(snapshot.roas, ".2f") + " justifies scaling spend up"
+        reason = "ROAS " + format(snapshot.roas, ".2f") + " leads the portfolio, scaling spend up"
     elif change_pct < -5:
-        reason = "ROAS " + format(snapshot.roas, ".2f") + " is inefficient, pulling spend back"
+        reason = (
+            "ROAS " + format(snapshot.roas, ".2f") + " trails the portfolio, pulling spend back"
+        )
     else:
         reason = "Performance is in line with the portfolio, budget held"
 

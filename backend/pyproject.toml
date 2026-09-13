@@ -154,14 +154,22 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = ["src/adoptimizer"]
+# SQLAlchemy's asyncio adapter runs the sync DBAPI inside greenlet_spawn and the
+# drivers hand results back on worker threads. Coverage drops its tracer across
+# those switches unless both are declared, and a dropped tracer does not fail
+# loudly: it reports lines that certainly executed as missing, which quietly
+# corrupts the gate below. Every repository call in this suite crosses that
+# boundary, so the setting is load-bearing rather than cosmetic.
+concurrency = ["thread", "greenlet"]
 omit = ["*/migrations/*"]
 
 [tool.coverage.report]
 precision = 1
 show_missing = true
 skip_covered = false
-# A ratchet, not a target. It is set below the measured total (80.8% as of the
-# action-execution / warehouse / LLM / CLI test work) so the suite has room to
-# move, but a large untested module cannot land without the gate going red.
+# A ratchet, not a target. It sits just under the measured total (88.54% as of
+# the scheduling work, 1064 tests), and the headroom is deliberately thin: a
+# large untested module, or a refactor that quietly drops a test file, should
+# turn CI red rather than slide down over three releases.
 # Raise it whenever the measured total climbs more than ~3 points above it.
-fail_under = 78
+fail_under = 88

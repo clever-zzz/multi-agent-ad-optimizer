@@ -74,9 +74,11 @@
 
 `infra/warehouse.py` 与 `init-scripts/clickhouse/` 提供了 schema 与查询实现，`DATA_MODE=warehouse` 可以切换。查询构造、绑定参数、以及连不上库时的降级路径都有测试覆盖（用一个假驱动，见 `tests/integration/test_warehouse.py`），但**没有任何真实数据量下的压测数据**。
 
-未验证的点：高基数维度下的查询延迟、`audience_observations` 的真实数据来源与口径、物化视图是否需要、以及从广告平台到 ClickHouse 的**采集管道根本还不存在**（当前假设数据已经在库里）。
+未验证的点：高基数维度下的查询延迟、`audience_observations` 的真实数据来源与口径、物化视图是否需要、以及从广告平台到 ClickHouse 的**采集管道仍然不存在**（当前假设数据已经在库里）。
 
-**投产前**：先明确采集方案（平台 API 轮询 / 平台导出 / 第三方 ETL），再做数据量评估。
+到**运营库**（`daily_metrics`）的采集入口已经落地，见 §3.5，但它写的是 PostgreSQL / SQLite 这一侧，**不写 ClickHouse**——两条路径的数据量级差着几个数量级，运营库入口跑得通不代表仓库路径跑得通。
+
+**投产前**：采集方案已经有了可挂载的框架（`MetricSource` 协议 + `POST /ingest/metrics`），剩下的是把真实平台接上去，再做数据量评估。
 
 ### 🟡 3.2 `run_events` 没有保留期策略
 
@@ -95,6 +97,31 @@
 ### 🟢 3.4 无多租户
 
 数据模型里没有 `tenant_id`，RBAC 也没有资源级授权（"某用户只能管某几个活动"）。单团队使用没问题；要做 SaaS 需要重新设计。
+
+### 🟡 3.5 数据入口只有框架，没有真实数据
+
+`services/ingest.py` + `infra/ingest/` + `POST /api/v1/ingest/metrics` 构成一个完整的采集入口：两层校验、身份归属解析、缺列不覆盖、逐条报告下落、批次台账、出处列（`daily_metrics.source` / `batch_id`）、审计与 Prometheus 指标，全都在，也都有测试。
+
+**调度也在**：`services/scheduling.py` + `GET /api/v1/ingest/schedule` + `adoptimizer scheduler` + `deploy/k8s/ingest-cronjob.yaml`。窗口由日历推导而不是由游标推导，错过一次由下一次补上（有 `INGEST__MAX_CATCHUP_DAYS` 上界，超过就报 `gap_days` 并给出补数命令而不是静默收窄），重叠运行由数据库租约仲裁，水位只放宽不收窄，干跑永不推进水位。设计理由见 [02 §5.3](02-architecture.md#53-定时拉取窗口来自日历不来自游标)。
+
+**缺的是数据本身，不是管道。**
+
+**但注册在案的数据源只有两个，而且没有一个接的是真实平台数据：**
+
+| 源 | 是什么 | 何时 `configured` |
+|---|---|---|
+| `synthetic` | 种子化 RNG 生成的数字。**不是广告数据**，每行都盖 `source="synthetic"`，出处列本身就是标签 | 永远（不依赖任何凭据） |
+| `platform` | 把已有适配器 `fetch_report` 的归一化行转成 `SourceRecord` | `DATA_MODE=warehouse` 且至少一个适配器凭据齐全 |
+
+`platform` 源是**真代码而不是桩**：三个适配器都已经把响应归一化成 `{date, impressions, clicks, conversions, cost}` 同一个形状，转换逻辑有测试覆盖（含 TikTok 返回 `"2026-09-01 00:00:00"` 这种时间戳形态）。它没被验证的部分是**真实账户上的端到端联调**，也就是 P0-2 那件事：没有真账号就跑不到那条路径。而 mock 适配器按构造返回空行，所以 `platform` 源在 mock 模式下**报错而不是返回 0**——"拉取失败"与"没有数据"必须是两件可区分的事，否则一条坏掉的管道看起来是健康的。
+
+仍然缺的：
+
+- **没有重试与退避。** 一次拉取里某个活动失败会抛出整批（这是刻意的：不制造部分成功的假象）。调度层的"重试"就是下一趟 tick，间隔固定为 `INGEST__INTERVAL_MINUTES`；没有指数退避，也不会针对 429 单独收窄节奏——对一个已经在限流你的平台更用力地重试，是把限流变成停服
+- **调度本身没有被真实平台验证过。** 窗口算术、水位、租约、错过策略都有测试；但"一个真实平台在一次拉取里要多久、会不会超时、能不能扛住 6 小时一次的节奏"要等 P0-2 的真账号才知道。`INGEST__LEASE_TTL_SECONDS`（1800）与 CronJob 的 `activeDeadlineSeconds`（1800）都是按估计给的，联调后应当按实测收紧
+- **推送侧没有幂等键。** 同一批推两次，第二次全部记为 `updated`；没有 `Idempotency-Key`，也没有基于内容的去重（同 §6.6）
+- **`revenue` 只能靠推送。** 平台源永远不声称 revenue（它真的不知道），所以 ROAS 相关的决策依赖你自己把收入数据推进来。这是设计，不是缺陷——但意味着**只接平台源的系统算不出真实 ROAS**
+- **ClickHouse 那一侧没有入口。** 见 §3.1
 
 ---
 
@@ -115,6 +142,8 @@
 ### 🟢 4.2 预算护栏是月度累计，不是实时
 
 `llm_spend` 表按调用记账，`LLM__MONTHLY_BUDGET_USD` 超限后按 `fail_open_to_mock` 决定降级还是失败。多副本下累计是准的（都写同一个库），但判定不是原子的，极端并发下可能略微超出。
+
+**单价同样是近似值**：记账用的是 `llm/base.py` 的 `DEFAULT_PRICING`（USD 国际标价）而不是厂商回传的账单金额，因此阶梯计价、缓存命中折扣、区域计价（中国区按 CNY）都不会自动反映出来。用 `LLM__PRICING` 把实际单价写死是唯一可靠的办法，并定期与厂商账单对一次。没写就按 `default` 行估算，启动日志会给一条 `llm_model_has_no_pricing_entry` 警告。
 
 ### 🟢 4.3 只支持 OpenAI 兼容协议
 
@@ -178,7 +207,35 @@
 
 补法很小：在「设置 → 账号」里加一个确认对话框调用该端点，成功后清空本地 token。列在这里是因为在补上之前，这个能力只能通过 API 直接调用。
 
+### 🟡 6.6 `Idempotency-Key` 只覆盖 `POST /runs`，且没有请求指纹
+
+真正生效的守卫是 `optimization_runs` 上的唯一索引 `uq_run_idempotency (idempotency_key, requested_by)`。`start_run` 是先查后插，两个并发调用可能都查不到，所以由索引在**插入时**仲裁：输的一方捕获 `IntegrityError`、回滚、再查一次，拿回赢家的 run，不会派发第二次执行。带 key 但没有 actor 的调用被 422 拒绝——`(key, NULL)` 在 SQL 里互不相同，约束会静默失效，而这种「看起来有保护其实没有」正是最坏的情况。
+
+配套修掉的：`background: false` 的重放过去会 404。`wait_for` 只认自己派发过的任务，而重放的调用方（并发对手、另一个副本）手里没有任务，于是抛 `NotFoundError`，为一个明明存在的 run 返回 404。现在拿不到本地任务就轮询数据库到终态。
+
+仍然缺的：
+
+- **只有 `POST /runs` 读这个头。** 审批 / 执行 / 批量、创意、活动、告警等写端点都不读，它们靠状态机防重复（重复 approve / execute 返回 409）——够用，但语义与 `Idempotency-Key` 不一致，客户端无从预期
+- **没有请求指纹校验。** 同一个 key 配不同 body 返回首次的 run，而不是 409。调用方跨不同载荷复用 key 时会静默拿到错误的结果
+- `idempotency_records` 表结构完整（PK = key、`request_fingerprint`、`response_body`、`expires_at`），`IdempotencyRepository` 也有 `get` / `record` / `prune_expired`，但**没有任何写入者**——唯一的调用点是 `/admin/prune` 里的删除。这与 `upsert_daily`、`_accumulate_usage` 是同一类失效：设施建好了，没人接线
+
+补齐路径：一个幂等中间件，按 `(key, actor)` 命中 `idempotency_records`，指纹不符返回 409，命中则重放 `response_body` 与状态码，然后挂到所有产生副作用的 `POST` 上。接完之后 `/admin/prune` 那条删除路径才终于有东西可删。
+
 完整威胁模型见 [06 安全](06-security.md)。
+
+### 🟢 6.7 独立的采集身份（已解决）
+
+`Role.INGESTOR` 已落地，只持有 `metrics:read` + `metrics:write` 两条权限，`metrics:write` 同时从 **optimizer** 上收回。现在能写指标的只有 admin 与 ingestor。
+
+之前的状态是：`POST /api/v1/ingest/metrics` 用 `metrics:write` 授权，而这个权限挂在 admin 与 optimizer 两个角色上。给 optimizer 的理由当时是成立的——一个 optimizer token 本来就带 `campaign:write` 与 `action:execute`，所以这不是新的提权，而它换来的是采集管道能跑在一个非 admin 身份下。但那句话说的是**角色**，问题出在**凭据**上：被复制进 pipeline runner、被塞进 Git 的 secret store、被打印进十几份日志的，是那份 token。凭据泄露时，攻击者拿到的是一个能改活动、能审批并执行动作的身份，而"执行动作"是真的会去动广告平台的。拆出来之后，泄露的采集凭据只能伪造数字，没法把自己伪造的数字批成真实预算变更。
+
+路由断言的是**权限**而不是角色，映射集中在 `core/security.py::_ROLE_PERMISSIONS` 一处，所以这次改动没有碰任何端点代码。
+
+**升级注意**：这是行为变更。原本用 optimizer 账号推送指标的管道会开始收到 `403`，需要建一个 ingestor 账号换凭据。走 `adoptimizer scheduler` / `adoptimizer ingest` 进程内路径的采集不受影响——那条路不经过 HTTP 鉴权。
+
+追溯能力本来就在，现在能追到正确的身份上了：`daily_metrics.source` / `batch_id` 回答"这个数字是谁写进来的"，`ingest_batches` 回答"这批灌了什么、拒了什么、是不是演练"，`audit_logs` 里的 `metrics.ingested` 带 `actor_role`，回答"谁在什么时候按的按钮"。
+
+仍然没做的：ingestor 是**全局**身份，不能限定"只能灌某几个活动"或"只能灌某个 source"。要做资源级隔离得等 P2 第 19 项（多租户 + 资源级授权）。
 
 ---
 
@@ -223,7 +280,7 @@ SQLite 开发库首次启动会自动 `create_all()` 并写入 `alembic_version`
 | # | 事项 | 交付标准 |
 |---|---|---|
 | 1 | ~~提交 `frontend/package-lock.json`，CI 切到 `npm ci` + npm 缓存~~ ✅ **已完成** | lockfile 已入库，`setup-node` 开了 npm 缓存，CI 与 `Dockerfile.frontend` 都只走 `npm ci`，`npm install` 回退分支已删除 |
-| 2 | 至少一个广告平台的**读**路径真实联调 | 从真实账户拉到的活动与日报表数字，与平台 UI 对得上 |
+| 2 | 至少一个广告平台的**读**路径真实联调 | 从真实账户拉到的活动与日报表数字，与平台 UI 对得上。拉取路径已存在（`adoptimizer ingest --source platform`，见 §3.5），缺的是真账号与对账 |
 | 3 | ~~CI 增加 `alembic upgrade head && alembic check`~~ ✅ **已完成** | `.github/workflows/ci.yml` 的 `migrations` job（PostgreSQL service container）已落地，`backend` job 另有 SQLite 可逆性验证 |
 | 4 | 依赖漏洞扫描（`pip-audit` + `npm audit`）进 CI | 高危 CVE 阻塞合并 |
 | 5 | 生产环境冒烟脚本化 | [07 §6](07-testing-and-ci.md#6-手工端到端验收清单) 里可自动化的部分变成一个脚本 |
@@ -239,19 +296,21 @@ SQLite 开发库首次启动会自动 `create_all()` 并写入 `alembic_version`
 | 10 | Playwright E2E：登录 → 触发 run → 看时间线 → 审批 → 执行 | 进 CI |
 | 11 | 创意质量评测集与回归流程 | 换 prompt/模型前后有可比的分数 |
 | 12 | Prometheus 告警规则文件 + Grafana dashboard JSON 入库 | `deploy/observability/` |
+| 13 | ~~指标采集的定时调度（CronJob 清单 + 常驻循环 + 明确的错过策略）~~ ✅ **已完成** | `deploy/k8s/ingest-cronjob.yaml`（`--once`，`Forbid`，`startingDeadlineSeconds`）+ `adoptimizer scheduler` 常驻循环 + `INGEST__*` 七个配置项。窗口由日历推导，错过一次由下一次补上（上界外报 `gap_days` 并给出补数命令），重叠由数据库租约仲裁，水位只放宽；`ingest_ticks_total` / `ingest_lag_days` 与 `GET /ingest/schedule` 负责看得见 |
+| 14 | ~~独立的 `ingestor` 角色，采集任务用它而不是 optimizer~~ ✅ **已完成** | 见 §6.7。`Role.INGESTOR` 只持有 `metrics:read` + `metrics:write`，`metrics:write` 已从 optimizer 收回；采集凭据被偷时炸不到活动与动作。**注意这是行为变更**，用 optimizer 账号推送的管道需要换凭据 |
 
 ### P2 — 规模化时再做
 
 | # | 事项 | 触发条件 |
 |---|---|---|
-| 13 | 迁移到 arq/Celery 队列 + 常驻 worker | 需要 run 必达 SLA，或单副本吞吐成瓶颈 |
-| 14 | EventBus 换 Redis Pub/Sub | 多副本且 cookie 亲和不可用 |
-| 15 | ClickHouse 采集管道 + 真实数据量压测 | 决定启用 `DATA_MODE=warehouse` |
-| 16 | SSO/OIDC 集成 | 企业身份体系要求 |
-| 17 | 多租户 + 资源级授权 | 要服务多个团队/客户 |
-| 18 | 审计日志哈希链或外发到 WORM 存储 | 合规要求法务级证据 |
-| 19 | OTLP 分布式追踪 | 服务拆分后 |
-| 20 | 金额改 `Numeric` + 财务对账口径 | 需要与财务系统对账 |
+| 15 | 迁移到 arq/Celery 队列 + 常驻 worker | 需要 run 必达 SLA，或单副本吞吐成瓶颈 |
+| 16 | EventBus 换 Redis Pub/Sub | 多副本且 cookie 亲和不可用 |
+| 17 | ClickHouse 采集管道 + 真实数据量压测 | 决定启用 `DATA_MODE=warehouse` |
+| 18 | SSO/OIDC 集成 | 企业身份体系要求 |
+| 19 | 多租户 + 资源级授权 | 要服务多个团队/客户 |
+| 20 | 审计日志哈希链或外发到 WORM 存储 | 合规要求法务级证据 |
+| 21 | OTLP 分布式追踪 | 服务拆分后 |
+| 22 | 金额改 `Numeric` + 财务对账口径 | 需要与财务系统对账 |
 
 ### 明确不做
 
@@ -266,6 +325,6 @@ SQLite 开发库首次启动会自动 `create_all()` 并写入 `alembic_version`
 
 ## 9. 一句话总结
 
-**这个系统现在可以做的事**：在 mock 数据或你自己灌进来的数据上，稳定地跑通"监控 → 分析 → 生成创意 → 调竞价 → 分预算 → 产出可审批提案 → 人工审批 → 执行 → 全程审计"的闭环，并且有企业级的认证、授权、审计、限流、探针、指标、容器化与 CI。
+**这个系统现在可以做的事**：在 mock 数据或你自己灌进来的数据上，稳定地跑通"采集 → 监控 → 分析 → 生成创意 → 调竞价 → 分预算 → 产出可审批提案 → 人工审批 → 执行 → 全程审计"的闭环，并且有企业级的认证、授权、审计、限流、探针、指标、容器化与 CI。数据入口（`POST /ingest/metrics` + `adoptimizer ingest`）是真接口而不是摆设：每一行要么落地、要么带着原因出现在报告里，落地的那部分带出处（`source` / `batch_id`）。
 
-**它现在还不能做的事**：直接接管你在 Google/Meta/TikTok 上的真实预算。那需要先完成 P0-2 与 P1-7 的平台联调，并且在你自己的沙箱账户上验证过。
+**它现在还不能做的事**：直接接管你在 Google/Meta/TikTok 上的真实预算。那需要先完成 P0-2 与 P1-7 的平台联调，并且在你自己的沙箱账户上验证过。同样地，**采集入口还没有真实数据源**——`platform` 源的转换逻辑写好了也有测试，但没有真账号就跑不到那条路径，日常能用的只有明确标注为合成数据的 `synthetic`（见 §3.5）。

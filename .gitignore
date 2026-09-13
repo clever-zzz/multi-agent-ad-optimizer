@@ -56,6 +56,10 @@ coverage/
 .ruff_cache/
 .pytest_cache/
 coverage.xml
+# pytest --basetemp scratch dirs and ad-hoc diagnostic scripts
+.pytest_tmp*/
+.pytest-tmp/
+.scratch/
 
 # Local databases
 *.db

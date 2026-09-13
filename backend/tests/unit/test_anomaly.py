@@ -85,6 +85,32 @@ class TestDetection:
         assert burn_w.severity == AlertSeverity.WARNING
         assert burn_c.severity == AlertSeverity.CRITICAL
 
+    def test_burn_rate_normalises_window_spend_to_a_daily_figure(self) -> None:
+        """Regression: a multi-day total was compared against a one-day budget."""
+        steady = PerformanceSnapshot(
+            campaign_id="steady",
+            impressions=10_000,
+            clicks=500,
+            conversions=50,
+            total_cost=2_100.0,
+            total_revenue=5_000.0,
+        )
+        budgets = {"steady": 100.0}
+        # 2100 across 21 days averages exactly the daily budget: nothing to report.
+        quiet = detect([steady], daily_budgets=budgets, window_days=21)
+        # The same total read as one day is 21x the budget.
+        loud = detect([steady], daily_budgets=budgets)
+        assert AlertRule.BURN_RATE not in rules(quiet)
+        assert AlertRule.BURN_RATE in rules(loud)
+
+    def test_burn_rate_context_records_the_window_it_normalised_over(self) -> None:
+        alerts = detect([BROKEN], daily_budgets={"broken": 20.0}, window_days=10)
+        alert = next(a for a in alerts if a.rule == AlertRule.BURN_RATE)
+        # 1000 across 10 days is 100/day against a 20/day budget.
+        assert alert.observed == pytest.approx(5.0)
+        assert alert.context["window_days"] == 10
+        assert alert.context["daily_spend"] == pytest.approx(100.0)
+
 
 class TestEvidenceGates:
     def test_low_impressions_suppress_the_ctr_rule(self) -> None:

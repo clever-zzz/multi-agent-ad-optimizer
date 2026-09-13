@@ -228,6 +228,11 @@ class CampaignService:
         return {
             "campaign_ids": ids,
             "snapshots": snapshots,
+            # The identity bridge agents need to call platform tools: internal id
+            # in, network coordinates out. Collected here rather than inside the
+            # loop so a run performs one query no matter how many iterations it
+            # takes, and so agents stay free of database access.
+            "campaign_refs": await self._campaigns.refs(ids),
             "daily_budgets": await self._campaigns.daily_budgets(ids),
             "campaign_targets": await self._campaigns.targets(ids),
             "creative_stats": await self._metrics.creative_stats(ids, days=days),

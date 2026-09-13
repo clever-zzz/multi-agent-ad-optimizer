@@ -88,6 +88,7 @@ class TestSchema:
         for channel in (
             "new_creatives",
             "optimization_actions",
+            "critic_findings",
             "agent_messages",
             "alert_fingerprints",
         ):

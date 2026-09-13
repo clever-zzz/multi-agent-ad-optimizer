@@ -15,7 +15,7 @@ import time
 
 from ..core.config import LLMProvider
 from ..core.logging import get_logger
-from .base import CompletionRequest, CompletionResult, Usage
+from .base import CompletionRequest, CompletionResult, DeltaHandler, Usage
 
 logger = get_logger(__name__)
 
@@ -48,10 +48,18 @@ class MockLanguageModel:
         # completion. Determinism is the point; this never guards anything.
         return random.Random(int(digest[:16], 16))  # noqa: S311
 
-    async def complete(self, request: CompletionRequest) -> CompletionResult:
+    async def complete(
+        self, request: CompletionRequest, *, on_delta: DeltaHandler | None = None
+    ) -> CompletionResult:
         started = time.perf_counter()
         payload = self._render(request)
         text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if on_delta is not None:
+            # Line-shaped chunks keep the mock deterministic while still
+            # exercising a consumer's incremental render path, and joining them
+            # reproduces the returned text exactly.
+            for chunk in text.splitlines(keepends=True):
+                await on_delta(chunk)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
         prompt_tokens = max(1, (len(request.system_prompt) + len(request.user_prompt)) // 4)

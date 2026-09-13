@@ -3,6 +3,12 @@
 The optimizer only proposes. This service is the single place where a proposal
 becomes a real change, and it enforces the human-in-the-loop gate so a model
 error can never move spend unattended.
+
+Once approved, the change reaches the network through the tool executor rather
+than through a platform client held by this service. That is not ceremony: the
+executor is what stamps the call with an audit row, an idempotency key and the
+deployment-wide dry-run switch, so "an agent moved money" is always a sentence
+somebody can read back instead of a stack trace nobody logged.
 """
 
 from __future__ import annotations
@@ -13,16 +19,24 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import SecuritySettings
-from ..core.errors import ActionRequiresApprovalError, ConflictError, NotFoundError
+from ..core.errors import (
+    ActionRequiresApprovalError,
+    ConflictError,
+    ExternalServiceError,
+    NotFoundError,
+    ValidationFailure,
+)
 from ..core.logging import get_logger
 from ..core.security import Permission, TokenClaims, require_permission
-from ..domain.enums import ActionStatus, ActionType, CampaignStatus, CreativeStatus
+from ..domain.enums import ActionStatus, ActionType, CampaignStatus, CreativeStatus, Platform
 from ..domain.statistics import required_sample_size
 from ..infra.ads.base import AdsPlatformClient, ExecutionResult
 from ..infra.db.models import Campaign, Creative, OptimizationAction
 from ..repositories.audit import ABTestRepository
 from ..repositories.campaigns import CampaignRepository, CreativeRepository
 from ..repositories.runs import ActionRepository
+from ..tools.executor import ToolExecutor
+from ..tools.spec import ToolOutcome, ToolRequest, ToolResult
 from .audit import AuditService
 
 logger = get_logger(__name__)
@@ -37,6 +51,11 @@ HIGH_RISK_ACTIONS = frozenset(
     }
 )
 
+# Mirrors REASON_MAX in the tool schema. The executor validates a rationale as
+# 1-200 characters, so truncating here keeps a verbose proposal from being
+# refused as malformed on its way to the network.
+REASON_MAX = 200
+
 
 class ActionService:
     """Approve, reject and execute proposed optimization actions."""
@@ -47,6 +66,7 @@ class ActionService:
         *,
         platforms: Any,
         security: SecuritySettings,
+        tools: ToolExecutor | None = None,
     ) -> None:
         self._session = session
         self._actions = ActionRepository(session)
@@ -55,6 +75,7 @@ class ActionService:
         self._experiments = ABTestRepository(session)
         self._audit = AuditService(session)
         self._platforms = platforms
+        self._tools = tools
         self._require_approval = security.require_action_approval
 
     async def list_actions(
@@ -205,6 +226,9 @@ class ActionService:
                 "action_type": action.action_type,
                 "after_value": action.after_value,
                 "external_reference": action.external_reference,
+                # A dry-run execution still settles the action locally, so the
+                # audit row has to say whether the network was really touched.
+                "dry_run": result.dry_run if result is not None else None,
             },
             client=client,
         )
@@ -223,6 +247,10 @@ class ActionService:
         """Mutate local state and call the platform adapter for the action type."""
         action_type = ActionType(action.action_type)
         platform_client: AdsPlatformClient | None = None
+        # Resolved apart from the adapter on purpose: the tool layer owns its own
+        # registry, so a campaign whose adapter lookup failed here can still be
+        # routed through the executor and get an honest failure back from it.
+        platform = _platform_of(campaign)
         if campaign is not None and campaign.external_id:
             try:
                 platform_client = self._platforms.for_platform(campaign.platform)
@@ -234,11 +262,13 @@ class ActionService:
                 )
 
         if action_type == ActionType.ADJUST_BUDGET:
-            return await self._apply_budget(action, campaign, platform_client)
+            return await self._apply_budget(action, campaign, platform_client, platform)
         if action_type in (ActionType.PAUSE_CAMPAIGN, ActionType.RESUME_CAMPAIGN):
-            return await self._apply_campaign_status(action, campaign, platform_client, action_type)
+            return await self._apply_campaign_status(
+                action, campaign, platform_client, action_type, platform
+            )
         if action_type in (ActionType.PAUSE_CREATIVE, ActionType.RESUME_CREATIVE):
-            return await self._apply_creative_status(action, platform_client, action_type)
+            return await self._apply_creative_status(action, platform_client, action_type, platform)
         if action_type == ActionType.ADJUST_BID:
             return await self._apply_bid(action, campaign, platform_client)
         if action_type == ActionType.START_AB_TEST:
@@ -251,11 +281,74 @@ class ActionService:
         logger.info("action_type_has_no_executor", action_type=action_type.value)
         return None
 
+    async def _push(
+        self,
+        action: OptimizationAction,
+        *,
+        tool: str,
+        operation: str,
+        platform: Platform | None,
+        arguments: dict[str, Any],
+    ) -> ExecutionResult | None:
+        """Send an approved change to the network through the tool executor.
+
+        agent=None is the load-bearing argument: the executor dry-runs every
+        agent-initiated write, but this call already carries a human approval, so
+        it is allowed to be real. Whether it actually is then depends on
+        TOOLS__DRY_RUN alone, which keeps one switch in charge of "does this
+        deployment touch money". Returns None when the tool layer is off or the
+        campaign was never synced, so the caller falls back to the adapter.
+        """
+        executor = self._tools
+        if executor is None or not executor.enabled or platform is None:
+            return None
+
+        call_arguments = dict(arguments)
+        call_arguments["platform"] = platform.value
+        result = await executor.call(
+            ToolRequest(
+                tool=tool,
+                arguments=call_arguments,
+                agent=None,
+                run_id=str(action.run_id or ""),
+                actor=str(action.approved_by or "system"),
+                # Keyed on the action rather than the attempt, so a retried
+                # execute replays the recorded result instead of charging the
+                # ad network twice for one approval.
+                idempotency_key="action:" + str(action.id),
+            )
+        )
+        if result.outcome is ToolOutcome.VALIDATION_FAILED:
+            raise ValidationFailure(
+                "Action "
+                + str(action.id)
+                + " could not be sent to "
+                + tool
+                + ": "
+                + str(result.error or "rejected by the tool schema"),
+                detail={"tool": tool, "action_id": action.id},
+            )
+        if result.outcome is ToolOutcome.FAILED or result.refused:
+            # Parity with the direct adapter path, where a platform error
+            # propagates and the action lands as failed rather than executed.
+            raise ExternalServiceError(
+                tool
+                + " did not run for action "
+                + str(action.id)
+                + " ("
+                + result.outcome.value
+                + "): "
+                + str(result.error or "no reason reported"),
+                detail={"tool": tool, "outcome": result.outcome.value, "action_id": action.id},
+            )
+        return _execution_from_tool(result, platform=platform, operation=operation)
+
     async def _apply_budget(
         self,
         action: OptimizationAction,
         campaign: Campaign | None,
         client: AdsPlatformClient | None,
+        platform: Platform | None,
     ) -> ExecutionResult | None:
         new_budget = _parse_float(action.after_value)
         if new_budget is None or new_budget <= 0:
@@ -269,7 +362,22 @@ class ActionService:
             campaign.daily_budget = rounded
             await self._campaigns.flush()
 
-        if client is not None and campaign is not None and campaign.external_id:
+        if campaign is None or not campaign.external_id:
+            return None
+        pushed = await self._push(
+            action,
+            tool="platform.set_daily_budget",
+            operation="update_budget",
+            platform=platform,
+            arguments={
+                "campaign_external_id": campaign.external_id,
+                "daily_budget": rounded,
+                "reason": _reason(action),
+            },
+        )
+        if pushed is not None:
+            return pushed
+        if client is not None:
             return await client.update_campaign_budget(campaign.external_id, daily_budget=rounded)
         return None
 
@@ -279,6 +387,7 @@ class ActionService:
         campaign: Campaign | None,
         client: AdsPlatformClient | None,
         action_type: ActionType,
+        platform: Platform | None,
     ) -> ExecutionResult | None:
         target = (
             CampaignStatus.PAUSED
@@ -289,11 +398,21 @@ class ActionService:
             campaign.status = target.value
             await self._campaigns.flush()
 
-        if client is not None and campaign is not None and campaign.external_id:
-            operation = (
-                client.pause_campaign if target == CampaignStatus.PAUSED else client.resume_campaign
-            )
-            return await operation(campaign.external_id, reason=action.reason[:200])
+        if campaign is None or not campaign.external_id:
+            return None
+        pausing = target == CampaignStatus.PAUSED
+        pushed = await self._push(
+            action,
+            tool="platform.pause_campaign" if pausing else "platform.resume_campaign",
+            operation="pause_campaign" if pausing else "resume_campaign",
+            platform=platform,
+            arguments={"campaign_external_id": campaign.external_id, "reason": _reason(action)},
+        )
+        if pushed is not None:
+            return pushed
+        if client is not None:
+            call = client.pause_campaign if pausing else client.resume_campaign
+            return await call(campaign.external_id, reason=action.reason[:200])
         return None
 
     async def _apply_creative_status(
@@ -301,6 +420,7 @@ class ActionService:
         action: OptimizationAction,
         client: AdsPlatformClient | None,
         action_type: ActionType,
+        platform: Platform | None,
     ) -> ExecutionResult | None:
         target = (
             CreativeStatus.PAUSED
@@ -320,14 +440,24 @@ class ActionService:
         creative.status = target.value
         await self._creatives.flush()
 
-        if client is not None and creative.id:
-            # Resuming must not reuse the pause call: an operator approving
-            # "resume creative" would otherwise switch the ad off on the network
-            # while the local row reads active.
-            operation = (
-                client.pause_creative if target == CreativeStatus.PAUSED else client.resume_creative
-            )
-            return await operation(creative.id, reason=action.reason[:200])
+        if not creative.id:
+            return None
+        # Resuming must not reuse the pause call: an operator approving "resume
+        # creative" would otherwise switch the ad off on the network while the
+        # local row reads active.
+        pausing = target == CreativeStatus.PAUSED
+        pushed = await self._push(
+            action,
+            tool="platform.pause_creative" if pausing else "platform.resume_creative",
+            operation="pause_creative" if pausing else "resume_creative",
+            platform=platform,
+            arguments={"creative_external_id": creative.id, "reason": _reason(action)},
+        )
+        if pushed is not None:
+            return pushed
+        if client is not None:
+            call = client.pause_creative if pausing else client.resume_creative
+            return await call(creative.id, reason=action.reason[:200])
         return None
 
     async def _apply_bid(
@@ -396,6 +526,55 @@ class ActionService:
             await self.approve(action_id, claims=claims, client=client)
             approved.append(action_id)
         return {"approved": approved, "skipped": skipped}
+
+
+def _reason(action: OptimizationAction) -> str:
+    """A rationale the tool schema accepts: never empty, never over-long."""
+    return str(action.reason or "").strip()[:REASON_MAX] or str(action.action_type)
+
+
+def _platform_of(campaign: Campaign | None) -> Platform | None:
+    """The network a campaign lives on, or None when it was never synced to one."""
+    if campaign is None or not campaign.external_id:
+        return None
+    try:
+        return Platform(str(campaign.platform))
+    except ValueError:
+        return None
+
+
+def _execution_from_tool(
+    result: ToolResult, *, platform: Platform, operation: str
+) -> ExecutionResult:
+    """Rebuild the adapter result from what the executor returned.
+
+    A successful call carries the adapter payload verbatim, so this is a
+    re-hydration rather than a translation. A dry run carries no adapter payload
+    at all - the executor never reached the network - so the rehearsal record
+    becomes the detail and dry_run stays true, which is what stops an approval
+    screen from claiming the network accepted something it was never asked about.
+    """
+    if result.dry_run:
+        return ExecutionResult(
+            success=True,
+            platform=platform,
+            operation=operation,
+            detail=dict(result.data),
+            dry_run=True,
+        )
+    payload: dict[str, Any] = dict(result.data)
+    detail = payload.get("detail")
+    reference = payload.get("external_reference")
+    error = payload.get("error")
+    return ExecutionResult(
+        success=bool(payload.get("success", True)),
+        platform=platform,
+        operation=str(payload.get("operation") or operation),
+        external_reference=str(reference) if reference else None,
+        detail=dict(detail) if isinstance(detail, dict) else {},
+        error=str(error) if error else None,
+        dry_run=bool(payload.get("dry_run", False)),
+    )
 
 
 def _parse_float(value: str) -> float | None:

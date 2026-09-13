@@ -1,0 +1,106 @@
+# The scheduled metric pull: the thing that keeps `daily_metrics` fed without
+# anybody pressing a button. Kubernetes starts a pod on a cadence, the pod runs
+# one pass and exits, and the *next* pass is what closes a missed run.
+#
+# Why a CronJob rather than the in-process loop: the API runs several replicas,
+# so INGEST__SCHEDULER_ENABLED=true would start one loop per replica. The
+# database lease stops them double-pulling, but it still spends N pods of work on
+# one job, and the cadence dies with whichever pod is restarted. The ConfigMap
+# therefore sets INGEST__SCHEDULER_ENABLED=false and this manifest owns the
+# schedule. `adoptimizer scheduler --once` deliberately ignores that flag: being
+# scheduled from outside the process is the point of --once.
+#
+# Run one pass by hand - exactly what the schedule does:
+#
+#   kubectl -n adoptimizer create job adoptimizer-ingest-$(date +%s) \
+#     --from=cronjob/adoptimizer-ingest
+#
+# A window older than INGEST__MAX_CATCHUP_DAYS is intentionally NOT closed here.
+# The tick reports `gap_days` and names the backfill command; run that instead,
+# with the window you actually want:
+#
+#   kubectl -n adoptimizer create job adoptimizer-backfill-$(date +%s) \
+#     --from=cronjob/adoptimizer-ingest -- \
+#     adoptimizer ingest --source platform --start 2026-08-01 --end 2026-08-31
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: adoptimizer-ingest
+  namespace: adoptimizer
+  labels:
+    # Same name as the API so the `backend` NetworkPolicy already covers this
+    # pod: it needs egress to postgres, redis, cluster DNS and 443 for the ad
+    # platform APIs, and it must not be reachable from the edge at all.
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: ingest
+spec:
+  # Minute 10 of every 6th hour. The offset keeps the pull off the top of the
+  # hour, where the migration job and most platforms' own report generation also
+  # land; 6 hours matches INGEST__INTERVAL_MINUTES=360 so the two mechanisms
+  # agree on cadence if the in-process loop is ever switched on by mistake.
+  schedule: "10 */6 * * *"
+  # Explicitly UTC. Without timeZone the cron expression is evaluated in each
+  # node's local zone, so "10 */6" means different wall-clock hours on different
+  # nodes and shifts twice a year wherever DST applies. The window arithmetic is
+  # calendar-day based, so the trigger has to be pinned to the same clock.
+  timeZone: "Etc/UTC"
+  # One pull at a time. The lease would already stop two pods writing the same
+  # slots, but Forbid means the second pod is never created, so a slow pull
+  # cannot queue up behind itself.
+  concurrencyPolicy: Forbid
+  # The k8s half of the missed-run policy, and the reason the window is derived
+  # from the calendar instead of a cursor: if the cluster was down or the image
+  # was broken for a day, the next run still starts and still asks for
+  # everything since the last covered day. 3600s means a run missed by more than
+  # an hour is skipped rather than started late - a late pull would compute the
+  # same window as the next scheduled one anyway.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Two retries, then the tick exits non-zero and
+      # ingest_ticks_total{outcome="failed"} is what pages. Retrying forever
+      # would hide a dead feed behind a job that never finishes.
+      backoffLimit: 2
+      # Generous compared with the migration job: one pass walks every campaign
+      # across up to INGEST__MAX_CATCHUP_DAYS + INGEST__LOOKBACK_DAYS days.
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: backend
+            app.kubernetes.io/component: ingest
+        spec:
+          # Never rather than OnFailure: backoffLimit already owns retries, and a
+          # finished pull's exit code is the signal, so the container must not be
+          # restarted underneath it.
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: ingest
+              image: adoptimizer/backend:latest
+              command: ["adoptimizer", "scheduler", "--once"]
+              envFrom:
+                - configMapRef:
+                    name: adoptimizer-config
+                - secretRef:
+                    name: adoptimizer-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]

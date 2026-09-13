@@ -12,6 +12,7 @@ const AGENT_COLOR: Record<string, string> = {
   creative: "var(--color-warn)",
   bidding: "var(--color-pos)",
   optimize: "#f472b6",
+  critic: "var(--color-neg)",
 };
 
 const AGENT_ICON: Record<string, IconName> = {
@@ -21,6 +22,7 @@ const AGENT_ICON: Record<string, IconName> = {
   creative: "sparkles",
   bidding: "wallet",
   optimize: "trendUp",
+  critic: "shield",
 };
 
 const TYPE_LABEL: Record<string, string> = {

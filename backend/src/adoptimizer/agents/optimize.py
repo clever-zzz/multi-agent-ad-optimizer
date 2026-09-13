@@ -3,6 +3,11 @@
 Nothing here executes. The agent only proposes; execution happens in the action
 service after approval (or immediately when approval is disabled), so a model
 hallucination can never change spend on its own.
+
+What it does do is rehearse. Every proposal that would mutate an ad account is
+handed to the tool layer as a dry run before it reaches the approval queue, so
+"the network would reject this" is discovered by the agent rather than by the
+operator who clicked approve.
 """
 
 from __future__ import annotations
@@ -24,6 +29,40 @@ logger = get_logger(__name__)
 PAUSE_RULES = frozenset({AlertRule.HIGH_CPA, AlertRule.BURN_RATE})
 REFRESH_RULES = frozenset({AlertRule.LOW_CTR, AlertRule.FREQUENCY_FATIGUE})
 
+# Which tool carries each proposal that touches a campaign. Anything absent from
+# these two maps is either advisory (refresh_creative, expand_audience,
+# start_ab_test) or applied through a per-network bidding API with no single
+# call shape (adjust_bid), so it is recorded locally and never preflighted.
+CAMPAIGN_TOOLS = {
+    ActionType.ADJUST_BUDGET: "platform.set_daily_budget",
+    ActionType.PAUSE_CAMPAIGN: "platform.pause_campaign",
+    ActionType.RESUME_CAMPAIGN: "platform.resume_campaign",
+}
+CREATIVE_TOOLS = {
+    ActionType.PAUSE_CREATIVE: "platform.pause_creative",
+    ActionType.RESUME_CREATIVE: "platform.resume_creative",
+}
+
+# Mirrors REASON_MAX in the tool schema. Truncating here rather than letting the
+# executor refuse the call keeps a long rationale from masquerading as a
+# malformed proposal.
+REASON_MAX = 200
+
+# Dry runs cost executor budget and audit rows even though they touch nothing.
+# Capping them per iteration keeps a pathological run from spending its whole
+# tool budget on rehearsal and leaving none for the monitor's live checks.
+MAX_PREFLIGHTS_PER_ITERATION = 25
+
+
+def _budget_value(raw: Any) -> float | None:
+    """Parse a proposed budget that may carry a currency symbol."""
+    cleaned = str(raw or "").replace("\u00a5", "").replace("$", "").replace(",", "").strip()
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 
 class OptimizeAgent(BaseAgent):
     """Proposes budget, bid, creative and experiment actions."""
@@ -42,6 +81,7 @@ class OptimizeAgent(BaseAgent):
         allocations = allocate(
             snapshots,
             max_change_pct=context.optimization.max_budget_change_pct / 100.0,
+            daily_budgets=context.daily_budgets,
             cross_check_with_solver=context.optimization.use_convex_solver,
         )
         actions.extend(self._budget_actions(allocations, iteration))
@@ -50,19 +90,23 @@ class OptimizeAgent(BaseAgent):
         actions.extend(self._experiment_actions(new_creatives, context, iteration))
 
         actions = self._dedupe(actions)
+        preflights = await self._preflight(actions, context, iteration)
         is_complete = self._should_complete(iteration, state, alerts, actions)
 
-        message = self._build_message(actions, allocations, iteration)
+        message = self._build_message(actions, allocations, iteration, preflights)
         logger.info(
             "optimize_completed",
             run_id=context.run_id,
             iteration=iteration,
             actions=len(actions),
+            preflights=len(preflights),
+            blocked=sum(1 for item in preflights if item["blocking"]),
             complete=is_complete,
         )
 
         return {
             "optimization_actions": actions,
+            "tool_preflights": preflights,
             "budget_allocations": [
                 {**allocation.model_dump(), "iteration": iteration} for allocation in allocations
             ],
@@ -74,9 +118,129 @@ class OptimizeAgent(BaseAgent):
                 "iteration": iteration,
                 "actions": len(actions),
                 "budget": total_delta(allocations),
+                "preflights": len(preflights),
+                "preflights_blocked": sum(1 for item in preflights if item["blocking"]),
                 "is_complete": is_complete,
             },
         }
+
+    async def _preflight(
+        self,
+        actions: list[dict[str, Any]],
+        context: AgentContext,
+        iteration: int,
+    ) -> list[dict[str, Any]]:
+        """Rehearse every write proposal and annotate it with the verdict.
+
+        The annotation travels on the proposal itself, so the critic can refuse
+        to pass along anything the platform would reject and the approval screen
+        can show the operator why. Records are also returned separately because
+        proposals accumulate across iterations while the run-level view of "what
+        was rehearsed" should not.
+        """
+        if context.tools is None or not context.tools.enabled:
+            return []
+
+        records: list[dict[str, Any]] = []
+        attempted = 0
+        for action in actions:
+            if attempted >= MAX_PREFLIGHTS_PER_ITERATION:
+                break
+            call = self._preflight_call(action, context)
+            if call is None:
+                continue
+            attempted += 1
+            tool, arguments, target_id = call
+            result = await context.call_tool(
+                tool,
+                arguments,
+                agent=self.name,
+                idempotency_key=("preflight:" + str(iteration) + ":" + str(action.get("id") or "")),
+            )
+            if result is None:
+                continue
+
+            record = {
+                "action_id": str(action.get("id") or ""),
+                "action_type": str(action.get("action_type") or ""),
+                "campaign_id": str(action.get("campaign_id") or ""),
+                "target_id": target_id,
+                "tool": tool,
+                "iteration": iteration,
+                "outcome": result.outcome.value,
+                "dry_run": result.dry_run,
+                "refused": result.refused,
+                "blocking": result.blocking,
+                "duration_ms": round(result.duration_ms, 2),
+                "error": result.error,
+            }
+            records.append(record)
+            action["preflight"] = {
+                "tool": tool,
+                "outcome": record["outcome"],
+                "refused": record["refused"],
+                "blocking": record["blocking"],
+                "error": result.error,
+            }
+        return records
+
+    def _preflight_call(
+        self, action: dict[str, Any], context: AgentContext
+    ) -> tuple[str, dict[str, Any], str] | None:
+        """Build the tool call a proposal implies, or None when it implies none.
+
+        Returning None is a deliberate non-verdict, not a pass: it means the
+        proposal is advisory, or the campaign was never synced to a network, so
+        there is nothing to rehearse. The critic treats those differently from a
+        rehearsal that came back refused.
+        """
+        try:
+            action_type = ActionType(str(action.get("action_type") or ""))
+        except ValueError:
+            return None
+
+        campaign_id = str(action.get("campaign_id") or "")
+        ref = context.campaign_ref(campaign_id)
+        if ref is None:
+            return None
+        reason = str(action.get("reason") or "")[:REASON_MAX] or action_type.value
+
+        if action_type in CAMPAIGN_TOOLS:
+            target = context.tool_target(campaign_id)
+            if target is None:
+                return None
+            platform, external_id = target
+            arguments: dict[str, Any] = {
+                "platform": platform,
+                "campaign_external_id": external_id,
+                "reason": reason,
+            }
+            if action_type == ActionType.ADJUST_BUDGET:
+                budget = _budget_value(action.get("after_value"))
+                if budget is None:
+                    return None
+                arguments["daily_budget"] = budget
+            return CAMPAIGN_TOOLS[action_type], arguments, external_id
+
+        if action_type in CREATIVE_TOOLS:
+            creative_id = str(action.get("creative_id") or "")
+            if not creative_id:
+                # A campaign-level proxy proposal names no specific asset, so
+                # there is nothing concrete for the network to accept or reject.
+                return None
+            platform = str(ref.get("platform") or "")
+            if not platform:
+                return None
+            return (
+                CREATIVE_TOOLS[action_type],
+                {
+                    "platform": platform,
+                    "creative_external_id": creative_id,
+                    "reason": reason,
+                },
+                creative_id,
+            )
+        return None
 
     def _snapshots(self, state: AgentState) -> list[PerformanceSnapshot]:
         restored: list[PerformanceSnapshot] = []
@@ -101,6 +265,7 @@ class OptimizeAgent(BaseAgent):
         before_value: str = "",
         after_value: str = "",
         creative_id: str | None = None,
+        severity: str = "",
     ) -> dict[str, Any]:
         return {
             "id": new_id("act"),
@@ -115,6 +280,10 @@ class OptimizeAgent(BaseAgent):
             "confidence": round(max(0.0, min(confidence, 1.0)), 3),
             "proposed_by": self.name.value,
             "iteration": iteration,
+            # Only alert-derived proposals carry this. It tells the critic that
+            # a fired anomaly rule stands behind the proposal, which is a
+            # different claim than "the delivery sample was large enough".
+            "severity": severity,
         }
 
     def _creative_actions(
@@ -249,6 +418,7 @@ class OptimizeAgent(BaseAgent):
                         reason="Alert " + rule.value + ": " + message,
                         confidence=confidence,
                         iteration=iteration,
+                        severity=severity,
                     )
                 )
             elif rule in REFRESH_RULES:
@@ -259,6 +429,7 @@ class OptimizeAgent(BaseAgent):
                         reason="Alert " + rule.value + ": " + message,
                         confidence=confidence,
                         iteration=iteration,
+                        severity=severity,
                     )
                 )
             elif rule == AlertRule.LOW_ROAS:
@@ -272,6 +443,7 @@ class OptimizeAgent(BaseAgent):
                         + message,
                         confidence=confidence,
                         iteration=iteration,
+                        severity=severity,
                     )
                 )
             else:
@@ -343,7 +515,11 @@ class OptimizeAgent(BaseAgent):
         return not actions
 
     def _build_message(
-        self, actions: list[dict[str, Any]], allocations: list[Any], iteration: int
+        self,
+        actions: list[dict[str, Any]],
+        allocations: list[Any],
+        iteration: int,
+        preflights: list[dict[str, Any]],
     ) -> dict[str, Any]:
         counts: dict[str, int] = {}
         for action in actions:
@@ -357,6 +533,17 @@ class OptimizeAgent(BaseAgent):
             or "none"
         )
         delta = total_delta(allocations)
+        rehearsed = len(preflights)
+        blocked = sum(1 for item in preflights if item["blocking"])
+        rehearsal = (
+            " Rehearsed "
+            + str(rehearsed)
+            + " write proposal(s) against the tool layer; "
+            + str(blocked)
+            + " came back blocked."
+            if rehearsed
+            else ""
+        )
 
         return self._message(
             "Iteration "
@@ -369,7 +556,12 @@ class OptimizeAgent(BaseAgent):
             + format(delta["net_delta"], "+.2f")
             + " across "
             + str(delta["campaigns"])
-            + " campaign(s).",
+            + " campaign(s)."
+            + rehearsal,
             iteration=iteration,
-            extra={"action_counts": counts, "budget_delta": delta},
+            extra={
+                "action_counts": counts,
+                "budget_delta": delta,
+                "preflights": {"attempted": rehearsed, "blocked": blocked},
+            },
         )

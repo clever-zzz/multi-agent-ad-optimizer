@@ -33,6 +33,17 @@ x-backend-env: &backend-env
   OBSERVABILITY__LOG_LEVEL: ${OBSERVABILITY__LOG_LEVEL:-INFO}
   OBSERVABILITY__JSON_LOGS: ${OBSERVABILITY__JSON_LOGS:-true}
   OPTIMIZATION__USE_CONVEX_SOLVER: ${OPTIMIZATION__USE_CONVEX_SOLVER:-true}
+  # Off by default even in compose: the API would otherwise run a loop per
+  # replica. The `ingest` service below is the one-shot form; run it from cron.
+  INGEST__SCHEDULER_ENABLED: ${INGEST__SCHEDULER_ENABLED:-false}
+  # synthetic is safe here because DATA_MODE=mock; the k8s ConfigMap pins this
+  # to ["platform"] so a real deployment can never schedule a synthetic feed.
+  INGEST__SOURCES: ${INGEST__SOURCES:-["synthetic"]}
+  INGEST__INTERVAL_MINUTES: ${INGEST__INTERVAL_MINUTES:-360}
+  INGEST__LOOKBACK_DAYS: ${INGEST__LOOKBACK_DAYS:-3}
+  INGEST__MAX_CATCHUP_DAYS: ${INGEST__MAX_CATCHUP_DAYS:-14}
+  INGEST__LEASE_TTL_SECONDS: ${INGEST__LEASE_TTL_SECONDS:-1800}
+  INGEST__DRY_RUN: ${INGEST__DRY_RUN:-false}
 
 services:
   postgres:
@@ -145,6 +156,36 @@ services:
       RUN_MIGRATIONS: "false"
     command: ["adoptimizer", "run", "--max-iterations", "2", "--window-days", "7"]
     profiles: ["worker"]
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  ingest:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.backend
+    image: adoptimizer-backend:${IMAGE_TAG:-dev}
+    # One-shot scheduled pull: run one pass over INGEST__SOURCES and exit with
+    # the outcome, so a non-zero code is what your scheduler alerts on.
+    #   docker compose --profile ingest run --rm ingest
+    # deploy/k8s/ingest-cronjob.yaml is the production form of this service.
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Waiting on api means waiting on RUN_MIGRATIONS: the pull writes
+      # ingest_watermarks and ingest_leases, which only exist from 0005 on.
+      api:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      RUN_MIGRATIONS: "false"
+    command: ["adoptimizer", "scheduler", "--once"]
+    profiles: ["ingest"]
     networks: [backend]
     deploy:
       resources:

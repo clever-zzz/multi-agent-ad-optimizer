@@ -6,14 +6,26 @@ gate as well as the happy path.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from sqlalchemy import select
+
+from adoptimizer.core.config import Settings
+from adoptimizer.core.errors import ValidationFailure
+from adoptimizer.infra.db.models import LLMSpendRecord, OptimizationRun
+from adoptimizer.infra.db.session import Database
+from adoptimizer.repositories.runs import RunRepository
+from adoptimizer.services.optimization import OptimizationService
 
 from ..conftest import ADMIN_EMAIL, ADMIN_PASSWORD, API, access_token, bearer
 
-FIVE_AGENTS = {"monitor", "audience", "creative", "bidding", "optimize"}
+# Every step of the loop must emit at least one event, so a silently skipped
+# agent fails here rather than showing up as a gap on the run timeline.
+LOOP_AGENTS = {"monitor", "audience", "creative", "bidding", "optimize", "critic"}
 
 
 @pytest.fixture
@@ -70,6 +82,48 @@ class TestRunLifecycle:
         assert sum(counts.values()) > 0
         assert counts
 
+    async def test_no_campaign_holds_two_contradictory_proposals(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        """The optimizer fires one proposal per rule; the critic reconciles them.
+
+        Without the critic every seeded campaign ended a run holding both
+        `pause_campaign` and a spend change, which asked an operator to approve
+        two mutually exclusive outcomes for the same campaign.
+        """
+        detail = (await client.get(API + "/runs/" + completed_run["id"], headers=admin)).json()
+        spend = {"adjust_budget", "adjust_bid"}
+        actions = detail["actions"]
+        paused = {a["campaign_id"] for a in actions if a["action_type"] == "pause_campaign"}
+        tuned = {a["campaign_id"] for a in actions if a["action_type"] in spend}
+        assert paused.isdisjoint(tuned), "contradictions survived: " + str(sorted(paused & tuned))
+
+    async def test_the_critic_shrinks_the_approval_queue(
+        self, completed_run: dict[str, Any]
+    ) -> None:
+        """The seeded portfolio is deliberately conflicted, so this must bite."""
+        summary = completed_run["summary"]
+        assert summary["actions_proposed"] >= summary["actions"]
+        assert summary["actions_suppressed"] == summary["actions_proposed"] - summary["actions"]
+        assert summary["critic_findings"] > 0
+        assert summary["actions_suppressed"] > 0
+
+    async def test_the_critic_reviews_the_proposals_the_optimizer_just_made(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        detail = (await client.get(API + "/runs/" + completed_run["id"], headers=admin)).json()
+        started = {
+            event["agent"]: event["seq"]
+            for event in detail["events"]
+            if event["event_type"] == "agent.started"
+        }
+        assert started["critic"] > started["optimize"]
+
+        verdicts = [event for event in detail["events"] if event["agent"] == "critic"]
+        completed = [event for event in verdicts if event["event_type"] == "agent.completed"]
+        assert completed, "the critic never reported a verdict"
+        assert completed[-1]["payload"]["summary"]["suppressed"] >= 0
+
     async def test_run_detail_exposes_the_agent_timeline(
         self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
     ) -> None:
@@ -77,9 +131,9 @@ class TestRunLifecycle:
         assert response.status_code == 200
         detail = response.json()
         assert detail["run"]["id"] == completed_run["id"]
-        assert len(detail["events"]) >= len(FIVE_AGENTS)
+        assert len(detail["events"]) >= len(LOOP_AGENTS)
         agents = {event["agent"] for event in detail["events"]}
-        assert agents >= FIVE_AGENTS
+        assert agents >= LOOP_AGENTS
         assert len(detail["actions"]) == completed_run["summary"]["actions"]
         assert len(detail["allocations"]) == completed_run["summary"]["budget_adjustments"]
 
@@ -158,6 +212,75 @@ class TestIdempotency:
         assert second.json()["id"] == first["id"]
         page = (await client.get(API + "/runs", headers=admin)).json()
         assert page["total"] == 1
+
+    async def test_concurrent_replays_create_exactly_one_run(
+        self, client: httpx.AsyncClient, admin: dict[str, str]
+    ) -> None:
+        """Two callers racing one key must not each walk away with a run.
+
+        `start_run` looks the key up before it inserts, so both callers can miss.
+        The unique index is what actually arbitrates; without it this produces two
+        runs and the platform gets asked to do the same work twice.
+        """
+        headers = {**admin, "Idempotency-Key": "probe-key-race"}
+        payload = {"background": False, "max_iterations": 1}
+        first, second = await asyncio.gather(
+            client.post(API + "/runs", json=payload, headers=headers),
+            client.post(API + "/runs", json=payload, headers=headers),
+        )
+        assert first.status_code == 202, first.text
+        assert second.status_code == 202, second.text
+        assert first.json()["id"] == second.json()["id"]
+        page = (await client.get(API + "/runs", headers=admin)).json()
+        assert page["total"] == 1
+
+    async def test_the_index_arbitrates_when_the_lookup_misses(
+        self, client: httpx.AsyncClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive the IntegrityError branch on purpose.
+
+        A genuine race is timing-dependent, so blind the first lookup instead. The
+        replay then reaches the insert, loses, and must still come back holding the
+        original run rather than a 500 or a second row.
+        """
+        headers = {**admin, "Idempotency-Key": "probe-key-blind"}
+        first = await run_sync(client, headers, max_iterations=1)
+
+        original = RunRepository.find_by_idempotency_key
+        calls = {"count": 0}
+
+        async def blind_once(
+            self: RunRepository, key: str, actor_id: str
+        ) -> OptimizationRun | None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None
+            return await original(self, key, actor_id)
+
+        monkeypatch.setattr(RunRepository, "find_by_idempotency_key", blind_once)
+        second = await client.post(
+            API + "/runs", json={"background": False, "max_iterations": 1}, headers=headers
+        )
+
+        assert calls["count"] >= 2, "the loser must look the key up again after rolling back"
+        assert second.status_code == 202, second.text
+        assert second.json()["id"] == first["id"]
+        page = (await client.get(API + "/runs", headers=admin)).json()
+        assert page["total"] == 1
+
+    async def test_a_key_with_no_actor_is_refused(self, app: FastAPI) -> None:
+        """An unscoped key would make the guarantee silently inoperative.
+
+        The index is (key, actor) and SQL treats NULLs as distinct, so a key sent
+        by nobody is never deduplicated. Refusing beats pretending otherwise - a
+        scheduler firing on a tick is exactly the caller that would trip here.
+        """
+        container = app.state.container
+        async with container.database.unit_of_work() as session:
+            with pytest.raises(ValidationFailure):
+                await OptimizationService(container, session).start_run(
+                    session, idempotency_key="orphan-key", actor_id=None
+                )
 
 
 class TestApprovalGate:
@@ -425,3 +548,43 @@ class TestAnalyticsAfterARun:
         self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
     ) -> None:
         assert completed_run["llm_cost_usd"] == 0.0
+
+    async def test_the_run_usage_matches_the_spend_ledger(
+        self,
+        client: httpx.AsyncClient,
+        admin: dict[str, str],
+        settings: Settings,
+        completed_run: dict[str, Any],
+    ) -> None:
+        """The run reports the tokens the ledger billed, never zeros.
+
+        The console used to show 0 tokens for a run that had genuinely called
+        the model, because nothing folded gateway usage into the run summary.
+        Reading `llm_spend` back is the only assertion that catches that class
+        of bug: it compares what was persisted against what was billed.
+        """
+        run_id = completed_run["id"]
+        database = Database(settings.database)
+        try:
+            async with database.session() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            LLMSpendRecord.prompt_tokens,
+                            LLMSpendRecord.completion_tokens,
+                            LLMSpendRecord.cost_usd,
+                        ).where(LLMSpendRecord.run_id == run_id)
+                    )
+                ).all()
+        finally:
+            await database.engine.dispose()
+
+        assert rows, "a completed loop bills at least one model call"
+        detail = (await client.get(API + "/runs/" + run_id, headers=admin)).json()["run"]
+        assert detail["prompt_tokens"] == sum(row.prompt_tokens for row in rows) > 0
+        assert detail["completion_tokens"] == sum(row.completion_tokens for row in rows) > 0
+        assert detail["llm_cost_usd"] == pytest.approx(sum(row.cost_usd for row in rows))
+        # The summary the UI renders has to carry the same numbers as the columns.
+        usage = detail["summary"]["usage"]
+        assert usage["prompt_tokens"] == detail["prompt_tokens"]
+        assert usage["completion_tokens"] == detail["completion_tokens"]

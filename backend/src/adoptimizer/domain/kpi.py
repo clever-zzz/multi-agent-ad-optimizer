@@ -26,6 +26,18 @@ HEALTH_CVR_REFERENCE = 0.10
 HEALTH_CPA_REFERENCE = 200.0
 HEALTH_ROAS_REFERENCE = 3.0
 
+# The columns a daily aggregate can assert. Ingestion validation, the metric
+# writer and the synthetic feed all read this one tuple, so measuring a new
+# column is a change in one place instead of three that can drift apart.
+DAILY_MEASUREMENTS: tuple[str, ...] = (
+    "impressions",
+    "clicks",
+    "conversions",
+    "cost",
+    "revenue",
+    "unique_reach",
+)
+
 
 class PerformanceSnapshot(BaseModel):
     """Aggregated delivery performance for one campaign over one window."""

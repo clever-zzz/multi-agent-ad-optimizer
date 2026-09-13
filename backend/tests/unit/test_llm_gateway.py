@@ -18,7 +18,13 @@ from adoptimizer.core.errors import BudgetExceededError, ExternalServiceError
 from adoptimizer.core.metrics import REGISTRY
 from adoptimizer.infra.cache import CacheService, InMemoryCache
 from adoptimizer.llm import gateway as gateway_module
-from adoptimizer.llm.base import CompletionRequest, CompletionResult, Usage
+from adoptimizer.llm.base import (
+    DEFAULT_PRICING,
+    CompletionRequest,
+    CompletionResult,
+    DeltaHandler,
+    Usage,
+)
 from adoptimizer.llm.gateway import LLMGateway, NullSpendLedger, build_gateway
 from adoptimizer.llm.mock import MockLanguageModel
 from adoptimizer.llm.openai_provider import OpenAICompatibleModel
@@ -59,17 +65,24 @@ class FakeModel:
         self.closed = False
         self.in_flight = 0
         self.peak_in_flight = 0
+        self.streamed_attempts: list[int] = []
 
-    async def complete(self, request: CompletionRequest) -> CompletionResult:
+    async def complete(
+        self, request: CompletionRequest, *, on_delta: DeltaHandler | None = None
+    ) -> CompletionResult:
         _ = request
         self.calls += 1
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        if on_delta is not None:
+            self.streamed_attempts.append(self.calls)
         try:
             if self.delay:
                 await asyncio.sleep(self.delay)
             if self.calls <= self.fail_times:
                 raise ExternalServiceError(self.error)
+            if on_delta is not None:
+                await on_delta(self.text)
             return CompletionResult(
                 text=self.text,
                 usage=Usage(prompt_tokens=100, completion_tokens=40, cost_usd=self.cost_usd),
@@ -581,6 +594,102 @@ class TestAccounting:
         assert ledger.total_usd == pytest.approx(0.1)
         assert await ledger.month_to_date_usd() == pytest.approx(0.1)
 
+    async def test_the_run_tally_agrees_with_what_the_ledger_was_told(self) -> None:
+        """A run's reported cost and the durable ledger must never disagree.
+
+        Token accounting used to be each agent's job via a helper on the base
+        class. No agent ever called it, so every run reported zero tokens and
+        zero cost while the ledger quietly recorded the truth. The tally now
+        lives beside the ledger write, where it cannot be forgotten.
+        """
+        ledger = FakeLedger()
+        gateway = LLMGateway(FakeModel(cost_usd=0.5), settings=make_settings(), ledger=ledger)
+
+        await gateway.complete(
+            make_request("headlines for shoes"), run_id="run_42", agent="creative"
+        )
+        await gateway.complete(
+            make_request("headlines for coffee"), run_id="run_42", agent="audience"
+        )
+
+        usage = gateway.usage("run_42")
+
+        assert usage == {
+            "prompt_tokens": 200,
+            "completion_tokens": 80,
+            "total_tokens": 280,
+            "cost_usd": pytest.approx(1.0),
+            "calls": 2,
+        }
+        assert usage["calls"] == len(ledger.records)
+        assert usage["cost_usd"] == pytest.approx(sum(r["cost_usd"] for r in ledger.records))
+
+    async def test_concurrent_runs_do_not_share_a_tally(self) -> None:
+        """Two runs in one process are billed separately, or nobody is."""
+        gateway = LLMGateway(FakeModel(cost_usd=0.25), settings=make_settings())
+
+        await gateway.complete(make_request("a"), run_id="run_1")
+        await gateway.complete(make_request("b"), run_id="run_1")
+        await gateway.complete(make_request("c"), run_id="run_2")
+
+        assert gateway.usage("run_1")["calls"] == 2
+        assert gateway.usage("run_1")["cost_usd"] == pytest.approx(0.5)
+        assert gateway.usage("run_2")["calls"] == 1
+        assert gateway.usage("run_2")["cost_usd"] == pytest.approx(0.25)
+
+    async def test_a_cache_hit_is_not_charged_to_the_run(self, cache: CacheService) -> None:
+        """A replayed answer cost nothing, so it must not inflate the run total.
+
+        The cache hit returns before the ledger write, and the tally sits after
+        it, which is what keeps the two consistent by construction.
+        """
+        ledger = FakeLedger()
+        gateway = LLMGateway(
+            FakeModel(cost_usd=0.5),
+            settings=make_settings(cache_enabled=True),
+            cache=cache,
+            ledger=ledger,
+        )
+
+        await gateway.complete(make_request(), run_id="run_7")
+        replayed = await gateway.complete(make_request(), run_id="run_7")
+
+        assert replayed.cached is True
+        assert gateway.usage("run_7")["calls"] == 1
+        assert gateway.usage("run_7")["cost_usd"] == pytest.approx(0.5)
+        assert len(ledger.records) == 1
+
+    async def test_a_call_without_a_run_is_not_attributed_to_one(self) -> None:
+        """Ad-hoc calls - a probe, the CLI - must not land on somebody's run."""
+        gateway = LLMGateway(FakeModel(cost_usd=0.5), settings=make_settings())
+
+        await gateway.complete(make_request())
+
+        assert gateway.usage("run_never_happened") == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "calls": 0,
+        }
+
+    async def test_a_degraded_call_is_still_counted(self) -> None:
+        """Falling back to the mock is free but not invisible: the tokens count.
+
+        A run that degraded all the way through still burned provider attempts,
+        and an operator reading the summary needs to see that the model produced
+        the answer rather than the fallback.
+        """
+        gateway = LLMGateway(FakeModel(fail_times=99), settings=make_settings(max_retries=1))
+
+        result = await gateway.complete(make_request(), run_id="run_9")
+
+        assert result.degraded is True
+        usage = gateway.usage("run_9")
+        assert usage["calls"] == 1
+        assert usage["total_tokens"] > 0
+        assert usage["cost_usd"] == 0.0
+
 
 class TestIdentityAndLifecycle:
     def test_the_gateway_reports_its_primary_provider(self) -> None:
@@ -611,6 +720,46 @@ class TestIdentityAndLifecycle:
         assert model.closed is True
 
 
+UNPRICED_MODEL = "qwen3-omni-flash"
+
+
+class RecordingLogger:
+    """Records structured log calls instead of emitting them.
+
+    ``structlog.testing.capture_logs`` looks like the obvious tool here and is
+    not: it edits the processor list currently held by the structlog config, but
+    ``configure_logging`` installs a brand-new list every time the app factory
+    runs, and ``cache_logger_on_first_use=True`` means a logger bound earlier
+    keeps pointing at the previous one. Under a full-suite run the capture then
+    comes back silently empty, which turns every "does not warn" assertion into
+    a vacuous pass. Going through the module attribute has no such coupling.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict[str, Any]]] = []
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.events.append(("info", event, fields))
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.events.append(("warning", event, fields))
+
+    def matching(self, level: str, event: str) -> list[dict[str, Any]]:
+        return [
+            fields
+            for seen_level, seen_event, fields in self.events
+            if seen_level == level and seen_event == event
+        ]
+
+
+@pytest.fixture
+def gateway_log(monkeypatch: pytest.MonkeyPatch) -> RecordingLogger:
+    """The gateway module's logger, swapped for a recorder."""
+    recorder = RecordingLogger()
+    monkeypatch.setattr(gateway_module, "logger", recorder)
+    return recorder
+
+
 class TestBuildGateway:
     def test_the_mock_provider_needs_no_credentials(self) -> None:
         gateway = build_gateway(LLMSettings(provider=LLMProvider.MOCK))
@@ -635,3 +784,175 @@ class TestBuildGateway:
 
         assert gateway._cache is cache
         assert gateway._ledger is ledger
+
+
+class TestPricingVisibility:
+    """An unpriced model still runs, so the only chance to notice is at boot.
+
+    Every call would otherwise be costed from the "default" row, which can be
+    several times the real bill in either direction, and the monthly budget
+    guard would then trip at the wrong moment. Each negative case also asserts
+    the build itself was logged, so a recorder that captured nothing at all
+    cannot pass by accident.
+    """
+
+    def test_an_unpriced_model_warns_once_at_boot(self, gateway_log: RecordingLogger) -> None:
+        build_gateway(make_settings(model=UNPRICED_MODEL))
+
+        warnings = gateway_log.matching("warning", "llm_model_has_no_pricing_entry")
+
+        assert len(warnings) == 1
+        assert warnings[0]["model"] == UNPRICED_MODEL
+        assert warnings[0]["fallback"] == list(DEFAULT_PRICING["default"])
+
+    def test_a_model_in_the_builtin_table_does_not_warn(self, gateway_log: RecordingLogger) -> None:
+        build_gateway(make_settings(model="qwen-plus"))
+
+        assert gateway_log.matching("info", "llm_gateway_built") != []
+        assert gateway_log.matching("warning", "llm_model_has_no_pricing_entry") == []
+
+    def test_a_pricing_override_counts_as_priced(self, gateway_log: RecordingLogger) -> None:
+        """The whole point of LLM__PRICING: an unseen model becomes accountable."""
+        build_gateway(make_settings(model=UNPRICED_MODEL, pricing={UNPRICED_MODEL: (0.113, 0.282)}))
+
+        assert gateway_log.matching("info", "llm_gateway_built") != []
+        assert gateway_log.matching("warning", "llm_model_has_no_pricing_entry") == []
+
+    def test_the_mock_provider_is_never_warned_about_pricing(
+        self, gateway_log: RecordingLogger
+    ) -> None:
+        """A mock call costs nothing, so the pricing table is irrelevant to it."""
+        build_gateway(LLMSettings(provider=LLMProvider.MOCK, model=UNPRICED_MODEL))
+
+        assert gateway_log.matching("info", "llm_gateway_built") != []
+        assert gateway_log.matching("warning", "llm_model_has_no_pricing_entry") == []
+
+
+def collector() -> tuple[list[str], DeltaHandler]:
+    """A sink that records every fragment the gateway decides to forward."""
+    seen: list[str] = []
+
+    async def on_delta(fragment: str) -> None:
+        seen.append(fragment)
+
+    return seen, on_delta
+
+
+class TestStreaming:
+    """How on_delta interacts with the stream flag, cache, retries and fallback.
+
+    Fragments are presentation sugar, so the gateway forwards them only while
+    LLM__STREAM is on, replays a cache hit as one whole fragment, and stays
+    silent on any attempt that is not the first and on degraded completions. A
+    caller can therefore never render the same answer twice, and can always fall
+    back to CompletionResult.text as the authoritative response.
+    """
+
+    async def test_the_handler_never_reaches_the_provider_while_streaming_is_off(self) -> None:
+        """A deployment that has not opted in keeps its buffered behaviour."""
+        model = FakeModel()
+        gateway = LLMGateway(model, settings=make_settings())
+        seen, on_delta = collector()
+
+        result = await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert model.streamed_attempts == []
+        assert seen == []
+        assert result.text == model.text
+
+    async def test_the_stream_flag_forwards_fragments_to_the_caller(self) -> None:
+        model = FakeModel()
+        gateway = LLMGateway(model, settings=make_settings(stream=True))
+        seen, on_delta = collector()
+
+        result = await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert model.streamed_attempts == [1]
+        assert seen == [model.text]
+        assert result.text == model.text
+        assert result.degraded is False
+
+    async def test_a_cache_hit_replays_the_whole_text_as_one_fragment(
+        self, cache: CacheService
+    ) -> None:
+        """An incremental consumer must reach the same final state on a hit."""
+        model = FakeModel()
+        gateway = LLMGateway(
+            model, settings=make_settings(stream=True, cache_enabled=True), cache=cache
+        )
+
+        await gateway.complete(make_request())
+        seen, on_delta = collector()
+        result = await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert model.calls == 1
+        assert result.cached is True
+        assert seen == [model.text]
+
+    async def test_a_retry_after_a_failed_stream_is_not_rendered_twice(self) -> None:
+        """The first attempt may already have shown partial text to the user."""
+        model = FakeModel(fail_times=1)
+        gateway = LLMGateway(model, settings=make_settings(stream=True, max_retries=3))
+        seen, on_delta = collector()
+
+        result = await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert model.calls == 2
+        assert model.streamed_attempts == [1]
+        assert seen == []
+        assert result.text == model.text
+        assert result.degraded is False
+
+    async def test_a_degraded_completion_emits_no_fragments(self) -> None:
+        """Substituted mock output is reported through the result, not streamed."""
+        model = FakeModel(fail_times=99)
+        gateway = LLMGateway(
+            model, settings=make_settings(stream=True, max_retries=2, fail_open_to_mock=True)
+        )
+        seen, on_delta = collector()
+
+        result = await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert result.degraded is True
+        assert result.provider is LLMProvider.MOCK
+        assert model.streamed_attempts == [1]
+        assert seen == []
+
+    async def test_a_fail_closed_stream_raises_after_the_first_attempt_only(self) -> None:
+        model = FakeModel(fail_times=99)
+        gateway = LLMGateway(
+            model, settings=make_settings(stream=True, max_retries=3, fail_open_to_mock=False)
+        )
+        seen, on_delta = collector()
+
+        with pytest.raises(ExternalServiceError):
+            await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert seen == []
+        assert model.streamed_attempts == [1]
+
+    async def test_the_budget_guard_trips_before_any_fragment_is_emitted(self) -> None:
+        """A hard spend stop must never leave half an answer on screen."""
+        model = FakeModel()
+        gateway = LLMGateway(
+            model,
+            settings=make_settings(stream=True, monthly_budget_usd=5.0),
+            ledger=FakeLedger(spent_usd=5.0),
+        )
+        seen, on_delta = collector()
+
+        with pytest.raises(BudgetExceededError):
+            await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert seen == []
+        assert model.calls == 0
+
+    async def test_the_mock_provider_streams_line_shaped_chunks(self) -> None:
+        """Offline mode exercises the same incremental render path."""
+        gateway = LLMGateway(MockLanguageModel(), settings=make_settings(stream=True))
+        seen, on_delta = collector()
+
+        result = await gateway.complete(make_request(), on_delta=on_delta)
+
+        assert len(seen) > 1
+        assert "".join(seen) == result.text

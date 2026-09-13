@@ -157,6 +157,13 @@ class DailyMetric(Base):
     cost: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     revenue: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     unique_reach: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Provenance, so a number that looks wrong can be traced to the feed that
+    # asserted it and the batch that carried it. Both nullable on purpose: rows
+    # written before ingestion existed (and everything the demo seed produces)
+    # genuinely have no known source, and inventing one would be a lie. Kept out
+    # of uq_daily_metric_slot - a slot holds one truth, whichever feed won last.
+    source: Mapped[str | None] = mapped_column(String(30), index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(40), index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
@@ -204,12 +211,114 @@ class OptimizationRun(Base, TimestampMixin):
     llm_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(80), index=True)
 
+    __table_args__ = (
+        # A replayed key must not create a second run. The lookup in
+        # RunRepository.find_by_idempotency_key is a read-then-insert, which two
+        # concurrent callers can both win; this index makes the insert itself the
+        # arbiter. Scoped to the actor because the key is client-chosen. NULLs are
+        # distinct in SQL, so keyless runs are never deduplicated - which is right,
+        # since no key means no idempotency claim.
+        Index("uq_run_idempotency", "idempotency_key", "requested_by", unique=True),
+    )
+
     events: Mapped[list[RunEvent]] = relationship(
         back_populates="run", cascade="all, delete-orphan", order_by="RunEvent.seq"
     )
     actions: Mapped[list[OptimizationAction]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+
+
+class IngestBatch(Base):
+    """One ingestion attempt.
+
+    The counts are the point: "did yesterday's feed arrive, and how much of it
+    landed" is the first question when the dashboard looks wrong, and it has to
+    be answerable without re-reading every metric row. A dry run is recorded too,
+    so a rehearsal is distinguishable from a feed that never came.
+    """
+
+    __tablename__ = "ingest_batches"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    source: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    actor: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    received: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unresolved: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    window_start: Mapped[date | None] = mapped_column(Date)
+    window_end: Mapped[date | None] = mapped_column(Date)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
+class IngestWatermark(Base):
+    """How far one feed has been pulled.
+
+    Answers "上次拉到哪" without re-reading every metric row, which is the
+    question that decides whether a dashboard is stale or merely quiet.
+
+    It is deliberately *not* how the next window is computed. A schedule driven
+    by a stored cursor inherits the cursor's mistakes forever: one rolled-back
+    or hand-edited row becomes a permanent gap, and every later run looks
+    correct relative to it. The scheduler derives the window from the calendar
+    and consults this row only to prove that pulling again would be redundant -
+    a proof that is allowed to be missing, because the fallback is a safe,
+    idempotent re-pull rather than a hole.
+
+    A dry run never advances it. A rehearsal that moved the watermark would
+    make the real run skip the very window the rehearsal only pretended to
+    cover.
+    """
+
+    __tablename__ = "ingest_watermarks"
+
+    source: Mapped[str] = mapped_column(String(30), primary_key=True)
+    window_start: Mapped[date] = mapped_column(Date, nullable=False)
+    window_end: Mapped[date] = mapped_column(Date, nullable=False)
+    batch_id: Mapped[str | None] = mapped_column(String(40))
+    received: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class SchedulerLease(Base):
+    """Single-flight guard for the scheduled pull.
+
+    ``concurrencyPolicy: Forbid`` only arbitrates between jobs spawned by one
+    CronJob. Two replicas of the resident loop, or a loop overlapping a manual
+    CronJob trigger, need a lock that lives where all of them can see it, and
+    the database is the only such place in a deployment that may not have Redis.
+
+    A lease rather than a row lock, because a holder that dies mid-pull must not
+    wedge the schedule: ``expires_at`` passes and the next tick takes over. The
+    cost is that a pull slower than the TTL can be joined by a second holder,
+    which is why the TTL defaults well above a realistic pull and why the
+    outcome is idempotent anyway - ingestion upserts one slot per
+    (campaign, creative, date), so two overlapping pulls write the same numbers.
+
+    ``last_outcome`` and ``consecutive_failures`` are kept here rather than in a
+    separate table because they are the lease's own history: "who holds it, and
+    how did the last holder get on" is one question asked by one screen.
+    """
+
+    __tablename__ = "scheduler_leases"
+
+    name: Mapped[str] = mapped_column(String(60), primary_key=True)
+    holder: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_outcome: Mapped[str] = mapped_column(String(20), default="", nullable=False)
+    last_message: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    last_batch_id: Mapped[str | None] = mapped_column(String(40))
+    last_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class RunEvent(Base):
@@ -389,6 +498,35 @@ class LLMSpendRecord(Base):
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     outcome: Mapped[str] = mapped_column(String(20), default="success", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
+class ToolInvocation(Base):
+    """One tool call, including the ones the executor refused.
+
+    Refusals are the interesting rows: they are the record of an agent trying
+    to do something it was not allowed to, which is exactly what an operator
+    needs when reviewing whether the guardrails are set correctly.
+    """
+
+    __tablename__ = "tool_invocations"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    agent: Mapped[str] = mapped_column(String(20), default="", nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), default="system", nullable=False)
+    tool: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    outcome: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    read_only: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    touches_platform: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(120), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )

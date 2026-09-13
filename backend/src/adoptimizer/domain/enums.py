@@ -53,13 +53,14 @@ class Gender(StrEnum):
 
 
 class AgentName(StrEnum):
-    """The five agents of the optimization loop."""
+    """The agents of the optimization loop."""
 
     MONITOR = "monitor"
     AUDIENCE = "audience"
     CREATIVE = "creative"
     BIDDING = "bidding"
     OPTIMIZE = "optimize"
+    CRITIC = "critic"
 
 
 class RunStatus(StrEnum):
@@ -131,12 +132,21 @@ class ABTestStatus(StrEnum):
 
 
 class Role(StrEnum):
-    """Principal roles, ordered from most to least privileged."""
+    """Principal roles, ordered from most to least privileged.
+
+    ``INGESTOR`` deliberately sits outside that ordering. It is a machine
+    identity for the metrics pipeline: it holds fewer permissions than
+    ``VIEWER``, but one of them is a write, so "least privileged" would be a
+    misleading label for it. What it is, is *narrow* - a stolen ingestion
+    credential can fabricate numbers and nothing else, where a stolen
+    ``OPTIMIZER`` credential could also move real budget on a real ad platform.
+    """
 
     ADMIN = "admin"
     OPTIMIZER = "optimizer"
     ANALYST = "analyst"
     VIEWER = "viewer"
+    INGESTOR = "ingestor"
 
 
 class Permission(StrEnum):
@@ -156,6 +166,7 @@ class Permission(StrEnum):
     ALERT_ACK = "alert:ack"
     CREATIVE_WRITE = "creative:write"
     METRICS_READ = "metrics:read"
+    METRICS_WRITE = "metrics:write"
     USER_MANAGE = "user:manage"
     AUDIT_READ = "audit:read"
     SYSTEM_READ = "system:read"

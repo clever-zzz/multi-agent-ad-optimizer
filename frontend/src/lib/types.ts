@@ -7,9 +7,9 @@ export type CampaignStatus = "active" | "paused" | "completed" | "archived";
 export type CreativeType = "text" | "image" | "video";
 export type CreativeStatus = "draft" | "active" | "paused" | "rejected";
 export type CreativeOrigin = "human" | "llm" | "rule";
-export type AgentName = "monitor" | "audience" | "creative" | "bidding" | "optimize";
+export type AgentName = "monitor" | "audience" | "creative" | "bidding" | "optimize" | "critic";
 export type RunStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
-export type Role = "admin" | "optimizer" | "analyst" | "viewer";
+export type Role = "admin" | "optimizer" | "analyst" | "viewer" | "ingestor";
 
 export type ActionType =
   | "pause_creative"
@@ -54,6 +54,7 @@ export type Permission =
   | "alert:ack"
   | "creative:write"
   | "metrics:read"
+  | "metrics:write"
   | "user:manage"
   | "audit:read"
   | "system:read";
@@ -166,6 +167,9 @@ export interface RunSummary {
   bidding_decisions: number;
   budget_adjustments: number;
   actions: number;
+  actions_proposed: number;
+  actions_suppressed: number;
+  critic_findings: number;
   action_counts: Record<string, number>;
   alerts_raised: number;
   health: Record<string, unknown>;

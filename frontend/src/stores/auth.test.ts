@@ -35,6 +35,7 @@ const BACKEND_MATRIX: Record<Role, Permission[] | "*"> = {
   ],
   analyst: ["campaign:read", "run:read", "alert:read", "alert:ack", "metrics:read", "system:read"],
   viewer: ["campaign:read", "run:read", "alert:read", "metrics:read"],
+  ingestor: ["metrics:read", "metrics:write"],
 };
 
 describe("selectPermissions", () => {
@@ -64,6 +65,21 @@ describe("can", () => {
     expect(can(userFor("optimizer"), "action:approve")).toBe(true);
     expect(can(userFor("optimizer"), "action:execute")).toBe(true);
     expect(can(userFor("optimizer"), "user:manage")).toBe(false);
+  });
+
+  it("keeps metric writes off the optimizer role", () => {
+    // Ingestion has its own identity now; an optimizer reads the numbers it
+    // optimises and cannot fabricate them.
+    expect(can(userFor("optimizer"), "metrics:read")).toBe(true);
+    expect(can(userFor("optimizer"), "metrics:write")).toBe(false);
+  });
+
+  it("gives an ingestor metrics and nothing else", () => {
+    expect(can(userFor("ingestor"), "metrics:write")).toBe(true);
+    expect(can(userFor("ingestor"), "metrics:read")).toBe(true);
+    expect(can(userFor("ingestor"), "campaign:read")).toBe(false);
+    expect(can(userFor("ingestor"), "run:trigger")).toBe(false);
+    expect(can(userFor("ingestor"), "action:execute")).toBe(false);
   });
 
   it("keeps an analyst read-only with respect to money", () => {
