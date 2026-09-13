@@ -13,6 +13,7 @@ from ..core.logging import get_logger
 from ..domain.enums import ActionStatus, RunStatus
 from ..infra.db.models import (
     BudgetAllocationRecord,
+    CriticFinding,
     OptimizationAction,
     OptimizationRun,
     RunEvent,
@@ -135,9 +136,20 @@ class RunRepository(BaseRepository[OptimizationRun]):
         return list((await self.session.execute(statement)).scalars().all())
 
     async def add_actions(
-        self, run_id: str, actions: Sequence[dict[str, Any]]
+        self,
+        run_id: str,
+        actions: Sequence[dict[str, Any]],
+        *,
+        suppressed_ids: set[str] | None = None,
     ) -> list[OptimizationAction]:
-        """Persist proposed actions produced by the optimize agent."""
+        """Persist proposed actions produced by the optimize agent.
+
+        ``suppressed_ids`` are the proposals the critic withheld. They are stored
+        with status ``suppressed`` rather than dropped, which is what gives an
+        operator a row to look at - and to overrule - instead of a proposal that
+        only ever existed inside the run's process memory.
+        """
+        withheld = suppressed_ids or set()
         records = [
             OptimizationAction(
                 id=str(action.get("id") or new_id("act")),
@@ -145,17 +157,58 @@ class RunRepository(BaseRepository[OptimizationRun]):
                 campaign_id=str(action["campaign_id"]),
                 creative_id=action.get("creative_id"),
                 action_type=str(action["action_type"]),
-                status=str(action.get("status", ActionStatus.PROPOSED.value)),
+                status=(
+                    ActionStatus.SUPPRESSED.value
+                    if str(action.get("id") or "") in withheld
+                    else str(action.get("status", ActionStatus.PROPOSED.value))
+                ),
                 before_value=str(action.get("before_value", "")),
                 after_value=str(action.get("after_value", "")),
                 reason=str(action.get("reason", "")),
                 confidence=float(action.get("confidence", 0.0) or 0.0),
+                direction=str(action.get("direction", "") or ""),
+                basis=dict(action.get("basis") or {}),
                 proposed_by=str(action.get("proposed_by", "optimize")),
             )
             for action in actions
         ]
         self.session.add_all(records)
         return records
+
+    async def add_findings(
+        self, run_id: str, findings: Sequence[dict[str, Any]]
+    ) -> list[CriticFinding]:
+        """Persist the critic's reconciliation verdicts for the audit trail."""
+        records = [
+            CriticFinding(
+                id=str(finding.get("id") or new_id("cfd")),
+                run_id=run_id,
+                iteration=int(finding.get("iteration", 0) or 0),
+                kind=str(finding.get("kind", "")),
+                scope=str(finding.get("scope", "campaign")),
+                campaign_id=str(finding.get("campaign_id", "")),
+                creative_id=finding.get("creative_id") or None,
+                kept_action_id=finding.get("kept_action_id") or None,
+                kept_action_type=str(finding.get("kept_action_type", "")),
+                kept_confidence=float(finding.get("kept_confidence", 0.0) or 0.0),
+                reason=str(finding.get("reason", "")),
+                suppressed_action_ids=list(finding.get("suppressed_action_ids") or []),
+                suppressed_actions=list(finding.get("suppressed_actions") or []),
+                escalate=bool(finding.get("escalate", False)),
+            )
+            for finding in findings
+        ]
+        self.session.add_all(records)
+        return records
+
+    async def findings_for_run(self, run_id: str) -> list[CriticFinding]:
+        """Every critic verdict recorded for one run, oldest first."""
+        statement = (
+            select(CriticFinding)
+            .where(CriticFinding.run_id == run_id)
+            .order_by(CriticFinding.iteration.asc(), CriticFinding.created_at.asc())
+        )
+        return list((await self.session.execute(statement)).scalars().all())
 
     async def add_allocations(
         self, run_id: str, allocations: Sequence[dict[str, Any]]

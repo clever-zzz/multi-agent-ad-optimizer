@@ -74,11 +74,37 @@ class OptimizationActionOut(BaseModel):
     reason: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     proposed_by: str = "optimize"
+    # Which way this proposal moves spend, and the reference frame it was
+    # decided against. Both are what let the critic - and the approval screen -
+    # tell an opposing pair (raise the bid, halve the budget) from a coherent
+    # one, instead of having to parse the free-text reason.
+    direction: str = ""
+    basis: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
     approved_by: str | None = None
     executed_at: datetime | None = None
     external_reference: str | None = None
     error_message: str | None = None
+
+
+class CriticFindingOut(BaseModel):
+    """One reconciliation verdict, exposed so the override is actionable."""
+
+    id: str | None = None
+    run_id: str | None = None
+    iteration: int = 0
+    kind: str
+    scope: str = "campaign"
+    campaign_id: str = ""
+    creative_id: str | None = None
+    kept_action_id: str | None = None
+    kept_action_type: str = ""
+    kept_confidence: float = 0.0
+    reason: str = ""
+    suppressed_action_ids: list[str] = Field(default_factory=list)
+    suppressed_actions: list[dict[str, Any]] = Field(default_factory=list)
+    escalate: bool = False
+    created_at: datetime | None = None
 
 
 class AlertOut(BaseModel):
@@ -140,6 +166,9 @@ class RunSummaryOut(BaseModel):
     actions_proposed: int = 0
     actions_suppressed: int = 0
     critic_findings: int = 0
+    # Which rules did the withholding, so the summary says more than "some
+    # proposals were dropped". The findings themselves live in critic_findings.
+    critic_findings_by_kind: dict[str, int] = Field(default_factory=dict)
     action_counts: dict[str, int] = Field(default_factory=dict)
     alerts_raised: int = 0
     health: dict[str, Any] = Field(default_factory=dict)

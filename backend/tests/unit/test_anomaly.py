@@ -195,12 +195,17 @@ class TestSerialization:
             "severity",
             "observed",
             "threshold",
+            "urgency",
             "message",
             "dedup_key",
             "context",
             "detected_at",
         }
         assert isinstance(payload["rule"], str)
+        # The continuous distance past the threshold survives serialization: the
+        # critic weighs near-boundary anomalies on it, so losing it here would
+        # quietly restore the cliff the severity bands create.
+        assert isinstance(payload["urgency"], float)
         # Must round-trip through datetime.isoformat, not a raw datetime object.
         datetime.fromisoformat(payload["detected_at"])
 
@@ -221,3 +226,62 @@ def test_alerts_default_to_utc_now() -> None:
     before = datetime.now(UTC)
     alert = detect([BROKEN])[0]
     assert alert.detected_at >= before
+
+
+def burn_rate(alerts: list[Alert]) -> Alert:
+    return next(alert for alert in alerts if alert.rule == AlertRule.BURN_RATE)
+
+
+class TestBurnRateBoundary:
+    """The critical line used to be a cliff rather than a slope.
+
+    It was written as ``burn_rate_multiplier * 1.5`` inside the detector, so
+    1.857 and 1.875 of a daily budget - the same situation to a business - fell
+    into different severity bands. Severity is what decides whether the
+    reconciliation step may overrule the anomaly, so a rounding difference
+    decided whether an operator had any say.
+    """
+
+    def test_the_critical_line_is_configurable(self) -> None:
+        strict = AlertThresholds(burn_rate_critical_multiplier=1.4)
+        relaxed = AlertThresholds()
+        budgets = {"broken": 700.0}  # 1000/day against 700 is a ratio of ~1.43
+        assert burn_rate(detect([BROKEN], strict, daily_budgets=budgets)).severity == (
+            AlertSeverity.CRITICAL
+        )
+        assert burn_rate(detect([BROKEN], relaxed, daily_budgets=budgets)).severity == (
+            AlertSeverity.WARNING
+        )
+
+    def test_hysteresis_holds_a_critical_campaign_critical(self) -> None:
+        budgets = {"broken": 538.0}  # ratio ~1.859, just under the 1.875 line
+        fresh = burn_rate(detect([BROKEN], daily_budgets=budgets))
+        held = burn_rate(
+            detect(
+                [BROKEN],
+                daily_budgets=budgets,
+                prior_severities={"broken": AlertSeverity.CRITICAL.value},
+            )
+        )
+        assert fresh.severity == AlertSeverity.WARNING
+        assert held.severity == AlertSeverity.CRITICAL
+
+    def test_hysteresis_releases_once_the_ratio_leaves_the_band(self) -> None:
+        budgets = {"broken": 750.0}  # ratio ~1.33: over budget, well below critical
+        held = burn_rate(
+            detect(
+                [BROKEN],
+                daily_budgets=budgets,
+                prior_severities={"broken": AlertSeverity.CRITICAL.value},
+            )
+        )
+        assert held.severity == AlertSeverity.WARNING
+
+    def test_urgency_is_continuous_across_the_severity_boundary(self) -> None:
+        """The two sides of the line differ by a rounding error, not a world."""
+        below = burn_rate(detect([BROKEN], daily_budgets={"broken": 538.0}))
+        above = burn_rate(detect([BROKEN], daily_budgets={"broken": 533.0}))
+
+        assert below.severity != above.severity
+        assert above.urgency > below.urgency
+        assert above.urgency - below.urgency < 0.02

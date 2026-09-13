@@ -158,6 +158,9 @@ def summarise_state(state: AgentState, *, status: RunStatus) -> dict[str, Any]:
         action for action in (state.get("optimization_actions") or []) if isinstance(action, dict)
     ]
     actions = surviving_actions(state)
+    findings = [
+        finding for finding in (state.get("critic_findings") or []) if isinstance(finding, dict)
+    ]
     allocations = list(state.get("budget_allocations") or [])
     alerts = list(state.get("alerts") or [])
     preflights = [item for item in (state.get("tool_preflights") or []) if isinstance(item, dict)]
@@ -169,6 +172,14 @@ def summarise_state(state: AgentState, *, status: RunStatus) -> dict[str, Any]:
         key = str(action.get("action_type", "unknown"))
         action_counts[key] = action_counts.get(key, 0) + 1
 
+    # Verdicts per kind, including the ones that escalated instead of
+    # suppressing, so the summary says *why* the queue is shorter than the raw
+    # proposal count rather than only how much shorter it is.
+    findings_by_kind: dict[str, int] = {}
+    for finding in findings:
+        key = str(finding.get("kind", "unknown"))
+        findings_by_kind[key] = findings_by_kind.get(key, 0) + 1
+
     return {
         "status": status.value,
         "iterations": int(state.get("iteration", 0) or 0),
@@ -179,7 +190,8 @@ def summarise_state(state: AgentState, *, status: RunStatus) -> dict[str, Any]:
         "actions": len(actions),
         "actions_proposed": len(proposed),
         "actions_suppressed": len(proposed) - len(actions),
-        "critic_findings": len(state.get("critic_findings") or []),
+        "critic_findings": len(findings),
+        "critic_findings_by_kind": findings_by_kind,
         "platform_checks": len(state.get("platform_checks") or []),
         "tool_preflights": len(preflights),
         "preflights_blocked": sum(1 for item in preflights if item.get("blocking")),

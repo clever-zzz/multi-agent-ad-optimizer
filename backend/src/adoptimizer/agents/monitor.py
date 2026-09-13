@@ -15,7 +15,7 @@ from typing import Any
 from ..core.clock import utc_today
 from ..core.logging import get_logger
 from ..domain.anomaly import Alert, AlertThresholds, deduplicate, detect
-from ..domain.enums import AgentName, AlertSeverity
+from ..domain.enums import AgentName, AlertRule, AlertSeverity
 from ..domain.kpi import (
     PerformanceSnapshot,
     health_score,
@@ -57,6 +57,9 @@ class MonitorAgent(BaseAgent):
             cpa_ceiling=context.optimization.alert_cpa_ceiling,
             roas_floor=context.optimization.alert_roas_floor,
             min_impressions=context.optimization.min_impressions_for_alerts,
+            burn_rate_multiplier=context.optimization.burn_rate_multiplier,
+            burn_rate_critical_multiplier=context.optimization.burn_rate_critical_multiplier,
+            burn_rate_hysteresis=context.optimization.burn_rate_hysteresis,
         )
         alerts = deduplicate(
             detect(
@@ -64,6 +67,7 @@ class MonitorAgent(BaseAgent):
                 thresholds,
                 daily_budgets=context.daily_budgets,
                 window_days=window_days,
+                prior_severities=self._prior_burn_rate(state),
             )
         )
 
@@ -190,6 +194,28 @@ class MonitorAgent(BaseAgent):
                 }
             )
         return checks
+
+    @staticmethod
+    def _prior_burn_rate(state: AgentState) -> dict[str, str]:
+        """Last pass's burn-rate severity per campaign, for the hysteresis band.
+
+        The monitor runs first in each iteration, so the alerts channel still
+        holds the previous iteration's verdicts at this point. Only burn rate is
+        carried over: it is the rule whose critical line gates whether the
+        reconciliation step may overrule the anomaly, and a classification that
+        flips on a rounding difference is worse than no classification at all.
+        """
+        prior: dict[str, str] = {}
+        # Typed loosely on purpose: a replayed run restores this channel from
+        # JSON, where nothing enforces the shape the schema declares.
+        raw: list[Any] = list(state.get("alerts") or [])
+        for alert in raw:
+            if not isinstance(alert, dict):
+                continue
+            if str(alert.get("rule") or "") != AlertRule.BURN_RATE.value:
+                continue
+            prior[str(alert.get("campaign_id") or "")] = str(alert.get("severity") or "")
+        return prior
 
     def _resolve_snapshots(
         self, state: AgentState, context: AgentContext

@@ -26,6 +26,8 @@ const ACTION: Record<string, BadgeTone> = {
   executed: "positive",
   failed: "negative",
   skipped: "warning",
+  // Withheld by the critic: not actionable by default, but reviewable.
+  suppressed: "warning",
 };
 
 const ALERT: Record<string, BadgeTone> = {

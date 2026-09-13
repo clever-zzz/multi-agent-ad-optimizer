@@ -53,6 +53,8 @@ def _out(action: OptimizationAction) -> OptimizationActionOut:
         reason=action.reason,
         confidence=action.confidence,
         proposed_by=action.proposed_by,
+        direction=action.direction,
+        basis=dict(action.basis or {}),
         created_at=action.created_at,
         approved_by=action.approved_by,
         executed_at=action.executed_at,
@@ -76,11 +78,19 @@ async def list_actions(
     run_id: Annotated[str | None, Query(max_length=64)] = None,
     min_confidence: Annotated[float, Query(ge=0.0, le=1.0)] = 0.0,
 ) -> Page[OptimizationActionOut]:
-    """Filterable action queue for the approval screen."""
+    """Filterable action queue for the approval screen.
+
+    With no ``status`` the queue is what an operator can act on: proposals the
+    critic withheld are excluded by default, because they are a record of a
+    decision already taken rather than a pending one. Ask for them explicitly
+    with ``?status=suppressed`` to review - and if necessary overrule - them.
+    """
     repository = ActionRepository(session)
     filters: list[Any] = [OptimizationAction.confidence >= min_confidence]
     if status_filter is not None:
         filters.append(OptimizationAction.status == status_filter.value)
+    else:
+        filters.append(OptimizationAction.status != ActionStatus.SUPPRESSED.value)
     if action_type is not None:
         filters.append(OptimizationAction.action_type == action_type.value)
     if campaign_id:

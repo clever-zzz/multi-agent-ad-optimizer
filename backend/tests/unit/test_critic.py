@@ -43,9 +43,11 @@ def action(
     iteration: int = 1,
     reason: str = "proposed by a test",
     severity: str = "",
+    direction: str = "",
+    urgency: float | None = None,
 ) -> dict[str, Any]:
     """Build one proposal in the shape the optimizer emits."""
-    return {
+    proposal: dict[str, Any] = {
         "id": "act_" + format(next(_ids), "05d"),
         "campaign_id": campaign_id,
         "creative_id": creative_id,
@@ -56,6 +58,13 @@ def action(
         "reason": reason,
         "severity": severity,
     }
+    # Left absent rather than defaulted when not supplied, so the tests exercise
+    # the critic's fallback for proposals that carry only a severity.
+    if direction:
+        proposal["direction"] = direction
+    if urgency is not None:
+        proposal["urgency"] = urgency
+    return proposal
 
 
 def state_with(proposals: list[dict[str, Any]], iteration: int = 1) -> AgentState:
@@ -460,6 +469,167 @@ class TestSeverityOutranksEvidence:
 
         assert finding["suppressed_actions"][0]["severity"] == ""
         assert finding["suppressed_actions"][0]["confidence"] == 0.98
+
+
+class TestDominanceMargin:
+    """Critical is a slope, not a cliff.
+
+    The critic used to give *any* critical anomaly absolute precedence over
+    evidence. At the boundary that made 1.875 of a daily budget undebatable
+    while 1.857 could be overruled by a 0.98 confidence - a 0.018 difference in
+    the input deciding whether an operator had any say at all.
+    """
+
+    async def test_a_marginal_critical_can_be_overruled(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        pause = action(
+            ActionType.PAUSE_CAMPAIGN, confidence=0.90, severity="critical", urgency=0.50
+        )
+        bid = action(ActionType.ADJUST_BID, confidence=0.98)
+        state = state_with([pause, bid])
+
+        survivors = surviving_actions(merged(state, await critic.run(state, context)))
+
+        assert [a["id"] for a in survivors] == [bid["id"]]
+
+    async def test_a_runaway_critical_is_undebatable(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        pause = action(
+            ActionType.PAUSE_CAMPAIGN, confidence=0.90, severity="critical", urgency=1.20
+        )
+        bid = action(ActionType.ADJUST_BID, confidence=0.98)
+        state = state_with([pause, bid])
+
+        survivors = surviving_actions(merged(state, await critic.run(state, context)))
+
+        assert [a["id"] for a in survivors] == [pause["id"]]
+
+    async def test_the_two_sides_of_the_boundary_behave_the_same(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        """0.487 and 0.501 of urgency must not land in different worlds."""
+        for severity, urgency in (("warning", 0.487), ("critical", 0.501)):
+            pause = action(
+                ActionType.PAUSE_CAMPAIGN,
+                confidence=0.90,
+                severity=severity,
+                urgency=urgency,
+            )
+            bid = action(ActionType.ADJUST_BID, confidence=0.98)
+            state = state_with([pause, bid])
+
+            survivors = surviving_actions(merged(state, await critic.run(state, context)))
+
+            assert [a["id"] for a in survivors] == [bid["id"]], severity
+
+    async def test_a_critical_without_urgency_is_treated_as_clearly_critical(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        """Proposals built without the continuous figure keep the old behaviour."""
+        pause = action(ActionType.PAUSE_CAMPAIGN, confidence=0.90, severity="critical")
+        bid = action(ActionType.ADJUST_BID, confidence=0.98)
+        state = state_with([pause, bid])
+
+        survivors = surviving_actions(merged(state, await critic.run(state, context)))
+
+        assert [a["id"] for a in survivors] == [pause["id"]]
+
+
+class TestOpposingSpendIntent:
+    """Two spend proposals pulling one campaign in opposite directions.
+
+    A bid raise and a budget cut are each defensible against their own reference
+    frame - the campaign's target versus the portfolio average - so neither
+    outranks the other on evidence. The critic escalates instead of inventing a
+    policy the operators never agreed to.
+    """
+
+    async def test_opposite_directions_escalate_without_suppressing(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        rise = action(ActionType.ADJUST_BID, confidence=0.98, direction="increase")
+        cut = action(ActionType.ADJUST_BUDGET, confidence=0.75, direction="decrease")
+        state = state_with([rise, cut])
+
+        update = await critic.run(state, context)
+
+        assert update["_summary"]["suppressed"] == 0
+        assert len(surviving_actions(merged(state, update))) == 2
+        finding = update["critic_findings"][0]
+        assert finding["kind"] == "opposing_spend_intent"
+        assert finding["escalate"] is True
+        assert finding["suppressed_action_ids"] == []
+        assert "opposing spend proposals" in finding["reason"]
+
+    async def test_same_direction_is_one_coherent_intent(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        rise_bid = action(ActionType.ADJUST_BID, confidence=0.90, direction="increase")
+        rise_budget = action(ActionType.ADJUST_BUDGET, confidence=0.80, direction="increase")
+        state = state_with([rise_bid, rise_budget])
+
+        update = await critic.run(state, context)
+
+        assert update["critic_findings"] == []
+        assert update["_summary"]["suppressed"] == 0
+
+    async def test_proposals_without_a_direction_are_untouched(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        """A proposal that never recorded a direction cannot be judged on one."""
+        state = state_with(
+            [
+                action(ActionType.ADJUST_BUDGET, confidence=0.75),
+                action(ActionType.ADJUST_BID, confidence=0.60),
+            ]
+        )
+
+        update = await critic.run(state, context)
+
+        assert update["critic_findings"] == []
+
+    async def test_the_finding_names_both_reference_frames(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        rise = action(ActionType.ADJUST_BID, confidence=0.98, direction="increase")
+        rise["basis"] = {"metric": "roas", "reference": "target_roas"}
+        cut = action(ActionType.ADJUST_BUDGET, confidence=0.75, direction="decrease")
+        cut["basis"] = {"metric": "roas", "reference": "portfolio"}
+        state = state_with([rise, cut])
+
+        finding = (await critic.run(state, context))["critic_findings"][0]
+
+        assert "target_roas" in finding["reason"]
+        assert "portfolio" in finding["reason"]
+
+    async def test_the_narrative_calls_out_the_escalation(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        """An escalating verdict withholds nothing, so the message has to say it."""
+        rise = action(ActionType.ADJUST_BID, confidence=0.98, direction="increase")
+        cut = action(ActionType.ADJUST_BUDGET, confidence=0.75, direction="decrease")
+        state = state_with([rise, cut])
+
+        message = (await critic.run(state, context))["agent_messages"][0]
+
+        assert "need a human decision" in message["content"]
+
+    async def test_a_pause_still_settles_the_pair_outright(
+        self, critic: CriticAgent, context: AgentContext
+    ) -> None:
+        """The conflict tables run first, so the spend pair never reaches escalation."""
+        pause = action(ActionType.PAUSE_CAMPAIGN, confidence=0.90, severity="critical")
+        rise = action(ActionType.ADJUST_BID, confidence=0.98, direction="increase")
+        cut = action(ActionType.ADJUST_BUDGET, confidence=0.75, direction="decrease")
+        state = state_with([pause, rise, cut])
+
+        update = await critic.run(state, context)
+        kinds = {finding["kind"] for finding in update["critic_findings"]}
+
+        assert "pause_overrides_spend" in kinds
+        assert "opposing_spend_intent" not in kinds
 
 
 class TestUnexecutableProposals:

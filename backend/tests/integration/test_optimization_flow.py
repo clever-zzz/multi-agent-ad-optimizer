@@ -89,11 +89,13 @@ class TestRunLifecycle:
 
         Without the critic every seeded campaign ended a run holding both
         `pause_campaign` and a spend change, which asked an operator to approve
-        two mutually exclusive outcomes for the same campaign.
+        two mutually exclusive outcomes for the same campaign. The run detail now
+        also carries the withheld proposals, so the check is on what survived -
+        the actionable queue - rather than on every row ever proposed.
         """
         detail = (await client.get(API + "/runs/" + completed_run["id"], headers=admin)).json()
         spend = {"adjust_budget", "adjust_bid"}
-        actions = detail["actions"]
+        actions = [a for a in detail["actions"] if a["status"] != "suppressed"]
         paused = {a["campaign_id"] for a in actions if a["action_type"] == "pause_campaign"}
         tuned = {a["campaign_id"] for a in actions if a["action_type"] in spend}
         assert paused.isdisjoint(tuned), "contradictions survived: " + str(sorted(paused & tuned))
@@ -134,7 +136,15 @@ class TestRunLifecycle:
         assert len(detail["events"]) >= len(LOOP_AGENTS)
         agents = {event["agent"] for event in detail["events"]}
         assert agents >= LOOP_AGENTS
-        assert len(detail["actions"]) == completed_run["summary"]["actions"]
+        # The run detail is the full record, so it carries every proposal the
+        # optimizer made - including the ones the critic withheld. The summary's
+        # `actions` is the post-review count, and `actions_proposed` is the raw
+        # one; the detail matches the raw count because suppression is a mark.
+        assert len(detail["actions"]) == completed_run["summary"]["actions_proposed"]
+        assert (
+            len([a for a in detail["actions"] if a["status"] == "proposed"])
+            == completed_run["summary"]["actions"]
+        )
         assert len(detail["allocations"]) == completed_run["summary"]["budget_adjustments"]
 
     async def test_events_are_ordered_by_sequence(
@@ -438,6 +448,106 @@ async def first_action_id(client: httpx.AsyncClient, headers: dict[str, str], ru
     page = (await client.get(API + "/actions", params={"run_id": run_id}, headers=headers)).json()
     assert page["items"], "the seeded dataset should always produce at least one proposal"
     return str(page["items"][0]["id"])
+
+
+class TestCriticFindingsAreDurable:
+    """The critic's verdicts must outlive the process that produced them.
+
+    Withholding used to exist only in the run's in-memory graph state, so the
+    docstring's promise - that an operator can disagree with the critic and
+    approve a suppressed proposal anyway - was not actually reachable: the
+    proposal had no row to approve, and the reason had nowhere to live.
+    """
+
+    async def test_withheld_proposals_are_persisted_with_their_own_status(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        detail = (await client.get(API + "/runs/" + completed_run["id"], headers=admin)).json()
+        suppressed = [action for action in detail["actions"] if action["status"] == "suppressed"]
+        assert suppressed, "the seeded portfolio is deliberately conflicted"
+        assert completed_run["summary"]["actions_suppressed"] == len(suppressed)
+
+    async def test_the_approval_queue_hides_what_the_critic_withheld(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        page = (
+            await client.get(
+                API + "/actions", params={"run_id": completed_run["id"]}, headers=admin
+            )
+        ).json()
+        assert page["total"] > 0
+        assert all(action["status"] == "proposed" for action in page["items"])
+
+    async def test_suppressed_proposals_are_listable_on_request(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        page = (
+            await client.get(
+                API + "/actions",
+                params={"status": "suppressed", "run_id": completed_run["id"]},
+                headers=admin,
+            )
+        ).json()
+        assert page["total"] > 0
+        assert all(action["status"] == "suppressed" for action in page["items"])
+
+    async def test_findings_endpoint_explains_each_withholding(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        findings = (
+            await client.get(API + "/runs/" + completed_run["id"] + "/findings", headers=admin)
+        ).json()
+        assert len(findings) == completed_run["summary"]["critic_findings"]
+        assert all(finding["kind"] for finding in findings)
+        assert all(finding["reason"] for finding in findings)
+        assert [action_id for f in findings for action_id in f["suppressed_action_ids"]]
+
+    async def test_the_summary_names_the_rules_that_withheld(
+        self, completed_run: dict[str, Any]
+    ) -> None:
+        summary = completed_run["summary"]
+        by_kind = summary["critic_findings_by_kind"]
+        assert by_kind
+        assert sum(by_kind.values()) == summary["critic_findings"]
+
+    async def test_an_operator_can_overrule_the_critic(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        """The escape hatch the "mark rather than delete" design exists for."""
+        page = (
+            await client.get(
+                API + "/actions",
+                params={"status": "suppressed", "run_id": completed_run["id"]},
+                headers=admin,
+            )
+        ).json()
+        assert page["items"], "nothing was suppressed, so the override cannot be exercised"
+        action_id = page["items"][0]["id"]
+
+        approved = await client.post(API + "/actions/" + action_id + "/approve", headers=admin)
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["status"] == "approved"
+
+    async def test_the_override_is_flagged_in_the_audit_trail(
+        self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]
+    ) -> None:
+        page = (
+            await client.get(
+                API + "/actions",
+                params={"status": "suppressed", "run_id": completed_run["id"]},
+                headers=admin,
+            )
+        ).json()
+        action_id = page["items"][0]["id"]
+        await client.post(API + "/actions/" + action_id + "/approve", headers=admin)
+
+        audit = (
+            await client.get(
+                API + "/admin/audit", params={"action": "action.approved"}, headers=admin
+            )
+        ).json()
+        entry = next(item for item in audit["items"] if item["resource_id"] == action_id)
+        assert entry["after"]["overruled_critic"] is True
 
 
 class TestAlertsFromARun:

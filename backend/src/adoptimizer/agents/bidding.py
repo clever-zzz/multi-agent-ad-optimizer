@@ -32,6 +32,9 @@ class BiddingAgent(BaseAgent):
         decisions: list[dict[str, Any]] = []
         for snapshot in snapshots:
             targets = context.campaign_targets.get(snapshot.campaign_id, {})
+            target_roas = float(
+                targets.get("target_roas", context.optimization.default_target_roas)
+            )
             recommendation = recommend_bid(
                 campaign_id=snapshot.campaign_id,
                 predicted_ctr=snapshot.predicted_ctr,
@@ -41,9 +44,7 @@ class BiddingAgent(BaseAgent):
                 target_cpa=float(
                     targets.get("target_cpa", context.optimization.default_target_cpa)
                 ),
-                target_roas=float(
-                    targets.get("target_roas", context.optimization.default_target_roas)
-                ),
+                target_roas=target_roas,
                 bid_cap_ratio=context.optimization.bid_cap_ratio_of_target_cpa,
             )
             decisions.append(
@@ -59,6 +60,12 @@ class BiddingAgent(BaseAgent):
                     "confidence": recommendation.confidence,
                     "reasoning": recommendation.reasoning,
                     "iteration": iteration,
+                    # The frame this recommendation was judged against. Carried
+                    # on the decision so the proposal can record it, which is
+                    # what lets the critic see that a bid raise and a budget cut
+                    # were decided against *different* references.
+                    "observed_roas": round(float(snapshot.roas), 4),
+                    "target_roas": target_roas,
                 }
             )
 

@@ -129,6 +129,7 @@ def allocate(
     daily_budgets: dict[str, float] | None = None,
     floor: float = MIN_BUDGET_FLOOR,
     cross_check_with_solver: bool = True,
+    no_decrease: set[str] | None = None,
 ) -> list[BudgetAllocation]:
     """Reallocate budget across campaigns under bounded per-campaign change.
 
@@ -141,17 +142,29 @@ def allocate(
     to be a daily figure too: sizing it from window spend inflated every
     recommendation by the length of the window. Callers with no campaign record
     to read from fall back to spend, which keeps this usable standalone.
+
+    ``no_decrease`` names campaigns whose budget must not be reduced - in
+    practice the ones already at or above their ROAS target. Their floor becomes
+    their current budget, so the reallocation happens entirely out of the
+    remaining headroom and the total is still preserved. Without it a campaign
+    can be told to raise its bid and halve its budget in the same run, because
+    the bid agent measures against the campaign's target while this one measures
+    against the portfolio average.
     """
     eligible = [s for s in snapshots if s.total_cost > 0]
     if not eligible:
         return []
 
     budgets = daily_budgets or {}
+    held = no_decrease or set()
     change = clamp(max_change_pct, 0.0, 10.0)
     current = np.array([max(_baseline(s, budgets), floor) for s in eligible], dtype=float)
     scores = np.array([max(allocation_score(s), 1e-6) for s in eligible], dtype=float)
     lower = np.maximum(current * (1.0 - change), floor)
     upper = current * (1.0 + change)
+    for index, snapshot in enumerate(eligible):
+        if snapshot.campaign_id in held:
+            lower[index] = current[index]
 
     budget = float(current.sum()) if total_budget is None else float(total_budget)
     budget = clamp(budget, float(lower.sum()), float(upper.sum()))
@@ -174,7 +187,12 @@ def allocate(
 
     return [
         _to_allocation(
-            snapshot, float(current[i]), float(allocation[i]), float(scores[i]), solver_used
+            snapshot,
+            float(current[i]),
+            float(allocation[i]),
+            float(scores[i]),
+            solver_used,
+            held_at_target=snapshot.campaign_id in held,
         )
         for i, snapshot in enumerate(eligible)
     ]
@@ -186,12 +204,20 @@ def _to_allocation(
     recommended: float,
     score: float,
     solver: str,
+    *,
+    held_at_target: bool = False,
 ) -> BudgetAllocation:
     change_pct = safe_ratio(recommended - current_budget, current_budget) * 100.0
     # The reallocation is zero-sum, so a strong campaign can still lose budget
     # to a stronger one. The reason therefore has to be phrased relative to the
     # portfolio; labelling a ROAS of 13 "inefficient" was simply untrue.
-    if change_pct > 5:
+    if held_at_target and change_pct > -5:
+        reason = (
+            "ROAS "
+            + format(snapshot.roas, ".2f")
+            + " meets its target, budget held rather than cut"
+        )
+    elif change_pct > 5:
         reason = "ROAS " + format(snapshot.roas, ".2f") + " leads the portfolio, scaling spend up"
     elif change_pct < -5:
         reason = (

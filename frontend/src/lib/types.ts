@@ -29,7 +29,8 @@ export type ActionStatus =
   | "rejected"
   | "executed"
   | "failed"
-  | "skipped";
+  | "skipped"
+  | "suppressed";
 
 export type AlertRule =
   | "low_ctr"
@@ -170,6 +171,7 @@ export interface RunSummary {
   actions_proposed: number;
   actions_suppressed: number;
   critic_findings: number;
+  critic_findings_by_kind: Record<string, number>;
   action_counts: Record<string, number>;
   alerts_raised: number;
   health: Record<string, unknown>;
@@ -217,11 +219,35 @@ export interface OptimizationAction {
   reason: string;
   confidence: number;
   proposed_by: string;
+  // Which way spend moves and the reference frame it was judged against, so the
+  // screen can explain why two proposals on one campaign contradict each other.
+  direction: string;
+  basis: Record<string, unknown>;
   created_at: string | null;
   approved_by: string | null;
   executed_at: string | null;
   external_reference: string | null;
   error_message: string | null;
+}
+
+export interface CriticFinding {
+  id: string | null;
+  run_id: string | null;
+  iteration: number;
+  kind: string;
+  scope: string;
+  campaign_id: string;
+  creative_id: string | null;
+  kept_action_id: string | null;
+  kept_action_type: string;
+  kept_confidence: number;
+  reason: string;
+  suppressed_action_ids: string[];
+  suppressed_actions: Array<Record<string, unknown>>;
+  // True when the critic refused to pick a winner and left the choice to a
+  // human. Such a finding suppresses nothing; it flags a conflict.
+  escalate: boolean;
+  created_at: string | null;
 }
 
 export interface BudgetAllocation {
@@ -240,6 +266,7 @@ export interface RunDetail {
   events: RunEvent[];
   actions: OptimizationAction[];
   allocations: BudgetAllocation[];
+  findings: CriticFinding[];
 }
 
 export interface Alert {

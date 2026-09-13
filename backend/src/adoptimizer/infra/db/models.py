@@ -227,6 +227,9 @@ class OptimizationRun(Base, TimestampMixin):
     actions: Mapped[list[OptimizationAction]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    findings: Mapped[list[CriticFinding]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
 
 
 class IngestBatch(Base):
@@ -363,6 +366,13 @@ class OptimizationAction(Base, TimestampMixin):
     after_value: Mapped[str] = mapped_column(String(200), default="")
     reason: Mapped[str] = mapped_column(Text, default="")
     confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    # Which way the proposal moves spend ("increase"/"decrease"/null), and the
+    # reference frame it was decided against. Stored rather than left in the
+    # reason prose so the critic can tell an opposing pair from a coherent one
+    # and the approval screen can explain the conflict without parsing text.
+    # Nullable because rows written before this existed have no direction.
+    direction: Mapped[str | None] = mapped_column(String(10))
+    basis: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     proposed_by: Mapped[str] = mapped_column(String(20), default="optimize")
     approved_by: Mapped[str | None] = mapped_column(String(32), ForeignKey("users.id"))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -373,6 +383,44 @@ class OptimizationAction(Base, TimestampMixin):
     run: Mapped[OptimizationRun | None] = relationship(back_populates="actions")
 
     __table_args__ = (Index("ix_action_status_type", "status", "action_type"),)
+
+
+class CriticFinding(Base, TimestampMixin):
+    """One reconciliation verdict the critic reached, kept for the audit trail.
+
+    The critic suppresses proposals rather than deleting them, and this table is
+    what carries that decision across the persistence boundary: the run's
+    in-memory state is gone when the process exits, so without a row here the
+    operator can see the *count* of withheld proposals but never the reason or
+    the proposals themselves. ``suppressed_action_ids`` is denormalised from
+    ``suppressed_actions`` so the approval screen can link a finding to the
+    action rows it withheld without parsing the detail blob.
+    """
+
+    __tablename__ = "critic_findings"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("optimization_runs.id", ondelete="SET NULL"), index=True
+    )
+    iteration: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(20), default="campaign", nullable=False)
+    campaign_id: Mapped[str] = mapped_column(String(40), default="", index=True)
+    creative_id: Mapped[str | None] = mapped_column(String(40))
+    kept_action_id: Mapped[str | None] = mapped_column(String(40))
+    kept_action_type: Mapped[str] = mapped_column(String(30), default="")
+    kept_confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    suppressed_action_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    suppressed_actions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    # True when the critic refused to pick a winner and escalated the conflict
+    # to a human instead. Such a finding suppresses nothing; it flags.
+    escalate: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    run: Mapped[OptimizationRun | None] = relationship(back_populates="findings")
+
+    __table_args__ = (Index("ix_finding_run_kind", "run_id", "kind"),)
 
 
 class Alert(Base, TimestampMixin):

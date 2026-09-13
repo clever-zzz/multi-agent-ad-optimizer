@@ -20,7 +20,12 @@ from ..domain.enums import (
     Role,
     RunStatus,
 )
-from .agent import BudgetAllocationOut, OptimizationActionOut, RunSummaryOut
+from .agent import (
+    BudgetAllocationOut,
+    CriticFindingOut,
+    OptimizationActionOut,
+    RunSummaryOut,
+)
 
 
 class LoginRequest(BaseModel):
@@ -237,12 +242,13 @@ class RunEventOut(BaseModel):
 
 
 class RunDetailOut(BaseModel):
-    """Full run view: metadata, timeline, actions and budget plan."""
+    """Full run view: metadata, timeline, actions, budget plan and verdicts."""
 
     run: RunOut
     events: list[RunEventOut] = Field(default_factory=list)
     actions: list[OptimizationActionOut] = Field(default_factory=list)
     allocations: list[BudgetAllocationOut] = Field(default_factory=list)
+    findings: list[CriticFindingOut] = Field(default_factory=list)
 
 
 class ActionDecisionRequest(BaseModel):

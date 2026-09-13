@@ -21,7 +21,13 @@ from ...core.logging import get_logger
 from ...domain.enums import Permission, RunStatus
 from ...orchestrator.events import TERMINAL_EVENTS, AgentEvent
 from ...repositories.runs import RunRepository
-from ...schemas.api import RunDetailOut, RunEventOut, RunOut, RunStartRequest
+from ...schemas.agent import CriticFindingOut
+from ...schemas.api import (
+    RunDetailOut,
+    RunEventOut,
+    RunOut,
+    RunStartRequest,
+)
 from ...schemas.common import Page
 from ...services.audit import AuditService
 from ...services.optimization import OptimizationService
@@ -138,7 +144,27 @@ async def get_run(run_id: str, session: SessionDep, container: ContainerDep) -> 
         events=[RunEventOut.model_validate(event) for event in detail["events"]],
         actions=[_action_out(action) for action in detail["actions"]],
         allocations=[_allocation_out(item) for item in detail["allocations"]],
+        findings=[_finding_out(finding) for finding in detail["findings"]],
     )
+
+
+@router.get(
+    "/{run_id}/findings",
+    response_model=list[CriticFindingOut],
+    summary="List the critic's verdicts for a run",
+    dependencies=[require(Permission.RUN_READ)],
+)
+async def list_run_findings(
+    run_id: str, session: SessionDep, container: ContainerDep
+) -> list[CriticFindingOut]:
+    """Why the approval queue is shorter than the proposal count.
+
+    Exposed as its own endpoint so an operator can answer "what did the critic
+    withhold, and on what grounds" without loading the whole run - and so the
+    reason survives the process that produced it.
+    """
+    detail = await OptimizationService(container, session).run_detail(session, run_id)
+    return [_finding_out(finding) for finding in detail["findings"]]
 
 
 @router.post(
@@ -260,11 +286,35 @@ def _action_out(action: Any) -> Any:
         reason=action.reason,
         confidence=action.confidence,
         proposed_by=action.proposed_by,
+        direction=action.direction,
+        basis=dict(action.basis or {}),
         created_at=action.created_at,
         approved_by=action.approved_by,
         executed_at=action.executed_at,
         external_reference=action.external_reference,
         error_message=action.error_message,
+    )
+
+
+def _finding_out(finding: Any) -> Any:
+    from ...schemas.agent import CriticFindingOut
+
+    return CriticFindingOut(
+        id=finding.id,
+        run_id=finding.run_id,
+        iteration=finding.iteration,
+        kind=finding.kind,
+        scope=finding.scope,
+        campaign_id=finding.campaign_id,
+        creative_id=finding.creative_id,
+        kept_action_id=finding.kept_action_id,
+        kept_action_type=finding.kept_action_type,
+        kept_confidence=finding.kept_confidence,
+        reason=finding.reason,
+        suppressed_action_ids=list(finding.suppressed_action_ids or []),
+        suppressed_actions=list(finding.suppressed_actions or []),
+        escalate=finding.escalate,
+        created_at=finding.created_at,
     )
 
 

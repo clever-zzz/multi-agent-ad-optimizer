@@ -17,7 +17,12 @@ and the critic honours it, so the approval queue only ever holds changes that
 could actually be applied. Suppression is a mark rather than a deletion for two reasons: the
 `optimization_actions` channel uses the append_list reducer, so no node can
 rewrite history, and keeping the record is what lets an operator disagree with
-the critic and approve a suppressed proposal anyway.
+the critic and approve a suppressed proposal anyway. That second promise only
+holds because the mark is persisted - the run's graph state dies with the
+process, so `_finalise` writes every proposal, withheld ones carrying status
+`suppressed`, next to a `critic_findings` row holding the reason. Without those
+rows the escape hatch existed only inside the run that created it, which is not
+an escape hatch at all.
 """
 
 from __future__ import annotations
@@ -75,9 +80,10 @@ ConflictRule = tuple[str, frozenset[str], str]
 # reports how much delivery evidence backs a price (0.35 + 0.45 * evidence +
 # 0.2, clamped to 0.98), so any campaign over 50k impressions scores ~0.98.
 # An alert-derived proposal instead reports how severe the anomaly was (0.9
-# critical, 0.7 warning). A fired critical anomaly therefore outranks any
-# amount of delivery evidence, and confidence only separates proposals that
-# carry the same standing.
+# critical, 0.7 warning). A critical anomaly therefore outranks any amount of
+# delivery evidence - but only once it is clearly past its threshold, which is
+# what DOMINANCE_MARGIN below measures. Confidence separates proposals that
+# carry the same standing, including two that are both critical.
 CRITICAL = AlertSeverity.CRITICAL.value
 
 
@@ -103,6 +109,17 @@ def _iteration_of(action: dict[str, Any]) -> int:
         return 0
 
 
+def _direction(action: dict[str, Any]) -> str:
+    """Which way a proposal moves spend: "increase", "decrease" or ""."""
+    return str(action.get("direction") or "")
+
+
+def _reference(action: dict[str, Any]) -> str:
+    """The frame a spend proposal was judged against, when it recorded one."""
+    basis = action.get("basis")
+    return str(basis.get("reference") or "") if isinstance(basis, dict) else ""
+
+
 def _severity_rank(action: dict[str, Any]) -> int:
     """1 when a fired critical anomaly backs this proposal, else 0."""
     return 1 if str(action.get("severity") or "") == CRITICAL else 0
@@ -111,6 +128,49 @@ def _severity_rank(action: dict[str, Any]) -> int:
 def _rank(action: dict[str, Any]) -> tuple[int, float]:
     """Ordering key: severity first, confidence only as the tie-break."""
     return (_severity_rank(action), _confidence(action))
+
+
+# A rule calls itself critical once it is this far past its threshold; the
+# detector's bands are cut from the same number.
+CRITICAL_GAP = 0.5
+# How much further past that line an anomaly has to be before the critic lets it
+# outrank evidence outright. Without a margin, "critical" is a cliff: 1.875 of a
+# daily budget gets absolute precedence while 1.857 - the same situation to a
+# business - can be overruled by a confidence score. With it, a marginal
+# critical competes on the evidence like anything else, and only a genuinely
+# runaway one is undebatable.
+DOMINANCE_MARGIN = 0.10
+
+
+def _urgency(action: dict[str, Any]) -> float:
+    """How far past its threshold the backing anomaly is.
+
+    Falls back to a full-margin 1.0 for a critical that carries only the
+    three-valued severity, so a proposal built without the continuous figure is
+    still treated as clearly critical rather than silently demoted.
+    """
+    raw = action.get("urgency")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw)
+    return 1.0 if _severity_rank(action) else 0.0
+
+
+def _dominates(action: dict[str, Any]) -> bool:
+    """Whether this proposal is clearly critical enough to outrank evidence."""
+    return _severity_rank(action) == 1 and _urgency(action) >= CRITICAL_GAP + DOMINANCE_MARGIN
+
+
+def _outranks(challenger: dict[str, Any], keeper: dict[str, Any]) -> bool:
+    """Whether the challenger strictly beats the keeper.
+
+    Strict on purpose: equal standing resolves toward the dominant remedy (the
+    keeper), which is what keeps "stopping spend wins a tie" intact.
+    """
+    challenger_dominates = _dominates(challenger)
+    keeper_dominates = _dominates(keeper)
+    if challenger_dominates != keeper_dominates:
+        return challenger_dominates
+    return _confidence(challenger) > _confidence(keeper)
 
 
 def _standing(action: dict[str, Any]) -> str:
@@ -161,6 +221,7 @@ def _brief(action: dict[str, Any]) -> dict[str, Any]:
         "action_type": _action_type(action),
         "confidence": _confidence(action),
         "severity": str(action.get("severity") or ""),
+        "direction": _direction(action),
         "iteration": _iteration_of(action),
         "reason": str(action.get("reason") or "")[:300],
         "preflight": _preflight(action) or None,
@@ -181,6 +242,10 @@ class Finding:
     suppressed: tuple[dict[str, Any], ...]
     reason: str
     iteration: int
+    # True when the critic refused to pick a winner and handed the decision to a
+    # human instead. An escalating finding suppresses nothing; it flags a
+    # conflict the critic cannot settle on evidence alone.
+    escalate: bool = False
 
     @property
     def suppressed_action_ids(self) -> tuple[str, ...]:
@@ -199,6 +264,7 @@ class Finding:
             "suppressed_action_ids": list(self.suppressed_action_ids),
             "reason": self.reason,
             "iteration": self.iteration,
+            "escalate": self.escalate,
         }
 
 
@@ -225,6 +291,7 @@ class CriticAgent(BaseAgent):
         findings.extend(self._repeats(actions, suppressed, iteration))
         findings.extend(self._conflicts(actions, suppressed, iteration, CAMPAIGN_CONFLICTS, False))
         findings.extend(self._conflicts(actions, suppressed, iteration, CREATIVE_CONFLICTS, True))
+        findings.extend(self._spend_direction(actions, suppressed, iteration))
 
         surviving = len(actions) - len(suppressed)
         by_kind = self._by_kind(findings)
@@ -396,6 +463,71 @@ class CriticAgent(BaseAgent):
                     findings.append(finding)
         return findings
 
+    def _spend_direction(
+        self,
+        actions: list[dict[str, Any]],
+        suppressed: set[str],
+        iteration: int,
+    ) -> list[Finding]:
+        """Flag two spend proposals that pull one campaign in opposite directions.
+
+        This is deliberately not another conflict table. The tables above encode
+        "these two cannot both be applied", and the critic can settle those
+        because stopping spend beats continuing it. A bid raise and a budget cut
+        are different: each is defensible against its own reference frame (the
+        campaign's target versus the portfolio average), so neither dominates and
+        picking one would be the critic inventing a policy the operators never
+        agreed to. It escalates instead - both proposals stay in the queue, and
+        the finding says why a human has to choose.
+
+        Same-direction proposals are left alone: a bid raise and a budget raise
+        are one coherent intent, and a conflict rule here would break that.
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for action in actions:
+            if _action_id(action) in suppressed:
+                continue
+            if _action_type(action) not in SPEND_ACTIONS:
+                continue
+            groups.setdefault(str(action.get("campaign_id", "")), []).append(action)
+
+        findings: list[Finding] = []
+        for campaign_id, group in groups.items():
+            rises = [a for a in group if _direction(a) == "increase"]
+            cuts = [a for a in group if _direction(a) == "decrease"]
+            if not rises or not cuts:
+                continue
+            references = sorted({_reference(a) for a in group if _reference(a)})
+            frame = " vs ".join(references) if references else "different reference frames"
+            findings.append(
+                Finding(
+                    kind="opposing_spend_intent",
+                    scope="campaign",
+                    campaign_id=campaign_id,
+                    creative_id="",
+                    kept_action_id="",
+                    kept_action_type="none",
+                    kept_confidence=0.0,
+                    # Nothing is suppressed: both proposals remain decidable and
+                    # the operator, not the critic, settles the contradiction.
+                    suppressed=(),
+                    escalate=True,
+                    reason=(
+                        _describe(campaign_id, "")
+                        + " received opposing spend proposals: "
+                        + _join(rises)
+                        + " against "
+                        + _join(cuts)
+                        + ". They were decided against "
+                        + frame
+                        + ", so neither outranks the other on evidence and both"
+                        + " were left in the queue. Choose one."
+                    ),
+                    iteration=iteration,
+                )
+            )
+        return findings
+
     @staticmethod
     def _resolve(
         group: list[dict[str, Any]],
@@ -419,7 +551,7 @@ class CriticAgent(BaseAgent):
         challenger = max(weak, key=_rank)
         target = _describe(campaign_id, creative_id)
 
-        if _rank(challenger) > _rank(keeper):
+        if _outranks(challenger, keeper):
             losers = strong
             winner = challenger
             reason = (
@@ -441,7 +573,7 @@ class CriticAgent(BaseAgent):
                 + _join(losers)
                 + " on "
                 + target
-                + ": the two cannot both be applied. A fired critical anomaly"
+                + ": the two cannot both be applied. A clearly critical anomaly"
                 + " outranks delivery evidence, and equal standing resolves"
                 + " toward stopping spend."
             )
@@ -486,6 +618,15 @@ class CriticAgent(BaseAgent):
             str(count) + " " + kind.replace("_", " ")
             for kind, count in sorted(self._by_kind(findings).items())
         )
+        escalated = sum(1 for finding in findings if finding.escalate)
+        # An escalating verdict withholds nothing, so it would be invisible in
+        # the withheld-by-kind breakdown above. It still has to be said out loud:
+        # it is the one case where the run is waiting on a person.
+        tail = (
+            " " + str(escalated) + " conflict(s) need a human decision."
+            if escalated
+            else ""
+        )
         return self._message(
             "Reviewed "
             + str(proposals)
@@ -495,6 +636,7 @@ class CriticAgent(BaseAgent):
             + detail
             + "). "
             + str(surviving)
-            + " remain for approval.",
+            + " remain for approval."
+            + tail,
             iteration=iteration,
         )

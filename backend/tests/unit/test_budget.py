@@ -230,3 +230,44 @@ class TestTotalDelta:
             "decreased": 0,
             "unchanged": 0,
         }
+
+
+class TestNoDecreaseGuard:
+    """A campaign at or above its target is not cut in the same run.
+
+    The bid agent judges a campaign against its own ROAS target while this
+    allocator judges it against the portfolio average, so without the guard one
+    run can raise a campaign's bid and halve its budget at once.
+    """
+
+    def test_a_protected_campaign_keeps_its_budget(self) -> None:
+        plan = allocate(
+            [WINNER, LOSER],
+            max_change_pct=0.5,
+            cross_check_with_solver=False,
+            no_decrease={"loser"},
+        )
+        by_id = {allocation.campaign_id: allocation for allocation in plan}
+        loser = by_id["loser"]
+
+        assert loser.recommended_budget == pytest.approx(loser.current_budget)
+        assert "meets its target" in loser.reason
+
+    def test_the_total_is_still_preserved(self) -> None:
+        plan = allocate(
+            [WINNER, LOSER],
+            max_change_pct=0.5,
+            cross_check_with_solver=False,
+            no_decrease={"loser"},
+        )
+
+        current = sum(allocation.current_budget for allocation in plan)
+        recommended = sum(allocation.recommended_budget for allocation in plan)
+
+        assert recommended == pytest.approx(current)
+
+    def test_without_the_guard_the_cut_still_happens(self) -> None:
+        plan = allocate([WINNER, LOSER], max_change_pct=0.5, cross_check_with_solver=False)
+        by_id = {allocation.campaign_id: allocation for allocation in plan}
+
+        assert by_id["loser"].recommended_budget < by_id["loser"].current_budget

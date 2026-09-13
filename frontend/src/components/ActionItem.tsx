@@ -82,8 +82,12 @@ export function ActionItem({
   const id = action.id ?? "";
   const pending = action.status === "proposed";
   const approved = action.status === "approved";
+  // Withheld by the critic, but a real row: the operator can still overrule it.
+  const suppressed = action.status === "suppressed";
   const tone = confidenceTone(action.confidence);
   const highImpact = HIGH_IMPACT.has(action.action_type);
+  // The reference frame the proposal was judged against, when it recorded one.
+  const reference = action.basis?.reference ? String(action.basis.reference) : "";
 
   return (
     <article
@@ -169,6 +173,26 @@ export function ActionItem({
         <p className="text-[13px] leading-relaxed text-ink-2">{action.reason}</p>
       )}
 
+      {action.direction && (
+        <p className="flex items-center gap-1.5 text-[11px] text-ink-3">
+          <Icon name={action.direction === "increase" ? "arrowUp" : "arrowDown"} size={12} />
+          {action.direction === "increase" ? t("moves spend up") : t("moves spend down")}
+          {reference ? (
+            <>
+              <span>·</span>
+              <span>{t("judged against {reference}", { reference })}</span>
+            </>
+          ) : null}
+        </p>
+      )}
+
+      {suppressed && (
+        <p className="flex items-start gap-1.5 rounded-md border border-warn/30 bg-warn/8 px-2.5 py-2 text-xs text-warn">
+          <Icon name="warning" size={13} className="mt-0.5 shrink-0" />
+          {t("Withheld by the critic. Approving overrules it.")}
+        </p>
+      )}
+
       {action.error_message && (
         <p className="flex items-start gap-1.5 rounded-md border border-neg/30 bg-neg/8 px-2.5 py-2 text-xs text-neg">
           <Icon name="warning" size={13} className="mt-0.5 shrink-0" />
@@ -184,8 +208,20 @@ export function ActionItem({
         </p>
       )}
 
-      {(pending || approved) && (canApprove || canExecute) && (
+      {(pending || approved || suppressed) && (canApprove || canExecute) && (
         <div className="flex flex-wrap items-center gap-2 border-t border-line pt-3">
+          {suppressed && canApprove && onApprove && (
+            <>
+              <Button variant="success" icon="check" onClick={() => onApprove(false)} disabled={busy}>
+                {t("Overrule the critic")}
+              </Button>
+              {onReject && (
+                <Button variant="ghost" icon="close" onClick={onReject} disabled={busy} className="text-neg hover:bg-neg/10">
+                  {t("Reject")}
+                </Button>
+              )}
+            </>
+          )}
           {pending && canApprove && onApprove && (
             <>
               <Button variant="success" icon="check" onClick={() => onApprove(false)} disabled={busy}>

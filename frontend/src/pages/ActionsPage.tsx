@@ -22,10 +22,11 @@ import { toast } from "@/stores/toast";
 import { formatNumber, formatPercent, humanize } from "@/lib/format";
 import type { ActionStatus, ActionType, OptimizationAction } from "@/lib/types";
 
-type TabValue = "proposed" | "approved" | "executed" | "rejected" | "all";
+type TabValue = "proposed" | "suppressed" | "approved" | "executed" | "rejected" | "all";
 
 const STATUS_TABS: Array<{ value: TabValue; label: string }> = [
   { value: "proposed", label: "Awaiting approval" },
+  { value: "suppressed", label: "Withheld by the critic" },
   { value: "approved", label: "Approved" },
   { value: "executed", label: "Executed" },
   { value: "rejected", label: "Rejected" },
@@ -104,12 +105,19 @@ export function ActionsPage() {
 
   const handleApprove = (action: OptimizationAction, execute: boolean) => {
     if (!action.id) return;
+    // Approving a withheld proposal is the operator overruling the critic, and
+    // saying so is the point of surfacing it at all.
+    const overruled = action.status === "suppressed";
     approveAction.mutate(
       { actionId: action.id, execute },
       {
         onSuccess: (updated) =>
           toast.success(
-            execute ? t("Approved and executed") : t("Approved"),
+            overruled
+              ? t("Critic overruled")
+              : execute
+                ? t("Approved and executed")
+                : t("Approved"),
             t("{type} → {status}", {
               type: humanize(updated.action_type),
               status: humanize(updated.status),

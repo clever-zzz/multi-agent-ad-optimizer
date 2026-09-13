@@ -34,7 +34,7 @@ import {
 } from "@/lib/format";
 import type { BudgetAllocation, OptimizationAction, RunSummary } from "@/lib/types";
 
-type TabValue = "proposals" | "budget" | "usage";
+type TabValue = "proposals" | "findings" | "budget" | "usage";
 
 function summaryOf(summary: RunSummary | Record<string, unknown> | undefined): RunSummary | null {
   if (summary && typeof summary === "object" && "status" in summary) return summary as RunSummary;
@@ -74,6 +74,7 @@ export function RunDetailPage() {
   const summary = summaryOf(run?.summary);
   const actions = detail.data?.actions ?? [];
   const allocations = detail.data?.allocations ?? [];
+  const findings = detail.data?.findings ?? [];
 
   const handleApprove = (action: OptimizationAction, execute: boolean) => {
     if (!action.id) return;
@@ -338,6 +339,7 @@ export function RunDetailPage() {
             onChange={setTab}
             items={[
               { value: "proposals", label: "Proposals", count: actions.length },
+              { value: "findings", label: "Critic verdicts", count: findings.length },
               { value: "budget", label: "Budget plan", count: allocations.length },
               { value: "usage", label: "Summary & usage" },
             ]}
@@ -374,6 +376,57 @@ export function RunDetailPage() {
                       })
                     }
                   />
+                ))
+              )}
+            </div>
+          )}
+
+          {tab === "findings" && (
+            <div className="flex flex-col gap-2.5">
+              {detail.isLoading ? (
+                <Skeleton className="h-40 w-full" />
+              ) : findings.length === 0 ? (
+                <Card>
+                  <EmptyState
+                    icon="checkSquare"
+                    title={t("The critic found no conflicts")}
+                    hint={t("Every proposal in this run was consistent, so nothing was withheld.")}
+                  />
+                </Card>
+              ) : (
+                findings.map((finding) => (
+                  <article
+                    key={finding.id ?? `${finding.kind}-${finding.campaign_id}`}
+                    className="card flex flex-col gap-2 p-3.5"
+                  >
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <h3 className="text-[13px] font-semibold text-ink-1">
+                        {humanize(finding.kind)}
+                      </h3>
+                      {finding.escalate ? (
+                        <Badge tone="warning">{t("needs a human decision")}</Badge>
+                      ) : (
+                        <Badge tone="neutral">
+                          {t("{count} withheld", {
+                            count: formatNumber(finding.suppressed_action_ids.length),
+                          })}
+                        </Badge>
+                      )}
+                      <span className="text-[11px] text-ink-3">
+                        · {t("iteration {n}", { n: finding.iteration })}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-ink-3">
+                      <span className="font-mono">{truncate(finding.campaign_id, 18)}</span>
+                      {finding.creative_id ? (
+                        <>
+                          {" · "}
+                          <span className="font-mono">{truncate(finding.creative_id, 14)}</span>
+                        </>
+                      ) : null}
+                    </p>
+                    <p className="text-[13px] leading-relaxed text-ink-2">{finding.reason}</p>
+                  </article>
                 ))
               )}
             </div>

@@ -240,6 +240,12 @@ class OptimizationSettings(BaseModel):
     alert_cpa_ceiling: float = Field(default=200.0, gt=0)
     alert_roas_floor: float = Field(default=1.0, ge=0)
     min_impressions_for_alerts: int = Field(default=100, ge=0)
+    # Burn-rate detection. The critical line used to be `burn_rate_multiplier
+    # * 1.5` written into the detector, which made "how far over budget is an
+    # emergency" impossible to tune per account; it is a deployment decision.
+    burn_rate_multiplier: float = Field(default=1.25, gt=1)
+    burn_rate_critical_multiplier: float = Field(default=1.875, gt=1)
+    burn_rate_hysteresis: float = Field(default=0.05, ge=0, lt=1)
     creative_score_threshold: float = Field(default=40.0, ge=0, le=100)
     max_budget_change_pct: float = Field(default=50.0, ge=0, le=100)
     bid_cap_ratio_of_target_cpa: float = Field(default=0.8, gt=0, le=1)

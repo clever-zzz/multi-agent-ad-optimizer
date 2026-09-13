@@ -31,7 +31,7 @@ from ..orchestrator.state import (
     AgentState,
     initial_state,
     summarise_state,
-    surviving_actions,
+    suppressed_action_ids,
 )
 from ..repositories.alerts import AlertRepository
 from ..repositories.runs import RunRepository
@@ -286,10 +286,27 @@ class OptimizationService:
             runs = RunRepository(session)
 
             if status == RunStatus.SUCCEEDED:
-                actions = surviving_actions(state)
+                # Every proposal is persisted, not just the survivors. A withheld
+                # proposal is stored with status `suppressed` so the operator has
+                # a row to inspect and overrule; the approval queue still reads
+                # only `proposed`, so nothing reaches a platform without review.
+                proposed = [
+                    action
+                    for action in (state.get("optimization_actions") or [])
+                    if isinstance(action, dict)
+                ]
+                findings = [
+                    finding
+                    for finding in (state.get("critic_findings") or [])
+                    if isinstance(finding, dict)
+                ]
                 allocations = list(state.get("budget_allocations") or [])
-                if actions:
-                    await runs.add_actions(run_id, actions)
+                if proposed:
+                    await runs.add_actions(
+                        run_id, proposed, suppressed_ids=suppressed_action_ids(state)
+                    )
+                if findings:
+                    await runs.add_findings(run_id, findings)
                 if allocations:
                     await runs.add_allocations(run_id, allocations)
                 await self._persist_alerts(session, state, run_id)
@@ -388,12 +405,14 @@ class OptimizationService:
         events = await runs.events(run_id, limit=1000)
         actions = await runs.actions_for_run(run_id)
         allocations = await runs.allocations_for_run(run_id)
+        findings = await runs.findings_for_run(run_id)
 
         return {
             "run": run,
             "events": events,
             "actions": actions,
             "allocations": allocations,
+            "findings": findings,
         }
 
     async def cancel(
@@ -453,6 +472,9 @@ class OptimizationService:
             cpa_ceiling=optimization.alert_cpa_ceiling,
             roas_floor=optimization.alert_roas_floor,
             min_impressions=optimization.min_impressions_for_alerts,
+            burn_rate_multiplier=optimization.burn_rate_multiplier,
+            burn_rate_critical_multiplier=optimization.burn_rate_critical_multiplier,
+            burn_rate_hysteresis=optimization.burn_rate_hysteresis,
         )
         alerts = deduplicate(detect(snapshots, thresholds, daily_budgets=budgets, window_days=days))
         return [alert.to_dict() for alert in alerts]

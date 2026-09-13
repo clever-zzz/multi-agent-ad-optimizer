@@ -47,12 +47,16 @@ describe("Badge and StatusPill", () => {
         <StatusPill domain="run" value="succeeded" />
         <StatusPill domain="run" value="failed" />
         <StatusPill domain="action" value="proposed" />
+        <StatusPill domain="action" value="suppressed" />
         <StatusPill domain="severity" value="critical" />
       </>,
     );
     expect(screen.getByText("Succeeded").className).toContain("text-pos");
     expect(screen.getByText("Failed").className).toContain("text-neg");
     expect(screen.getByText("Proposed").className).toContain("text-brand-300");
+    // Withheld proposals are a first-class status, so they need their own tone
+    // rather than falling through to the neutral unknown-value default.
+    expect(screen.getByText("Suppressed").className).toContain("text-warn");
     expect(screen.getByText("Critical").className).toContain("text-neg");
   });
 

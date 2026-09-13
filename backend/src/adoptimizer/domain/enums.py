@@ -101,6 +101,11 @@ class ActionStatus(StrEnum):
     EXECUTED = "executed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    # Withheld by the critic, but persisted rather than dropped. It is a real
+    # row an operator can see and overrule, which is what makes "the critic
+    # marks rather than deletes" true across the persistence boundary and not
+    # only inside one run's in-memory state.
+    SUPPRESSED = "suppressed"
 
 
 class AlertRule(StrEnum):

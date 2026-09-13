@@ -200,7 +200,7 @@ key 按 **actor** 作用域。同一个 key + 同一个 actor 第二次调用，
 |---|---|---|
 | GET | `/healthz` | 存活探针，永远 200 |
 | GET | `/readyz` | 就绪探针，聚合依赖健康；数据库不可达时 503 |
-| GET | `/metrics` | Prometheus 文本格式，17 个指标 |
+| GET | `/metrics` | Prometheus 文本格式，20 个指标 |
 | GET | `/system/info` | 运行时配置摘要（只含可公开字段） |
 | GET | `/` | 服务标识（不在 OpenAPI 里） |
 
@@ -262,7 +262,8 @@ key 按 **actor** 作用域。同一个 key + 同一个 actor 第二次调用，
 |---|---|---|---|
 | POST | `/runs` | `run:trigger` | 触发一次优化闭环，202 + run 对象 |
 | GET | `/runs` | `run:read` | 运行列表，支持 status 过滤与分页 |
-| GET | `/runs/{run_id}` | `run:read` | 详情：run + 事件时间线 + 动作 + 预算方案 |
+| GET | `/runs/{run_id}` | `run:read` | 详情：run + 事件时间线 + 动作 + 预算方案 + critic 裁决 |
+| GET | `/runs/{run_id}/findings` | `run:read` | 该 run 的 critic 裁决（含被抑制提案与理由） |
 | POST | `/runs/{run_id}/cancel` | `run:trigger` | 取消运行中的 run |
 | GET | `/runs/{run_id}/stream` | `run:read` | **SSE**：先回放历史事件，再推实时事件 |
 
@@ -289,7 +290,7 @@ curl -N http://localhost:8000/api/v1/runs/<RUN_ID>/stream -H "Authorization: Bea
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/actions` | `run:read` | 提案列表，支持 status/type/campaign 过滤 |
+| GET | `/actions` | `run:read` | 提案列表，支持 status/type/campaign 过滤；**默认不含 `suppressed`** |
 | GET | `/actions/{action_id}` | `run:read` | 单个提案 |
 | POST | `/actions/{action_id}/approve` | `action:approve` | 批准，写审计 |
 | POST | `/actions/{action_id}/reject` | `action:approve` | 驳回（可带理由），写审计 |
@@ -306,7 +307,13 @@ curl -N http://localhost:8000/api/v1/runs/<RUN_ID>/stream -H "Authorization: Bea
 proposed ──approve──▶ approved ──execute──▶ executed
     │                     │
     └──reject──▶ rejected └──execute(未批准)──▶ 409 approval_required
+
+suppressed ──approve──▶ approved        （运维推翻 critic 的判定）
+     │
+     └──reject──▶ rejected
 ```
+
+`suppressed` 是 critic 抑制掉的提案：**标记而非删除**，因此它是一条真实的行，运维可以查看理由并翻案。审批队列（`GET /actions` 不带 status）默认不返回它，需显式 `?status=suppressed` 查询；翻案时审计条目会带 `overruled_critic: true`。批量端点（`/actions/bulk`）只处理 `proposed`，不提供批量翻案。
 
 `SECURITY__REQUIRE_ACTION_APPROVAL=false` 时，`proposed` 可直接 `execute`（**仅用于本地实验**）。
 

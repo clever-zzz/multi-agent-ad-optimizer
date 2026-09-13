@@ -98,13 +98,20 @@ class ActionService:
         claims: TokenClaims,
         client: dict[str, str] | None = None,
     ) -> OptimizationAction:
-        """Approve a proposal so it may be executed."""
+        """Approve a proposal so it may be executed.
+
+        A ``suppressed`` proposal is approvable on purpose: the critic marks
+        rather than deletes precisely so an operator can disagree with it. The
+        override is flagged in the audit row so "who overruled the critic" is a
+        question the trail can answer.
+        """
         require_permission(Permission.ACTION_APPROVE, claims)
         action = await self._actions.get_or_raise(action_id)
 
-        if action.status != ActionStatus.PROPOSED.value:
+        if action.status not in (ActionStatus.PROPOSED.value, ActionStatus.SUPPRESSED.value):
             raise ConflictError("Action is already " + action.status)
 
+        overruled_critic = action.status == ActionStatus.SUPPRESSED.value
         before = {"status": action.status}
         action.status = ActionStatus.APPROVED.value
         action.approved_by = claims.subject
@@ -117,10 +124,19 @@ class ActionService:
             resource_id=action.id,
             claims=claims,
             before=before,
-            after={"status": action.status, "action_type": action.action_type},
+            after={
+                "status": action.status,
+                "action_type": action.action_type,
+                "overruled_critic": overruled_critic,
+            },
             client=client,
         )
-        logger.info("action_approved", action_id=action.id, actor=claims.subject)
+        logger.info(
+            "action_approved",
+            action_id=action.id,
+            actor=claims.subject,
+            overruled_critic=overruled_critic,
+        )
         return action
 
     async def reject(
@@ -135,7 +151,11 @@ class ActionService:
         require_permission(Permission.ACTION_APPROVE, claims)
         action = await self._actions.get_or_raise(action_id)
 
-        if action.status not in (ActionStatus.PROPOSED.value, ActionStatus.APPROVED.value):
+        if action.status not in (
+            ActionStatus.PROPOSED.value,
+            ActionStatus.APPROVED.value,
+            ActionStatus.SUPPRESSED.value,
+        ):
             raise ConflictError("Action is already " + action.status)
 
         before = {"status": action.status}

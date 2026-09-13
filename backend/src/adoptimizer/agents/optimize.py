@@ -83,6 +83,7 @@ class OptimizeAgent(BaseAgent):
             max_change_pct=context.optimization.max_budget_change_pct / 100.0,
             daily_budgets=context.daily_budgets,
             cross_check_with_solver=context.optimization.use_convex_solver,
+            no_decrease=self._at_or_above_target(snapshots, context),
         )
         actions.extend(self._budget_actions(allocations, iteration))
         actions.extend(self._bid_actions(decisions, iteration))
@@ -266,6 +267,9 @@ class OptimizeAgent(BaseAgent):
         after_value: str = "",
         creative_id: str | None = None,
         severity: str = "",
+        direction: str = "",
+        basis: dict[str, Any] | None = None,
+        urgency: float = 0.0,
     ) -> dict[str, Any]:
         return {
             "id": new_id("act"),
@@ -284,6 +288,16 @@ class OptimizeAgent(BaseAgent):
             # a fired anomaly rule stands behind the proposal, which is a
             # different claim than "the delivery sample was large enough".
             "severity": severity,
+            # How far past its threshold the anomaly is, continuous rather than
+            # the three-valued severity. The critic uses it to give a *clearly*
+            # critical anomaly absolute precedence without handing that power to
+            # one that only just crossed the line.
+            "urgency": round(float(urgency), 4),
+            # Which way spend moves, and the reference frame that decided it.
+            # Structured rather than left in the prose so the critic can tell an
+            # opposing pair from a coherent one.
+            "direction": direction,
+            "basis": dict(basis or {}),
         }
 
     def _creative_actions(
@@ -348,6 +362,25 @@ class OptimizeAgent(BaseAgent):
                 )
         return actions
 
+    def _at_or_above_target(
+        self, snapshots: list[PerformanceSnapshot], context: AgentContext
+    ) -> set[str]:
+        """Campaigns already meeting their ROAS target.
+
+        Their budget is not cut. The bid agent judges a campaign against this
+        same target, so without the guard one run could raise a campaign's bid
+        because it clears its target and halve its budget because it trails the
+        portfolio - two proposals that are individually defensible and jointly
+        incoherent.
+        """
+        protected: set[str] = set()
+        for snapshot in snapshots:
+            targets = context.campaign_targets.get(snapshot.campaign_id, {})
+            target = float(targets.get("target_roas", context.optimization.default_target_roas))
+            if target > 0 and snapshot.roas >= target:
+                protected.add(snapshot.campaign_id)
+        return protected
+
     def _budget_actions(self, allocations: list[Any], iteration: int) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
         for allocation in allocations:
@@ -362,6 +395,21 @@ class OptimizeAgent(BaseAgent):
                     reason=allocation.reason,
                     confidence=0.75,
                     iteration=iteration,
+                    direction=(
+                        "increase"
+                        if allocation.recommended_budget > allocation.current_budget
+                        else "decrease"
+                    ),
+                    # Judged against the *portfolio* average rather than the
+                    # campaign's own target, which is why it can disagree with a
+                    # bid proposal that used the target.
+                    basis={
+                        "metric": "roas",
+                        "reference": "portfolio",
+                        "change_pct": round(float(allocation.change_pct), 2),
+                        "score": round(float(allocation.score), 4),
+                        "solver": allocation.solver,
+                    },
                 )
             )
         return actions
@@ -389,6 +437,18 @@ class OptimizeAgent(BaseAgent):
                     ),
                     confidence=float(decision.get("confidence", 0.5) or 0.5),
                     iteration=iteration,
+                    direction="increase" if multiplier > 1.0 else "decrease",
+                    # The reference this was judged against is the campaign's own
+                    # target, not the portfolio. Recording it is what lets the
+                    # critic recognise a bid raise and a budget cut as answers to
+                    # two different questions rather than a coherent plan.
+                    basis={
+                        "metric": "roas",
+                        "reference": "target_roas",
+                        "observed": decision.get("observed_roas"),
+                        "reference_value": decision.get("target_roas"),
+                        "magnitude": round(abs(multiplier - 1.0), 4),
+                    },
                 )
             )
         return actions
