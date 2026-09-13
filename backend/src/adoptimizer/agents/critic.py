@@ -622,11 +622,7 @@ class CriticAgent(BaseAgent):
         # An escalating verdict withholds nothing, so it would be invisible in
         # the withheld-by-kind breakdown above. It still has to be said out loud:
         # it is the one case where the run is waiting on a person.
-        tail = (
-            " " + str(escalated) + " conflict(s) need a human decision."
-            if escalated
-            else ""
-        )
+        tail = " " + str(escalated) + " conflict(s) need a human decision." if escalated else ""
         return self._message(
             "Reviewed "
             + str(proposals)
