@@ -65,6 +65,35 @@ def payload(output: str) -> Any:
     return json.loads(output[start:])
 
 
+class TestLoggingBootstrap:
+    """Settings must drive logging, not the import-time defaults.
+
+    ``get_logger`` configures structlog on first use, which happens at import
+    time - before any settings exist - so it falls back to INFO + JSON. Only
+    ``serve`` used to re-read ``OBSERVABILITY__*`` afterwards, so every other
+    command put an INFO log line on stdout. That is not cosmetic: it breaks
+    anything parsing a command's output, ``payload()`` in this file included.
+    """
+
+    def test_a_command_reconfigures_logging_from_settings(
+        self, cli_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import adoptimizer.cli as cli_module
+
+        configured: list[dict[str, Any]] = []
+
+        def record(**kwargs: Any) -> None:
+            configured.append(kwargs)
+
+        monkeypatch.setattr(cli_module, "configure_logging", record)
+
+        runner.invoke(app, ["migrate"])
+
+        assert configured, "the command never configured logging"
+        assert configured[-1]["level"] == "WARNING"
+        assert configured[-1]["json_logs"] is False
+
+
 class TestDiscovery:
     def test_the_help_lists_every_operator_command(self) -> None:
         result = runner.invoke(app, ["--help"])

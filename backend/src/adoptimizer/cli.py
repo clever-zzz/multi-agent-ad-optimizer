@@ -29,6 +29,27 @@ app = typer.Typer(
     add_completion=False,
 )
 
+
+@app.callback()
+def _configure_logging() -> None:
+    """Reconfigure logging from settings before any command runs.
+
+    ``get_logger`` configures structlog on first use, which happens at import
+    time - before any settings exist - so it falls back to hard-coded defaults
+    (INFO, JSON). Only ``serve`` used to re-read ``OBSERVABILITY__*`` afterwards,
+    which left every other command emitting INFO JSON logs however the operator
+    had configured them. A stray line on stdout is not cosmetic: it breaks
+    anything that parses a command's output, including this project's own CLI
+    tests. ``--help`` never reaches here, so a broken configuration still lets an
+    operator read the usage text.
+    """
+    settings = get_settings()
+    configure_logging(
+        level=settings.observability.log_level,
+        json_logs=settings.observability.json_logs,
+    )
+
+
 logger = get_logger(__name__)
 
 
