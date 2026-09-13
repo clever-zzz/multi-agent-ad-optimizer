@@ -77,10 +77,18 @@ class TestRunLifecycle:
     async def test_the_seeded_data_is_designed_to_produce_work(
         self, completed_run: dict[str, Any]
     ) -> None:
-        """A run that finds nothing cannot prove the loop works."""
+        """A run that finds nothing cannot prove the loop works.
+
+        The budget agent is named separately because it is the easiest one to
+        silence without anything looking broken: every seeded campaign runs far
+        above its 2.0 ROAS target, so a guard that protects all of them leaves
+        the allocator no headroom and it proposes nothing while the run still
+        reports success on the strength of the bid actions.
+        """
         counts = completed_run["summary"]["action_counts"]
         assert sum(counts.values()) > 0
         assert counts
+        assert counts.get("adjust_budget", 0) > 0
 
     async def test_no_campaign_holds_two_contradictory_proposals(
         self, client: httpx.AsyncClient, admin: dict[str, str], completed_run: dict[str, Any]

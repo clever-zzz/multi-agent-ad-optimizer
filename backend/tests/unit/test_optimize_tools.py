@@ -15,7 +15,11 @@ import pytest
 
 from adoptimizer.agents import optimize as optimize_module
 from adoptimizer.agents.base import AgentContext
-from adoptimizer.agents.optimize import MAX_PREFLIGHTS_PER_ITERATION, OptimizeAgent
+from adoptimizer.agents.optimize import (
+    BID_MOVE_THRESHOLD,
+    MAX_PREFLIGHTS_PER_ITERATION,
+    OptimizeAgent,
+)
 from adoptimizer.core.config import (
     DataMode,
     LLMProvider,
@@ -24,6 +28,7 @@ from adoptimizer.core.config import (
     ToolSettings,
 )
 from adoptimizer.domain.enums import ActionType, AlertRule, Platform
+from adoptimizer.domain.kpi import PerformanceSnapshot
 from adoptimizer.infra.ads.mock import MockAdsClient
 from adoptimizer.infra.ads.registry import PlatformRegistry
 from adoptimizer.llm.gateway import build_gateway
@@ -437,3 +442,106 @@ class TestTheMessageReportsTheRehearsal:
         assert "Rehearsed 1 write proposal(s)" in message["content"]
         assert "0 came back blocked" in message["content"]
         assert message["preflights"] == {"attempted": 1, "blocked": 0}
+
+
+def perf_snapshot(campaign_id: str, *, cost: float, revenue: float) -> PerformanceSnapshot:
+    """A mature campaign, so confidence and scale weighting are both maxed out."""
+    return PerformanceSnapshot(
+        campaign_id=campaign_id,
+        campaign_name=campaign_id,
+        impressions=100_000,
+        clicks=3_000,
+        conversions=200,
+        total_cost=cost,
+        total_revenue=revenue,
+    )
+
+
+def bid_decision(campaign_id: str, multiplier: float) -> dict[str, Any]:
+    """One bidding decision in the shape the bidding agent emits."""
+    return {"campaign_id": campaign_id, "multiplier": multiplier}
+
+
+class TestTheBudgetHoldOnlyGuardsARealContradiction:
+    """A campaign on target is protected only when this run also bids it up.
+
+    The guard exists so one run cannot propose "bid more here" and "spend less
+    here" about the same campaign. Protecting every campaign that merely clears
+    its target is far wider, and it backfires: on a portfolio running above
+    target every lower bound gets pinned to its current budget, the allocator is
+    left with no headroom, and the budget agent proposes nothing at all.
+    """
+
+    def test_on_target_with_no_bid_proposal_is_not_held(self, agent: OptimizeAgent) -> None:
+        context = make_context(None, campaign_targets={CAMP_A: {"target_roas": 2.0}})
+
+        held = agent._hold_at_target(
+            [perf_snapshot(CAMP_A, cost=1_000.0, revenue=9_000.0)], [], context
+        )
+
+        assert held == set()
+
+    def test_on_target_and_being_bid_up_is_held(self, agent: OptimizeAgent) -> None:
+        context = make_context(None, campaign_targets={CAMP_A: {"target_roas": 2.0}})
+
+        held = agent._hold_at_target(
+            [perf_snapshot(CAMP_A, cost=1_000.0, revenue=9_000.0)],
+            [bid_decision(CAMP_A, 1.3)],
+            context,
+        )
+
+        assert held == {CAMP_A}
+
+    def test_below_target_is_not_held_even_when_being_bid_up(self, agent: OptimizeAgent) -> None:
+        """The bid agent would not raise this bid, so there is no contradiction."""
+        context = make_context(None, campaign_targets={CAMP_A: {"target_roas": 20.0}})
+
+        held = agent._hold_at_target(
+            [perf_snapshot(CAMP_A, cost=1_000.0, revenue=9_000.0)],
+            [bid_decision(CAMP_A, 1.3)],
+            context,
+        )
+
+        assert held == set()
+
+    def test_a_bid_cut_does_not_hold(self, agent: OptimizeAgent) -> None:
+        """Both proposals spend less here, so they already agree."""
+        context = make_context(None, campaign_targets={CAMP_A: {"target_roas": 2.0}})
+
+        held = agent._hold_at_target(
+            [perf_snapshot(CAMP_A, cost=1_000.0, revenue=9_000.0)],
+            [bid_decision(CAMP_A, 0.6)],
+            context,
+        )
+
+        assert held == set()
+
+    def test_a_campaign_with_no_target_falls_back_to_the_default(
+        self, agent: OptimizeAgent
+    ) -> None:
+        context = make_context(None)
+
+        held = agent._hold_at_target(
+            [perf_snapshot(CAMP_A, cost=1_000.0, revenue=9_000.0)],
+            [bid_decision(CAMP_A, 1.3)],
+            context,
+        )
+
+        assert held == {CAMP_A}
+
+    def test_a_budget_is_held_exactly_when_a_bid_proposal_exists(
+        self, agent: OptimizeAgent
+    ) -> None:
+        """The guard and the bid agent read one threshold, so they cannot drift.
+
+        A hold that fires on a multiplier _bid_actions is about to drop as noise
+        protects a budget for a proposal that does not exist.
+        """
+        context = make_context(None, campaign_targets={CAMP_A: {"target_roas": 2.0}})
+        snapshots = [perf_snapshot(CAMP_A, cost=1_000.0, revenue=9_000.0)]
+
+        for multiplier in (1.0, 1.0 + BID_MOVE_THRESHOLD - 0.001, 1.0 + BID_MOVE_THRESHOLD, 1.3):
+            decisions = [bid_decision(CAMP_A, multiplier)]
+            held = agent._hold_at_target(snapshots, decisions, context)
+            proposed = bool(agent._bid_actions(decisions, iteration=1))
+            assert held == ({CAMP_A} if proposed else set()), multiplier

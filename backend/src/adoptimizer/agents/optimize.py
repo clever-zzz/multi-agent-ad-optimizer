@@ -16,7 +16,7 @@ from typing import Any
 
 from ..core.ids import new_id
 from ..core.logging import get_logger
-from ..domain.budget import allocate, total_delta
+from ..domain.budget import BudgetAllocation, allocate, total_delta
 from ..domain.enums import ActionStatus, ActionType, AgentName, AlertRule, AlertSeverity
 from ..domain.kpi import PerformanceSnapshot
 from ..domain.scoring import should_pause
@@ -53,6 +53,11 @@ REASON_MAX = 200
 # tool budget on rehearsal and leaving none for the monitor's live checks.
 MAX_PREFLIGHTS_PER_ITERATION = 25
 
+# How far a bid multiplier has to move before it counts as a proposal at all.
+# Shared by _bid_actions and the budget guard below, so "this run wants to spend
+# more here" means exactly "a raise-bid proposal is in the queue".
+BID_MOVE_THRESHOLD = 0.05
+
 
 def _budget_value(raw: Any) -> float | None:
     """Parse a proposed budget that may carry a currency symbol."""
@@ -78,13 +83,15 @@ class OptimizeAgent(BaseAgent):
 
         actions: list[dict[str, Any]] = []
         actions.extend(self._creative_actions(snapshots, context, iteration))
+        held_at_target = self._hold_at_target(snapshots, decisions, context)
         allocations = allocate(
             snapshots,
             max_change_pct=context.optimization.max_budget_change_pct / 100.0,
             daily_budgets=context.daily_budgets,
             cross_check_with_solver=context.optimization.use_convex_solver,
-            no_decrease=self._at_or_above_target(snapshots, context),
+            no_decrease=held_at_target,
         )
+        self._log_budget_holds(held_at_target, allocations, context, iteration)
         actions.extend(self._budget_actions(allocations, iteration))
         actions.extend(self._bid_actions(decisions, iteration))
         actions.extend(self._alert_actions(alerts, iteration))
@@ -362,24 +369,80 @@ class OptimizeAgent(BaseAgent):
                 )
         return actions
 
-    def _at_or_above_target(
-        self, snapshots: list[PerformanceSnapshot], context: AgentContext
+    def _hold_at_target(
+        self,
+        snapshots: list[PerformanceSnapshot],
+        decisions: list[dict[str, Any]],
+        context: AgentContext,
     ) -> set[str]:
-        """Campaigns already meeting their ROAS target.
+        """Campaigns whose budget this run must not cut.
 
-        Their budget is not cut. The bid agent judges a campaign against this
-        same target, so without the guard one run could raise a campaign's bid
-        because it clears its target and halve its budget because it trails the
-        portfolio - two proposals that are individually defensible and jointly
-        incoherent.
+        Two conditions, and both are required. The campaign clears its own ROAS
+        target - the same test the bid agent uses - *and* this run is actually
+        proposing to raise its bid. The guard exists to stop one run from saying
+        "bid more here" and "spend less here" about the same campaign, so it only
+        needs to fire where that contradiction would arise.
+
+        Guarding every campaign that merely clears its target is much wider, and
+        it backfires. A real portfolio runs above target most of the time, so
+        every lower bound gets pinned to its current budget, the allocator is
+        left with no headroom, and the budget agent proposes nothing at all - a
+        guard that deletes the very plan it was added to keep coherent.
         """
+        raising = self._raising_bid_ids(decisions)
         protected: set[str] = set()
         for snapshot in snapshots:
+            if snapshot.campaign_id not in raising:
+                continue
             targets = context.campaign_targets.get(snapshot.campaign_id, {})
             target = float(targets.get("target_roas", context.optimization.default_target_roas))
             if target > 0 and snapshot.roas >= target:
                 protected.add(snapshot.campaign_id)
         return protected
+
+    @staticmethod
+    def _raising_bid_ids(decisions: list[dict[str, Any]]) -> set[str]:
+        """Campaigns carrying a raise-bid proposal in this run.
+
+        The threshold matches _bid_actions, so a decision that is about to be
+        dropped as noise cannot be the reason a budget is protected.
+        """
+        return {
+            str(decision.get("campaign_id", ""))
+            for decision in decisions
+            if float(decision.get("multiplier", 1.0) or 1.0) - 1.0 >= BID_MOVE_THRESHOLD
+        }
+
+    def _log_budget_holds(
+        self,
+        held: set[str],
+        allocations: list[BudgetAllocation],
+        context: AgentContext,
+        iteration: int,
+    ) -> None:
+        """Audit which budget holds survived the allocator.
+
+        allocate() releases holds when keeping them would leave it no headroom,
+        so a campaign named here can still be cut. That trade is intended, but
+        an operator reading a cut on a campaign that clears its target deserves
+        the line explaining why.
+        """
+        if not held:
+            return
+        released = sorted(
+            allocation.campaign_id
+            for allocation in allocations
+            if allocation.campaign_id in held and allocation.delta < 0
+        )
+        logger.info(
+            "optimize_budget_holds",
+            run_id=context.run_id,
+            iteration=iteration,
+            held=len(held),
+            kept=len(held) - len(released),
+            released=len(released),
+            released_campaign_ids=released,
+        )
 
     def _budget_actions(self, allocations: list[Any], iteration: int) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
@@ -418,7 +481,7 @@ class OptimizeAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
         for decision in decisions:
             multiplier = float(decision.get("multiplier", 1.0) or 1.0)
-            if abs(multiplier - 1.0) < 0.05:
+            if abs(multiplier - 1.0) < BID_MOVE_THRESHOLD:
                 continue
             direction = "raise" if multiplier > 1.0 else "lower"
             actions.append(
