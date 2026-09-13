@@ -175,3 +175,21 @@ class TestSummariseState:
         state["agent_messages"] = [{"agent": "monitor", "text": "ok"}]
         summary = summarise_state(state, status=RunStatus.SUCCEEDED)
         assert summary["messages"] == [{"agent": "monitor", "text": "ok"}]
+
+    def test_a_run_that_never_reached_the_critic_reports_no_verdicts(self) -> None:
+        """A failed or cancelled run is summarised from the initial state.
+
+        ``execute_run`` only rebinds its ``state`` when the orchestrator returns
+        normally, so a run that raised keeps the initial state and its summary
+        carries zeroed counters. That is what stops a persisted summary from
+        claiming critic verdicts - or proposals - that no row can back, which
+        would reintroduce the bare-count-with-no-detail problem the findings
+        table exists to solve.
+        """
+        summary = summarise_state(initial_state(), status=RunStatus.FAILED)
+
+        assert summary["critic_findings"] == 0
+        assert summary["critic_findings_by_kind"] == {}
+        assert summary["actions"] == 0
+        assert summary["actions_proposed"] == 0
+        assert summary["actions_suppressed"] == 0
