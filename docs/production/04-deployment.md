@@ -434,9 +434,9 @@ main ─▶ 部署到 staging ─▶ 冒烟测试 ─▶ 部署到 production
 **升级**
 
 ```bash
-# Compose
-IMAGE_TAG=v1.1.0 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-docker compose logs -f api          # 确认迁移与启动日志
+# Compose（compose 文件在 deploy/compose/，本节的命令都在仓库根目录执行）
+IMAGE_TAG=v1.1.0 docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.prod.yml up -d
+docker compose -f deploy/compose/docker-compose.yml logs -f api   # 确认迁移与启动日志
 
 # Kubernetes
 kubectl -n adoptimizer create job adoptimizer-migrate-$(date +%s) --from=cronjob/adoptimizer-migrate
@@ -454,7 +454,7 @@ kubectl -n adoptimizer rollout undo deploy/backend
 kubectl -n adoptimizer rollout status deploy/backend
 
 # Compose
-IMAGE_TAG=v1.0.0 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+IMAGE_TAG=v1.0.0 docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.prod.yml up -d
 ```
 
 ⚠️ **代码可以回滚，schema 不一定能。** 回滚前先确认这次发布引入的迁移是否 `downgrade()` 可逆：

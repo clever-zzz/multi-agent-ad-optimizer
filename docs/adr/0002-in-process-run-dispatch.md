@@ -68,7 +68,7 @@ GET /runs/{id}/stream（SSE）
 
 **通往方案 3 的路已经铺好**
 
-`pyproject.toml` 预留了 `worker = ["arq>=0.26"]` extra，`docker-compose.yml` 有 `worker` profile，`execute_run` 的签名被刻意设计成"可以在任何进程里调用"（自己开 session、自己建 context、不依赖请求态）。切换到 arq 只需要：
+`pyproject.toml` 预留了 `worker = ["arq>=0.26"]` extra，`deploy/compose/docker-compose.yml` 有 `worker` profile，`execute_run` 的签名被刻意设计成"可以在任何进程里调用"（自己开 session、自己建 context、不依赖请求态）。切换到 arq 只需要：
 
 1. `_dispatch` 改成 `await redis.enqueue_job("execute_run", run_id, ...)`
 2. 加一个 `worker/` 模块消费该任务
