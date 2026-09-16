@@ -918,6 +918,43 @@ class TestClickHouseDailySource:
         assert "GROUP BY creative_id" in driver.last_sql
         assert "GROUP BY campaign_id, stat_date" not in driver.last_sql
 
+    async def test_a_replayed_window_is_deduped_at_read_time(self) -> None:
+        """Sync is re-runnable, so the read must collapse the versions it leaves.
+
+        ``campaign_daily_metrics`` is a ``ReplacingMergeTree``: replaying the same
+        window inserts a second version of every row, and ClickHouse only drops
+        the superseded one during a background merge it schedules itself. Summing
+        before that merge adds the same delivery twice - impressions, spend and
+        revenue all double while ROAS, a ratio of two equally inflated numbers,
+        still looks sane, so nothing downstream complains. ``FINAL`` is what makes
+        the idempotence ``warehouse sync`` promises hold for readers and not only
+        for the table. The placement is asserted too: ``FROM t WHERE ... FINAL``
+        is a syntax error, so a well-intentioned edit can break this silently.
+        """
+        warehouse, driver = daily_connected()
+
+        await warehouse.campaign_snapshots(None, days=7)
+        await warehouse.timeseries(None, days=7)
+        await warehouse.creative_snapshots("camp_a", days=7)
+
+        reads = [sql for sql, _parameters in driver.queries if "campaign_daily_metrics" in sql]
+        # campaign_snapshots also issues a name lookup against ``campaigns``, so
+        # counting every query would assert against the wrong relation.
+        assert len(reads) == 3
+        for sql in reads:
+            assert "campaign_daily_metrics FINAL WHERE" in sql
+
+    async def test_the_events_source_pays_no_dedup(self) -> None:
+        """``ad_events`` is a plain MergeTree: one row is one delivery, no versions."""
+        warehouse, driver = connected()
+
+        await warehouse.campaign_snapshots(None, days=7)
+        await warehouse.timeseries(None, days=7)
+        await warehouse.creative_snapshots("camp_a", days=7)
+
+        for sql, _parameters in driver.queries:
+            assert "FINAL" not in sql
+
     async def test_the_events_source_reads_the_bare_table(self) -> None:
         """One event is one delivery at one granularity, so no collapse is needed."""
         warehouse, driver = connected()

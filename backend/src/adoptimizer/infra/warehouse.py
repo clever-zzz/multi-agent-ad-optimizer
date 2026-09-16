@@ -338,6 +338,33 @@ class ClickHouseWarehouse:
     def _table(self) -> str:
         return self.DAILY_TABLE if self._source == "daily" else self.EVENTS_TABLE
 
+    @property
+    def _relation(self) -> str:
+        """The qualified table reference, carrying the dedup its engine needs.
+
+        ``campaign_daily_metrics`` is a ``ReplacingMergeTree`` keyed on
+        (campaign_id, creative_id, stat_date), and replacing only happens when
+        ClickHouse gets around to a background merge. Until then a read sees
+        every version of a row, so summing a window adds the same delivery once
+        per replay - and ``warehouse sync`` is documented as re-runnable over a
+        30-day window, which makes that the normal case rather than an edge one.
+        From the second run onwards impressions, spend and revenue all read
+        double while ROAS, a ratio of two equally inflated numbers, still looks
+        perfectly sane, so nothing downstream complains and the inflated totals
+        go straight into the agents' budget and bid scoring. ``FINAL`` collapses
+        to the newest version per key at read time, which is what makes the
+        mirror's idempotence hold for readers and not only for the table.
+
+        This is a different double count from the one ``_delivery_relation``
+        collapses: that one is two granularities of the same money stored side by
+        side, this one is two versions of one row. A query needs both handled.
+
+        ``ad_events`` is a plain ``MergeTree`` - one row is one delivery, with no
+        version to supersede - so it stays the bare table and pays no dedup.
+        """
+        table = "{db:Identifier}." + self._table
+        return table + " FINAL" if self._source == "daily" else table
+
     def _measures(self) -> str:
         """The aggregate expressions, which differ by what the table stores.
 
@@ -453,7 +480,7 @@ class ClickHouseWarehouse:
         The events source needs none of this - one row is one delivery, at one
         granularity - so it stays the bare table, byte for byte.
         """
-        table = "{db:Identifier}." + self._table
+        table = self._relation
         if self._source != "daily":
             return table + " " + where
         per_bucket = ", ".join(
@@ -525,8 +552,8 @@ class ClickHouseWarehouse:
         sql = (
             "SELECT creative_id,"
             + self._measures()
-            + " FROM {db:Identifier}."
-            + self._table
+            + " FROM "
+            + self._relation
             + " "
             + where
             + " GROUP BY creative_id"
