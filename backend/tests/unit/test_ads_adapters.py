@@ -317,6 +317,32 @@ class TestMetaAdsAdapter:
         with pytest.raises(ExternalServiceError, match="not configured"):
             await client.pause_campaign("1", reason="r")
 
+    async def test_access_token_is_never_placed_in_the_query_string(self) -> None:
+        """Regression: every Meta call used to append ``access_token`` to the URL.
+
+        Graph API accepts that spelling, so nothing failed - the credential just
+        landed in access logs and proxy traces, the same leak TikTok had on
+        reads. All five operations are walked because reverting any one call
+        site is enough to bring it back, and a test that checked a single one
+        would not notice.
+        """
+        client, captured = meta_client(
+            httpx.Response(200, json={"success": True, "id": "cr_1", "data": []}),
+            access_token="super-secret-token",
+        )
+
+        await client.update_campaign_budget("c_1", daily_budget=12.34)
+        await client.pause_campaign("c_1", reason="r")
+        await client.resume_campaign("c_1", reason="r")
+        await client.create_creative("page_1", CreativeDraft(headline="h", description="d"))
+        await client.fetch_report("c_1", start_date="2026-09-01", end_date="2026-09-07")
+
+        assert len(captured) == 5
+        for request in captured:
+            assert request.headers["authorization"] == "Bearer super-secret-token"
+            assert "super-secret-token" not in str(request.url)
+            assert "access_token" not in request.url.params
+
     async def test_budget_is_sent_as_integer_cents(self) -> None:
         client, captured = meta_client(httpx.Response(200, json={"success": True}))
 
@@ -328,7 +354,7 @@ class TestMetaAdsAdapter:
         assert str(request.url.copy_with(query=None)) == "https://graph.facebook.com/v21.0/c_1"
         # Meta bills in minor units; sending 12.34 would mean twelve cents.
         assert request.url.params["daily_budget"] == "1234"
-        assert request.url.params["access_token"] == "meta-token"
+        assert request.headers["authorization"] == "Bearer meta-token"
 
     async def test_ad_account_prefix_is_added_exactly_once(self) -> None:
         client, captured = meta_client(

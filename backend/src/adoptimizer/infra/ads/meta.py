@@ -21,7 +21,15 @@ GRAPH_VERSION = "v21.0"
 
 
 class MetaAdsClient(AdsPlatformClient):
-    """Meta ads adapter using a long-lived system user access token."""
+    """Meta ads adapter using a long-lived system user access token.
+
+    The token travels in the ``Authorization`` header on every call, reads
+    included. It is not a query parameter: Graph API accepts ``access_token``
+    in the URL, so nothing would fail - the credential would simply land in
+    access logs and proxy traces. ``TikTokAdsClient`` states the same rule for
+    its own header, and the two adapters should not disagree about where a
+    secret may appear.
+    """
 
     platform = Platform.META
 
@@ -42,7 +50,13 @@ class MetaAdsClient(AdsPlatformClient):
         self._app_secret = app_secret
         self.is_configured = bool(access_token and ad_account_id)
         self._http = (
-            PlatformHTTPClient(GRAPH_BASE, timeout_seconds=30.0, max_retries=3, transport=transport)
+            PlatformHTTPClient(
+                GRAPH_BASE,
+                timeout_seconds=30.0,
+                max_retries=3,
+                headers=self._headers(),
+                transport=transport,
+            )
             if self.is_configured
             else None
         )
@@ -56,11 +70,11 @@ class MetaAdsClient(AdsPlatformClient):
             )
         return self._http
 
-    def _auth_params(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        params: dict[str, Any] = {"access_token": self._access_token}
-        if extra:
-            params.update(extra)
-        return params
+    def _headers(self) -> dict[str, str]:
+        """Auth header sent on every request; empty when unconfigured."""
+        if not self._access_token:
+            return {}
+        return {"Authorization": "Bearer " + self._access_token}
 
     async def update_campaign_budget(
         self, external_id: str, *, daily_budget: float
@@ -69,7 +83,7 @@ class MetaAdsClient(AdsPlatformClient):
         payload = await client.request(
             "POST",
             "/" + GRAPH_VERSION + "/" + external_id,
-            params=self._auth_params({"daily_budget": round(daily_budget * 100)}),
+            params={"daily_budget": round(daily_budget * 100)},
         )
         return ExecutionResult(
             success=bool(payload.get("success", True)),
@@ -86,7 +100,7 @@ class MetaAdsClient(AdsPlatformClient):
         payload = await client.request(
             "POST",
             "/" + GRAPH_VERSION + "/" + external_id,
-            params=self._auth_params({"status": status}),
+            params={"status": status},
         )
         return ExecutionResult(
             success=bool(payload.get("success", True)),
@@ -131,9 +145,7 @@ class MetaAdsClient(AdsPlatformClient):
         payload = await client.request(
             "POST",
             "/" + GRAPH_VERSION + "/" + self._ad_account_id + "/adcreatives",
-            params=self._auth_params(
-                {"name": draft.headline[:100], "object_story_spec": json.dumps(spec)}
-            ),
+            params={"name": draft.headline[:100], "object_story_spec": json.dumps(spec)},
         )
         return ExecutionResult(
             success="id" in payload,
@@ -150,13 +162,11 @@ class MetaAdsClient(AdsPlatformClient):
         payload = await client.request(
             "GET",
             "/" + GRAPH_VERSION + "/" + external_id + "/insights",
-            params=self._auth_params(
-                {
-                    "time_range": '{"since":"' + start_date + '","until":"' + end_date + '"}',
-                    "time_increment": 1,
-                    "fields": "impressions,clicks,actions,spend,date_start,date_stop",
-                }
-            ),
+            params={
+                "time_range": '{"since":"' + start_date + '","until":"' + end_date + '"}',
+                "time_increment": 1,
+                "fields": "impressions,clicks,actions,spend,date_start,date_stop",
+            },
         )
         rows = [self._normalise_row(row) for row in payload.get("data", [])]
         return {"campaign_id": external_id, "source": "meta", "rows": rows}
