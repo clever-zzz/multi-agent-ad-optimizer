@@ -49,12 +49,12 @@
 | 约束 | 后果 | 缓解 |
 |---|---|---|
 | `UVICORN_WORKERS` 必须为 1 | 单副本吞吐受限于一个事件循环 | 加副本 |
-| run 在执行它的进程里 | 副本崩溃 = 该 run 丢失 | 启动时 `reap_stale_runs` 标记为 failed，需人工重跑 |
+| run 在执行它的进程里 | 副本崩溃 = 该 run 丢失 | 启动时与每 10 分钟的周期任务都跑 `reap_stale_runs`，标记为 failed，需人工重跑 |
 | SSE 实时尾流是进程内的 | 请求落到别的副本时，实时性退化为约 60s 批量补齐 | Ingress cookie 亲和（清单已配） |
-| 令牌桶在进程内 | 全局限流上限 = `limit × 副本数` | 换成 Redis 后端 |
+| 限流是进程内固定窗口 | 全局限流上限 = `limit × 副本数`，且窗口交界处最坏可放过 2× limit | 换成 Redis 后端，并顺带把已写好但零调用的 `CacheService.rate_limit()` 接上 |
 | 无跨进程并发上限 | 无法限制"全系统同时最多 N 个 run" | 只有按主体的 `OPTIMIZE_RUNS_PER_HOUR` |
 
-**已经做对的**：SSE 以持久化的 `run_events` 为权威源，所以重启后重连能补齐完整时间线；协作式取消让跨副本的 cancel 也能生效；`mark_finished` 拒绝覆盖已终态的 run。
+**已经做对的**：SSE 以持久化的 `run_events` 为权威源，所以重启后重连能补齐完整时间线；协作式取消让跨副本的 cancel 也能生效；`mark_finished` 拒绝覆盖已终态的 run；`reap_stale_runs` 的判据是"最后一次事件的时间"（`COALESCE(max(run_events.created_at), started_at, created_at)`）而不是创建时间，所以慢但还在出事件的 run 不会被误杀，回收时也会 `close_run` 关掉挂着的 SSE 流。
 
 ### 🟢 2.2 没有常驻 worker
 
@@ -66,25 +66,51 @@
 
 `MemorySaver` 意味着进程重启后无法从断点续跑。对当前的短闭环（几十秒）影响很小；如果将来单次要跑几十分钟，需要换成持久化 checkpointer。
 
+**内存占用是有界的**：run 收尾时会调 `orchestrator.forget_run(run_id)` → `adelete_thread`，把该 thread 的全部快照丢掉。以前没有这一步，而全仓又没有任何续跑路径，checkpointer 会随进程存活期单调增长。清理失败只记一条 warning，绝不让一个已经跑完的 run 因为收尾动作而变成 failed；checkpointer 没有 `adelete_thread`（或根本没配）时是 no-op 而不是报错。
+
+**要把这条限制读准：丢的是「续跑能力」，不是「可审计性」。** 图状态不持久，但图产出的决策全部落库——提案在 `optimization_actions`（被 critic 抑制的以 `suppressed` 状态保留，不删除），裁决在 `critic_findings`（含理由与被抑制提案原文），事件在 `run_events`（SSE 重连靠它回放）。运维因此始终能回答「谁在什么时候基于什么数据做了什么、critic 为什么拦下它」，也能对 `suppressed` 的提案 approve 翻案（审计带 `overruled_critic: true`）。
+
 ---
 
 ## 3. 数据与分析
 
-### 🔴 3.1 ClickHouse 路径未经真实数据量验证
+### 🟡 3.1 ClickHouse 路径有写入入口了，但仍未经真实数据量验证
 
 `infra/warehouse.py` 与 `init-scripts/clickhouse/` 提供了 schema 与查询实现，`DATA_MODE=warehouse` 可以切换。查询构造、绑定参数、以及连不上库时的降级路径都有测试覆盖（用一个假驱动，见 `tests/integration/test_warehouse.py`），但**没有任何真实数据量下的压测数据**。
 
-未验证的点：高基数维度下的查询延迟、`audience_observations` 的真实数据来源与口径、物化视图是否需要、以及从广告平台到 ClickHouse 的**采集管道仍然不存在**（当前假设数据已经在库里）。
+**已解决的部分（2026-09-15）**：原先"从广告平台到 ClickHouse 的采集管道不存在"这条已经不成立了。写入侧现在由 `infra/analytics/`（`AnalyticsSink` 协议 + `ClickHouseSink` + `NullSink`）与 `services/warehouse_sync.py` 承担，入口是：
 
-到**运营库**（`daily_metrics`）的采集入口已经落地，见 §3.5，但它写的是 PostgreSQL / SQLite 这一侧，**不写 ClickHouse**——两条路径的数据量级差着几个数量级，运营库入口跑得通不代表仓库路径跑得通。
+```bash
+adoptimizer warehouse status                    # 预检仓库是否可写
+adoptimizer warehouse sync --days 30 --dry-run  # 先看会搬多少行
+adoptimizer warehouse sync --days 30            # 真正镜像
+```
 
-**投产前**：采集方案已经有了可挂载的框架（`MetricSource` 协议 + `POST /ingest/metrics`），剩下的是把真实平台接上去，再做数据量评估。
+实施时发现了一个比"缺写入代码"更根本的约束：**平台 API 返回的是日报，不是事件流**。把日报展开成 `ad_events` 的事件行，等于为每次曝光合成一行并编造成本分摊。所以补的是两条路径：
+
+- `ad_events` —— 真实事件流，写入器已就绪，等事件流接入；
+- `campaign_daily_metrics`（**新增**，`init-scripts/clickhouse/02_daily_metrics.sql`）—— 日报聚合，**今天就能灌**，是当前主路径。
+
+读侧新增 `CLICKHOUSE__METRICS_SOURCE=events|daily`（默认 `events`，不让已有部署的读取行为在脚下改变）。
+
+**镜像把双粒度也一起带过去了，这一点必须点名。** `MetricRepository.export_daily` 刻意**不做槽位合并**——搬运时合并等于把创意明细丢掉，镜像就成了有损副本，回填也就失去意义。于是 `campaign_daily_metrics` 里同样并存着活动级汇总行（`creative_id` 是**空串**，因为 `String` 列没有 NULL 语义）与创意明细行，`daily` 源的读取器必须自己再塌缩一次：`ClickHouseWarehouse._delivery_relation()` 先按 `(campaign_id, stat_date)` 收敛成一行，汇总行优先、明细兜底，外层才 `sum()`。漏掉这一步每个 KPI 都翻倍且不报错，和主库当年那个坑是同一个。详见 `docs/production/02-architecture.md` §5.1 与 `docs/tutorial/04-clickhouse-guide.md` §6.3。
+
+**仍未验证的点**：高基数维度下的查询延迟、`audience_observations` 的真实数据来源与口径、物化视图是否需要、以及在目标量级（建议先定 1 亿行）下的 P95。
+
+**降级可见性**：读路径连不上库时仍降级到空结果（这是刻意的——仓库故障不该拖垮优化循环），但每次降级现在都计入 `warehouse_reads_total{outcome="degraded"}`，不再无声。写入路径相反：连不上就抛错，因为静默的写失败会丢掉没有第二份副本的数据。
+
+**投产前**：接入真实平台数据，再做数据量评估。
 
 ### 🟡 3.2 `run_events` 没有保留期策略
 
 这张表增长最快，而 `POST /admin/prune` 只清理 `audit_logs` 与 `idempotency_records`。
 
-同样没有自动回收的：`llm_spend`、过期的 `refresh_sessions`。
+同样没有自动回收的：`llm_spend`、`critic_findings`、过期的 `refresh_sessions`。
+
+`critic_findings` 尤其值得点名：它每次 run × 每迭代 × 每条裁决一行，而 `suppressed_actions`
+存的是**被抑制提案的原文 JSON**，单行可能比 `run_events` 还大；而且它的 `run_id` 是
+`ON DELETE SET NULL`，删 run 不会连带删裁决，孤儿行会一直留着。
+把它纳入 `prune` 的成本很低（和 `audit_logs` 同一个 `created_at` 语义），属于该顺手做掉的事。
 
 临时处置见 [05 运维手册 §5](05-operations-runbook.md#5-容量与数据增长)。路线图里 P1。
 
@@ -121,7 +147,7 @@
 - **调度本身没有被真实平台验证过。** 窗口算术、水位、租约、错过策略都有测试；但"一个真实平台在一次拉取里要多久、会不会超时、能不能扛住 6 小时一次的节奏"要等 P0-2 的真账号才知道。`INGEST__LEASE_TTL_SECONDS`（1800）与 CronJob 的 `activeDeadlineSeconds`（1800）都是按估计给的，联调后应当按实测收紧
 - **推送侧没有幂等键。** 同一批推两次，第二次全部记为 `updated`；没有 `Idempotency-Key`，也没有基于内容的去重（同 §6.6）
 - **`revenue` 只能靠推送。** 平台源永远不声称 revenue（它真的不知道），所以 ROAS 相关的决策依赖你自己把收入数据推进来。这是设计，不是缺陷——但意味着**只接平台源的系统算不出真实 ROAS**
-- **ClickHouse 那一侧没有入口。** 见 §3.1
+- ~~**ClickHouse 那一侧没有入口。**~~ ✅ **已解决（2026-09-15）**：`adoptimizer warehouse sync` 把 `daily_metrics` 镜像进 `campaign_daily_metrics`，见 §3.1
 
 ---
 
@@ -141,7 +167,7 @@
 
 ### 🟢 4.2 预算护栏是月度累计，不是实时
 
-`llm_spend` 表按调用记账，`LLM__MONTHLY_BUDGET_USD` 超限后按 `fail_open_to_mock` 决定降级还是失败。多副本下累计是准的（都写同一个库），但判定不是原子的，极端并发下可能略微超出。
+`llm_spend` 表按调用记账，`LLM__MONTHLY_BUDGET_USD` 超限后**一律抛 `BudgetExceededError`（HTTP 402）**，与 `fail_open_to_mock` 无关——那个开关只管"供应商调用重试打满后是否退到 mock provider"，而预算守卫在 `complete()` 第一步就抛了，走不到降级分支。多副本下累计是准的（都写同一个库），但判定不是原子的，极端并发下可能略微超出。
 
 **单价同样是近似值**：记账用的是 `llm/base.py` 的 `DEFAULT_PRICING`（USD 国际标价）而不是厂商回传的账单金额，因此阶梯计价、缓存命中折扣、区域计价（中国区按 CNY）都不会自动反映出来。用 `LLM__PRICING` 把实际单价写死是唯一可靠的办法，并定期与厂商账单对一次。没写就按 `default` 行估算，启动日志会给一条 `llm_model_has_no_pricing_entry` 警告。
 
@@ -161,13 +187,15 @@
 - 没有框选缩放、联动筛选这类交互
 - 新增图表类型的成本比引库高
 
-### 🟢 5.2 无国际化
+### 🟢 5.2 国际化已落地（已解决）
 
-界面文案硬编码中文/英文混排。要多语言需要引入 i18n 框架并把文案抽出来。
+自研的轻量 i18n，没有引第三方框架：`frontend/src/i18n/` 提供 `I18nProvider` / `useI18n`，**英文原文即 key**，`zh-CN` 走 `locales/zh.ts` 词典查表，未命中回落原文而不是抛错或显示空白。支持 `en` 与 `zh-CN` 两种 locale，偏好写 `localStorage` 并在刷新后恢复，首次访问按 `navigator.language` 探测。`translate.ts` 另外暴露模块级的 `tStatic` / `setActiveLocale`，让非 React 路径（纯格式化函数、class 组件）也能本地化；`options.ts` 的 `localizeOptions` 让下拉选项的 `value` 保持字面量联合类型、只有 label 参与翻译。
+
+仍然没做的：没有复数与性别规则、没有 ICU MessageFormat、没有翻译完整性校验（漏翻只会静默显示英文原文，不会报错）。
 
 ### 🟡 5.3 前端测试覆盖偏薄
 
-6 个测试文件，集中在纯函数（格式化、图表几何、口令策略）、HTTP 客户端与认证状态机。**没有**整页渲染测试、路由测试、E2E 测试。
+10 个测试文件 / 109 个用例，集中在纯函数（格式化、图表几何、口令策略）、HTTP 客户端、认证状态机、i18n 查表与 UI 组件集（Button / Table / Pagination / StatusPill / Modal / BarList / Donut / Sparkline）。`App.test.tsx` 会把整个 `<App />` 挂进 `MemoryRouter` 渲染，覆盖受保护路由的会话重建（硬刷新不再卡在 spinner、并发 hydrate 收敛成一次 refresh、refresh 被拒时回落匿名）。**没有** E2E 测试，页面级的数据流与交互断言也还很薄。
 
 `SettingsPage` 的账号管理弹窗、`RunDetailPage` 的 SSE 时间线这类交互，目前只靠 [07 §6 的手工清单](07-testing-and-ci.md#6-手工端到端验收清单)覆盖。
 
@@ -199,7 +227,7 @@
 
 ### 🟢 6.4 限流不防分布式暴力破解
 
-令牌桶按认证主体计，匿名请求按 IP 计。有代理池的攻击者可以绕过 IP 维度。账号锁定（5 次 / 15 分钟）是主要防线，配合 ingress 层的 WAF/IP 白名单更稳。
+限流按认证主体计，匿名请求按 IP 计。有代理池的攻击者可以绕过 IP 维度。账号锁定（5 次 / 15 分钟）是主要防线，配合 ingress 层的 WAF/IP 白名单更稳。
 
 ### 🟡 6.5 「全设备登出」后端已就绪，UI 没有入口
 
@@ -249,15 +277,18 @@ SQLite 开发库首次启动会自动 `create_all()` 并写入 `alembic_version`
 
 **防线（已落地）**：CI 的 `migrations` job 用 PostgreSQL service container 跑 `alembic upgrade head → alembic check → alembic downgrade base → alembic upgrade head`，autogenerate 一旦检测到漂移就让 CI 变红；`backend` job 另外用一次性 SQLite 验证同一条链路可升级、可回滚。本地等价命令是 `.\scripts\check.ps1`（`migrations` 门禁）或 `make verify-migrations`，两者都指向临时库，不会碰你配置里的数据库。
 
-### 🟢 7.2 遗留代码仍在仓库里
+### ✅ 7.2 遗留 demo 已移除（原「遗留代码仍在仓库里」）
 
-`python/`、`java/`、`golang/` 是原始 demo 实现（Streamlit / Spring Boot / goroutine），`docs/interview/`、`docs/tutorial/`、`docs/code-walkthrough/` 是配套的教学与面试材料。
+仓库早期带有 `python/`（Streamlit demo）、`java/`（Spring Boot demo）、`golang/`（goroutine demo）
+三套教学实现，以及配套的 `docs/code-walkthrough/`、`docs/architecture.md`（早期架构稿）、
+`docs/plan.md`（原始规划）与 `docs/interview/legacy-readme.md`（旧版 demo README）。
+它们不参与生产部署、不被 CI 覆盖，但带来两个实际成本：仓库体积（含一个 288MB 的虚拟环境），
+以及**入门教程指向旧代码**——`docs/tutorial/` 五份教程当时全部引用 `python/src/orchestrator/supervisor.py`
+的五 Agent 拓扑，与生产代码的六 Agent（含 critic）拓扑不一致，照教程读会漏掉整个复核环节。
 
-它们**不参与生产部署**，也不被 CI 覆盖。保留是因为有教学价值。如果你要把这个仓库当作严肃的生产项目对外，建议：
-
-- 把它们移到 `legacy/` 目录下，或
-- 拆成独立仓库，或
-- 至少在根 README 里保持现在的明确标注（已做）
+**已全部移除**，并把 `docs/tutorial/` 五份教程重写为对齐 `backend/src/adoptimizer/` 的版本。
+移除后全量测试仍为全绿，CI 与部署路径不受影响（两者本来就只覆盖 `backend/` 与 `frontend/`）。
+历史实现可从 git 历史中取回。
 
 ### 🟢 7.3 没有 CHANGELOG 与语义化版本流程
 
@@ -284,6 +315,7 @@ SQLite 开发库首次启动会自动 `create_all()` 并写入 `alembic_version`
 | 3 | ~~CI 增加 `alembic upgrade head && alembic check`~~ ✅ **已完成** | `.github/workflows/ci.yml` 的 `migrations` job（PostgreSQL service container）已落地，`backend` job 另有 SQLite 可逆性验证 |
 | 4 | 依赖漏洞扫描（`pip-audit` + `npm audit`）进 CI | 高危 CVE 阻塞合并 |
 | 5 | 生产环境冒烟脚本化 | [07 §6](07-testing-and-ci.md#6-手工端到端验收清单) 里可自动化的部分变成一个脚本 |
+| 6 | ~~平台适配器的 HTTP 层直测（P0-2 的前置条件）~~ ✅ **已完成** | `tests/unit/test_ads_adapters.py`（37 用例）用 `httpx.MockTransport` 断言每个适配器的请求路径、请求头与请求体，并覆盖 401 / 429 / 非 JSON 等错误分支。**过程中修掉三个真实缺陷**：TikTok 写操作不带凭据、TikTok 读操作把 token 放进 query string、Meta 把 `object_story_spec` 序列化成 Python repr。详见 [09 §S0.1](09-upgrade-path.md) |
 
 ### P1 — 上线后一个月内
 
@@ -305,7 +337,7 @@ SQLite 开发库首次启动会自动 `create_all()` 并写入 `alembic_version`
 |---|---|---|
 | 15 | 迁移到 arq/Celery 队列 + 常驻 worker | 需要 run 必达 SLA，或单副本吞吐成瓶颈 |
 | 16 | EventBus 换 Redis Pub/Sub | 多副本且 cookie 亲和不可用 |
-| 17 | ClickHouse 采集管道 + 真实数据量压测 | 决定启用 `DATA_MODE=warehouse` |
+| 17 | ClickHouse 采集管道 + 真实数据量压测 | 决定启用 `DATA_MODE=warehouse`。**写入管道已完成（2026-09-15）**：`infra/analytics/` + `services/warehouse_sync.py` + `adoptimizer warehouse sync`，见 §3.1。剩下的是真实数据量压测 |
 | 18 | SSO/OIDC 集成 | 企业身份体系要求 |
 | 19 | 多租户 + 资源级授权 | 要服务多个团队/客户 |
 | 20 | 审计日志哈希链或外发到 WORM 存储 | 合规要求法务级证据 |

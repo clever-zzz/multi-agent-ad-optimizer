@@ -141,15 +141,32 @@ INGEST_LAG_DAYS = Gauge(
     registry=REGISTRY,
 )
 
-ACTIVE_RUNS = Gauge(
-    "active_optimization_runs",
-    "Optimization runs currently executing in this process.",
+WAREHOUSE_READS_TOTAL = Counter(
+    "warehouse_reads_total",
+    "Analytical reads by outcome. 'ok' served rows, 'empty' found none and "
+    "'degraded' could not reach the warehouse and fell back to the primary "
+    "datastore. Degrading is the right behaviour - a warehouse outage must not "
+    "take the optimization loop down with it - but it is invisible by design, "
+    "which is exactly why it needs a counter: a steady 'degraded' rate means "
+    "every report is silently reading a different source than the operator "
+    "thinks it is.",
+    labelnames=("backend", "outcome"),
     registry=REGISTRY,
 )
 
-QUEUE_DEPTH = Gauge(
-    "job_queue_depth",
-    "Pending background jobs.",
+WAREHOUSE_WRITES_TOTAL = Counter(
+    "warehouse_writes_total",
+    "Analytical rows offered to the warehouse write path, by table and "
+    "disposition. 'written' landed, 'skipped' was refused by column-type "
+    "normalisation and 'failed' means the insert raised. A backfill that "
+    "reports written=0 is the failure this counter exists to make visible.",
+    labelnames=("table", "outcome"),
+    registry=REGISTRY,
+)
+
+ACTIVE_RUNS = Gauge(
+    "active_optimization_runs",
+    "Optimization runs currently executing in this process.",
     registry=REGISTRY,
 )
 

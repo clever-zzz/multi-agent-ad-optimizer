@@ -17,7 +17,7 @@
 约束条件：
 
 - 项目要能"clone 下来就能跑"，不能强依赖一个必须先起好的 broker。
-- 已有 Redis 作为缓存与限流后端，但它是**可选**的（`REDIS__ENABLED=false` 时降级为进程内实现）。
+- 已有 Redis 作为 **LLM 响应缓存**后端，但它是**可选**的（`REDIS__ENABLED=false` 时降级为进程内缓存）。限流与事件总线本来就不走 Redis。
 - 运维人力有限，多一个 worker 部署单元就多一份监控、日志、扩缩容配置。
 
 ## Decision
@@ -54,7 +54,7 @@ GET /runs/{id}/stream（SSE）
 
 - 零额外基础设施。`clone → pip install → adoptimizer serve` 就能跑完整闭环，这对评审、教学、单机部署都是决定性的。
 - SSE 延迟极低（进程内队列，没有 broker 往返）。
-- run 记录先落库再执行，进程崩溃时留下可被 `reap_stale_runs` 回收的持久记录，不会凭空消失。
+- run 记录先落库再执行，进程崩溃时留下可被 `reap_stale_runs` 回收的持久记录，不会凭空消失。回收不只在启动时发生：lifespan 里还挂着 `run_reaper_loop`（默认 10 分钟一扫），所以某个副本崩了、别的副本还活着时，卡住的 run 也会被标记 failed，不用等下一次重启。
 - 因为 SSE 以 `run_events` 表为权威源，**API 重启后重连依然能补齐完整时间线**。
 
 **负面（必须正视）**
@@ -63,7 +63,7 @@ GET /runs/{id}/stream（SSE）
 - **横向扩展要靠多副本**，且实时流体验依赖请求落到执行该 run 的副本。缓解手段：
   - 在 Ingress/负载均衡上开启会话亲和（`nginx.ingress.kubernetes.io/affinity: cookie`）
   - 或者接受"准实时"（≤60s 延迟）的持久回放
-- **进程崩溃 = 正在跑的 run 丢失**，只能靠 reaper 标记为 failed 后重跑。没有 at-least-once 重试语义。
+- **进程崩溃 = 正在跑的 run 丢失**，只能靠 reaper 标记为 failed 后重跑。没有 at-least-once 重试语义。reaper 的判据是"最后一次事件的时间"而不是创建时间，所以它不会误杀跑得慢但仍在推进的 run。
 - **没有跨进程的并发上限**。`RATE_LIMIT__OPTIMIZE_RUNS_PER_HOUR` 是按主体的频率限制，不是全局在跑数量限制；`active_runs` 指标也只反映本进程。
 
 **通往方案 3 的路已经铺好**

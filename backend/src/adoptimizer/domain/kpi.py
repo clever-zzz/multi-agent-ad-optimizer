@@ -7,6 +7,7 @@ API response and every LangGraph checkpoint silently dropped ctr/cvr/cpa/roas.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Self
 
@@ -37,6 +38,61 @@ DAILY_MEASUREMENTS: tuple[str, ...] = (
     "revenue",
     "unique_reach",
 )
+
+
+# Money is stored as Float, so folding many rows together can leave binary noise
+# past the fourth decimal. Every reader rounds to the same precision; without one
+# shared constant two readers over one table disagree in the last bits, and an
+# equality assertion between them fails for a reason nobody can see.
+MONEY_DECIMALS = 4
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledDelivery:
+    """A delivery funnel made physically possible, and whether that took work."""
+
+    impressions: int
+    clicks: int
+    conversions: int
+    cost: float
+    revenue: float
+    repaired: bool
+
+
+def reconcile_delivery(
+    *,
+    impressions: int,
+    clicks: int,
+    conversions: int,
+    cost: float,
+    revenue: float,
+) -> ReconciledDelivery:
+    """Clamp a stored funnel and normalise money, in the one place readers share.
+
+    ``daily_metrics`` lets several feeds assert different columns of the same slot
+    (see ``MetricRepository.upsert_daily``), so a stored row can claim more clicks
+    than impressions even though every ingested record was valid on its own.
+    ``PerformanceSnapshot`` refuses such a funnel outright, so a reader that passes
+    the numbers through unchanged fails a whole run over one unreconciled row.
+
+    Repairing here rather than inside one reader is the point: a clamp that only
+    one of the two warehouse implementations performs is invisible to a consistency
+    test whose fixtures are well formed, which is how the readers drifted apart in
+    the first place. Both now call this, so they cannot disagree.
+
+    ``repaired`` exists so callers can report the repair instead of absorbing it
+    silently. The domain layer does no I/O, so the logging belongs to them.
+    """
+    clamped_clicks = min(clicks, impressions)
+    clamped_conversions = min(conversions, clamped_clicks)
+    return ReconciledDelivery(
+        impressions=impressions,
+        clicks=clamped_clicks,
+        conversions=clamped_conversions,
+        cost=round(cost, MONEY_DECIMALS),
+        revenue=round(revenue, MONEY_DECIMALS),
+        repaired=clamped_clicks != clicks or clamped_conversions != conversions,
+    )
 
 
 class PerformanceSnapshot(BaseModel):

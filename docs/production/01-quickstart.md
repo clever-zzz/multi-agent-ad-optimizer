@@ -42,7 +42,7 @@ cd multi-agent-ad-optimizer
 
 `dev.ps1` 做的事：
 
-1. `adoptimizer migrate`（首次运行会创建 14 张表）
+1. `adoptimizer migrate`（首次运行会创建 19 张表）
 2. `adoptimizer seed`（8 个活动 + 21 天指标 + 管理员账号）
 3. 后台起 uvicorn（`--reload`）与 Vite dev server
 4. 两路日志合并输出，`Ctrl+C` 一起停
@@ -203,7 +203,7 @@ docker compose -f deploy/compose/docker-compose.yml ps      # 等到全部 healt
 docker compose -f deploy/compose/docker-compose.yml --profile worker up -d
 
 # 带 ClickHouse 分析仓库（DATA_MODE=warehouse）
-docker compose -f deploy/compose/docker-compose.yml --profile clickhouse up -d
+docker compose -f deploy/compose/docker-compose.yml --profile analytics up -d
 ```
 
 停止并清数据：

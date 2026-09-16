@@ -412,6 +412,19 @@ class TestUserAdministration:
         )
         assert response.status_code == 409
 
+    async def test_an_admin_may_step_down_once_another_admin_exists(
+        self, client: httpx.AsyncClient, admin_headers: dict[str, str], make_user
+    ) -> None:
+        """The guard refuses the *last* administrator, not any administrator."""
+        await make_user("admin")
+
+        me = (await client.get(AUTH + "/me", headers=admin_headers)).json()
+        response = await client.patch(
+            API + "/admin/users/" + me["id"], json={"role": "viewer"}, headers=admin_headers
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["role"] == "viewer"
+
     async def test_empty_user_patch_is_a_validation_error(
         self, client: httpx.AsyncClient, admin_headers: dict[str, str]
     ) -> None:

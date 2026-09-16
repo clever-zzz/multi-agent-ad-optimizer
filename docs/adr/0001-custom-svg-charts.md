@@ -12,7 +12,7 @@
 
 1. **recharts** — React 生态最常用，声明式，覆盖绝大多数图表类型。
 2. **visx / d3** — 更底层，自由度高，但等于自己写。
-3. **手写 SVG 组件** — 只实现真正需要的四种。
+3. **手写图表组件** — 只实现真正需要的四种，不引任何图表库。
 
 约束条件：
 
@@ -22,19 +22,21 @@
 
 ## Decision
 
-手写四个 SVG 组件 + 一个纯函数工具模块：
+手写四个图表组件（**三个 SVG + 一个 DOM/CSS**）+ 一个纯函数工具模块：
 
 ```
 components/charts/
-  TrendChart.tsx     折线/面积，支持多序列、阈值线、hover tooltip
-  Sparkline.tsx      卡片内的迷你走势，无坐标轴
-  Donut.tsx          环形占比
-  BarList.tsx        排行榜条形
+  TrendChart.tsx     折线/面积，支持多序列、阈值线、hover tooltip   ← SVG
+  Sparkline.tsx      卡片内的迷你走势，无坐标轴                     ← SVG（装饰性）
+  Donut.tsx          环形占比                                       ← SVG
+  BarList.tsx        排行榜条形                                     ← 不是 SVG
   chartUtils.ts      scale/path/格式化等纯函数（有独立单测）
   chartUtils.test.ts
 ```
 
 所有几何计算集中在 `chartUtils.ts`，是**纯函数**，因此可以在 jsdom 里直接单测，不需要渲染。组件本身只负责把算好的坐标画出来。
+
+`BarList` 是四个里唯一不用 SVG 的：排行榜要的是「按值排序的横向对比 + 可读的标签」，没有坐标系，用 `<ul>/<li>` 加一个按百分比宽度的 `<div>` 就够了（`BarList.tsx:52-78`），窄屏还能自然降级；可点击的行是真的 `<button>`（`:86-92`），所以四个组件里它的无障碍性反而最好。本 ADR 的标题沿用「手写 SVG」是简称，准确说法是**手写图表组件，不引图表库**。
 
 同时从 `vite.config.ts` 的 `manualChunks` 里移除 `charts: ["recharts"]`——留着它会让 `npm run build` 去解析一个根本不存在的依赖。
 
@@ -51,7 +53,7 @@ components/charts/
 
 - 需要自己实现坐标轴刻度、hover 命中检测、响应式宽度（用 `useMeasure` hook + ResizeObserver）。这些代码已经写完，但**维护责任在我们**。
 - 新增图表类型的成本比"引个库"高。如果未来需要十几种图表，这个决定应该被重新评估并 supersede。
-- 无障碍需要自己处理：SVG 要显式加 `role="img"` 与 `<title>`，键盘用户拿不到 tooltip。当前实现只做到了前者。
+- 无障碍需要自己处理：SVG 没有文本内容，读屏软件拿不到东西。当前 `TrendChart`（`TrendChart.tsx:148`）与 `Donut`（`Donut.tsx:71`）加了 `role="img"` + `aria-label`，`Sparkline` 按装饰性处理（`aria-hidden="true"`），**但三个 SVG 都没有 `<title>` 子元素，键盘用户也拿不到 tooltip 里的数值**。`BarList` 是真实 DOM 文本，不受这条影响。
 
 **中性**
 

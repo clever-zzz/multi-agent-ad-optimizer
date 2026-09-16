@@ -463,6 +463,24 @@ class TestSemanticRules:
 
         assert problem is not None and "conversions, cost" in problem
 
+    def test_a_funnel_inverted_within_one_record_is_rejected(self) -> None:
+        """A single row claiming more clicks than impressions is never legitimate."""
+        problem = _semantic_problem(record(impressions=100, clicks=500))
+
+        assert problem is not None and "clicks exceed impressions" in problem
+
+    def test_conversions_above_clicks_are_rejected(self) -> None:
+        problem = _semantic_problem(record(clicks=10, conversions=40))
+
+        assert problem is not None and "conversions exceed clicks" in problem
+
+    def test_a_partially_asserted_funnel_is_not_judged(self) -> None:
+        """One feed may assert clicks alone; with no impressions there is nothing to
+        compare against, and a cross-feed inversion is reconciled on read instead."""
+        partial = MetricRecordIn(campaign_id="camp_a", stat_date=utc_today(), clicks=500)
+
+        assert _semantic_problem(partial) is None
+
     def test_a_record_that_measures_nothing_is_rejected(self) -> None:
         empty = MetricRecordIn(campaign_id="camp_a", stat_date=utc_today())
 

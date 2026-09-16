@@ -448,6 +448,23 @@ def _semantic_problem(record: MetricRecordIn) -> str | None:
     if negative:
         return "negative value for " + ", ".join(negative)
 
+    # Only decidable when one record asserts both sides of the funnel. Several
+    # feeds may write different columns of the same slot, so an inversion can also
+    # appear in storage without any single record having been invalid; that case
+    # is reconciled on read by ``domain.kpi.reconcile_delivery``.
+    if (
+        record.impressions is not None
+        and record.clicks is not None
+        and record.clicks > record.impressions
+    ):
+        return "clicks exceed impressions within one record"
+    if (
+        record.clicks is not None
+        and record.conversions is not None
+        and record.conversions > record.clicks
+    ):
+        return "conversions exceed clicks within one record"
+
     if not record.measurements_present():
         return "record asserts no measurements; every column is absent"
 

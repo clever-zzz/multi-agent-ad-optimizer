@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..core.clock import utc_today
 from ..core.config import ClickHouseSettings, get_settings
 from ..core.logging import get_logger
+from ..core.metrics import WAREHOUSE_READS_TOTAL
 from ..domain.audience import SegmentObservation
-from ..domain.kpi import PerformanceSnapshot
+from ..domain.kpi import PerformanceSnapshot, reconcile_delivery
 from .db.models import Campaign, DailyMetric
 
 logger = get_logger(__name__)
@@ -32,6 +33,51 @@ def _accumulate(target: dict[str, Any], row: dict[str, Any]) -> None:
     """Add one slot's measures into a running total."""
     for measure in MEASURES:
         target[measure] = target.get(measure, 0) + row[measure]
+
+
+def _reconciled_snapshot(
+    reader: str,
+    *,
+    campaign_id: str,
+    campaign_name: str,
+    impressions: int,
+    clicks: int,
+    conversions: int,
+    cost: float,
+    revenue: float,
+) -> PerformanceSnapshot:
+    """Build a snapshot through the shared funnel repair, reporting any repair.
+
+    Both warehouse implementations and the primary-datastore reader reconcile
+    through ``domain.kpi.reconcile_delivery`` so they cannot drift apart. This
+    wrapper exists so that neither implementation has to remember to also report
+    it: a repair means two feeds disagreed about the same slot, and that is worth
+    a log line rather than a silently corrected number.
+    """
+    delivery = reconcile_delivery(
+        impressions=impressions,
+        clicks=clicks,
+        conversions=conversions,
+        cost=cost,
+        revenue=revenue,
+    )
+    if delivery.repaired:
+        logger.warning(
+            "funnel_reconciled",
+            reader=reader,
+            campaign_id=campaign_id,
+            clicks=clicks,
+            impressions=delivery.impressions,
+        )
+    return PerformanceSnapshot(
+        campaign_id=campaign_id,
+        campaign_name=campaign_name,
+        impressions=delivery.impressions,
+        clicks=delivery.clicks,
+        conversions=delivery.conversions,
+        total_cost=delivery.cost,
+        total_revenue=delivery.revenue,
+    )
 
 
 class MetricsWarehouse(Protocol):
@@ -164,14 +210,15 @@ class SqlAggregateWarehouse:
             names.setdefault(bucket, str(row.get("name", "")))
 
         return [
-            PerformanceSnapshot(
+            _reconciled_snapshot(
+                self.name,
                 campaign_id=bucket,
                 campaign_name=names[bucket],
                 impressions=int(totals[bucket]["impressions"]),
                 clicks=int(totals[bucket]["clicks"]),
                 conversions=int(totals[bucket]["conversions"]),
-                total_cost=float(totals[bucket]["cost"]),
-                total_revenue=float(totals[bucket]["revenue"]),
+                cost=float(totals[bucket]["cost"]),
+                revenue=float(totals[bucket]["revenue"]),
             )
             for bucket in sorted(totals)
         ]
@@ -254,9 +301,26 @@ class SqlAggregateWarehouse:
 
 
 class ClickHouseWarehouse:
-    """Reads the analytical warehouse. Requires the clickhouse extra."""
+    """Reads the analytical warehouse. Requires the clickhouse extra.
+
+    Two sources are supported, chosen by ``CLICKHOUSE__METRICS_SOURCE``:
+
+    * ``events`` (default) reads the raw ``ad_events`` stream. This is the
+      richer shape - it carries device, country and gender, so audience
+      breakdowns are real rather than a fallback.
+    * ``daily`` reads ``campaign_daily_metrics``, the aggregate table the
+      ingestion path can populate today. Demographics are absent there by
+      construction, so ``audience_observations`` degrades to the campaign split
+      and says so.
+
+    The default stays ``events`` so that turning this on does not silently
+    change what an existing deployment reads.
+    """
 
     name = "clickhouse"
+
+    EVENTS_TABLE = "ad_events"
+    DAILY_TABLE = "campaign_daily_metrics"
 
     # Demographic columns available on the events table.
     DIMENSIONS: tuple[str, ...] = ("device", "country", "age_group", "gender")
@@ -264,6 +328,41 @@ class ClickHouseWarehouse:
     def __init__(self, settings: ClickHouseSettings) -> None:
         self._settings = settings
         self._client: Any = None
+        self._source = settings.metrics_source
+
+    @property
+    def source(self) -> str:
+        return self._source
+
+    @property
+    def _table(self) -> str:
+        return self.DAILY_TABLE if self._source == "daily" else self.EVENTS_TABLE
+
+    def _measures(self) -> str:
+        """The aggregate expressions, which differ by what the table stores.
+
+        ``ad_events`` holds one row per delivery, so counting is the aggregate.
+        ``campaign_daily_metrics`` already holds totals, so summing is - over the
+        relation ``_delivery_relation`` returns, which has already picked one of
+        the two granularities that table stores. Getting the counting wrong is not
+        a subtle error - it would undercount by orders of magnitude - which is why
+        the two are kept visibly separate.
+        """
+        if self._source == "daily":
+            return (
+                " sum(impressions) AS impressions,"
+                " sum(clicks) AS clicks,"
+                " sum(conversions) AS conversions,"
+                " sum(cost) AS cost,"
+                " sum(revenue) AS revenue"
+            )
+        return (
+            " countIf(event_type = 'impression') AS impressions,"
+            " countIf(event_type = 'click') AS clicks,"
+            " countIf(event_type = 'conversion') AS conversions,"
+            " sumIf(cost, event_type IN ('impression', 'click')) AS cost,"
+            " sumIf(revenue, event_type = 'conversion') AS revenue"
+        )
 
     async def connect(self) -> bool:
         """Connect lazily and report failure without raising."""
@@ -291,18 +390,87 @@ class ClickHouseWarehouse:
             return False
 
     async def _query(self, sql: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
-        """Execute a parameterised read query off the event loop."""
+        """Execute a parameterised read query off the event loop.
+
+        Returning an empty list when the warehouse is unreachable is deliberate:
+        a warehouse outage must not take the optimization loop down with it, and
+        the optimizer has a working primary datastore to fall back on. What was
+        missing was any way to tell that apart from "the query genuinely found
+        nothing", so every outcome is counted on ``warehouse_reads_total``. A
+        steady ``degraded`` rate is the signal that reports are silently being
+        served from a different source than the operator assumes.
+        """
         if self._client is None:
+            WAREHOUSE_READS_TOTAL.labels(backend=self.name, outcome="degraded").inc()
             return []
         try:
             result = await _to_thread(self._client.query, sql, parameters=parameters)
         except Exception as exc:
+            WAREHOUSE_READS_TOTAL.labels(backend=self.name, outcome="degraded").inc()
             logger.error("clickhouse_query_failed", error=str(exc), sql=sql[:200])
             return []
-        return [dict(zip(result.column_names, row, strict=True)) for row in result.result_rows]
+        rows = [dict(zip(result.column_names, row, strict=True)) for row in result.result_rows]
+        WAREHOUSE_READS_TOTAL.labels(backend=self.name, outcome="ok" if rows else "empty").inc()
+        return rows
 
     def _window_filter(self, days: int) -> str:
+        """The time predicate, which is a different column per source.
+
+        ``stat_date`` is a calendar day, so a window of ``days`` days ending today
+        starts ``days - 1`` back - the arithmetic every primary-datastore reader
+        uses. Without the subtraction the warehouse answers a seven-day request
+        with eight days of delivery, and disagrees with the SQL path silently.
+        ``greatest`` guards it because the placeholder binds as UInt16: a ``days``
+        of zero would otherwise wrap to 65535 and read the whole table rather than
+        nothing. ``event_time`` is an instant, so its window is a rolling ``days``
+        times 24 hours and needs no such correction.
+        """
+        if self._source == "daily":
+            return "stat_date >= today() - toIntervalDay(greatest({days:UInt16}, 1) - 1)"
         return "event_time >= now() - toIntervalDay({days:UInt16})"
+
+    def _date_expression(self) -> str:
+        """How the bucket date is derived from each table's timestamp."""
+        return "stat_date" if self._source == "daily" else "toDate(event_time)"
+
+    def _delivery_relation(self, where: str) -> str:
+        """The ``FROM`` target for a campaign-level or per-day aggregate.
+
+        ``campaign_daily_metrics`` mirrors ``daily_metrics``, and that table keeps
+        two granularities of the same money side by side: a campaign-level roll-up
+        row whose ``creative_id`` is empty, plus one row per creative summing to
+        that roll-up. A bare ``sum(...)`` over the window therefore counts every
+        impression and every unit of spend twice - and nothing about the result
+        looks broken, the numbers are merely the wrong size.
+
+        Collapsing to one row per (campaign, day) first is the warehouse-side form
+        of the contract ``MetricRepository.merged_slots`` implements in Python:
+        the roll-up wins a bucket that has one, and a bucket stored only per
+        creative still contributes its breakdown instead of reading as zero.
+        Deciding per bucket rather than per campaign is what keeps a portfolio
+        that mixes both shapes exact.
+
+        The events source needs none of this - one row is one delivery, at one
+        granularity - so it stays the bare table, byte for byte.
+        """
+        table = "{db:Identifier}." + self._table
+        if self._source != "daily":
+            return table + " " + where
+        per_bucket = ", ".join(
+            "if(countIf(creative_id = '') > 0,"
+            " sumIf(" + measure + ", creative_id = ''),"
+            " sumIf(" + measure + ", creative_id != '')) AS " + measure
+            for measure in MEASURES
+        )
+        return (
+            "(SELECT campaign_id, stat_date, "
+            + per_bucket
+            + " FROM "
+            + table
+            + " "
+            + where
+            + " GROUP BY campaign_id, stat_date)"
+        )
 
     async def campaign_snapshots(
         self, campaign_ids: list[str] | None, *, days: int
@@ -315,24 +483,23 @@ class ClickHouseWarehouse:
 
         sql = (
             "SELECT campaign_id,"
-            " countIf(event_type = 'impression') AS impressions,"
-            " countIf(event_type = 'click') AS clicks,"
-            " countIf(event_type = 'conversion') AS conversions,"
-            " sumIf(cost, event_type IN ('impression', 'click')) AS cost,"
-            " sumIf(revenue, event_type = 'conversion') AS revenue"
-            " FROM {db:Identifier}.ad_events " + where + " GROUP BY campaign_id"
+            + self._measures()
+            + " FROM "
+            + self._delivery_relation(where)
+            + " GROUP BY campaign_id"
         )
         rows = await self._query(sql, parameters)
         names = await self._campaign_names([str(r["campaign_id"]) for r in rows])
         return [
-            PerformanceSnapshot(
+            _reconciled_snapshot(
+                self.name,
                 campaign_id=str(row["campaign_id"]),
                 campaign_name=names.get(str(row["campaign_id"]), ""),
                 impressions=int(row.get("impressions") or 0),
                 clicks=int(row.get("clicks") or 0),
                 conversions=int(row.get("conversions") or 0),
-                total_cost=float(row.get("cost") or 0.0),
-                total_revenue=float(row.get("revenue") or 0.0),
+                cost=float(row.get("cost") or 0.0),
+                revenue=float(row.get("revenue") or 0.0),
             )
             for row in rows
         ]
@@ -349,16 +516,20 @@ class ClickHouseWarehouse:
         return {str(r["campaign_id"]): str(r.get("campaign_name") or "") for r in rows}
 
     async def creative_snapshots(self, campaign_id: str, *, days: int) -> list[dict[str, Any]]:
+        where = "WHERE " + self._window_filter(days) + " AND campaign_id = {campaign_id:String}"
+        if self._source == "daily":
+            # The aggregate table stores a campaign's roll-up row with an empty
+            # creative_id. Without this filter those totals would be reported as
+            # belonging to a creative whose id is the empty string.
+            where += " AND creative_id != ''"
         sql = (
             "SELECT creative_id,"
-            " countIf(event_type = 'impression') AS impressions,"
-            " countIf(event_type = 'click') AS clicks,"
-            " countIf(event_type = 'conversion') AS conversions,"
-            " sumIf(cost, event_type IN ('impression', 'click')) AS cost,"
-            " sumIf(revenue, event_type = 'conversion') AS revenue"
-            " FROM {db:Identifier}.ad_events"
-            " WHERE " + self._window_filter(days) + " AND campaign_id = {campaign_id:String}"
-            " GROUP BY creative_id"
+            + self._measures()
+            + " FROM {db:Identifier}."
+            + self._table
+            + " "
+            + where
+            + " GROUP BY creative_id"
         )
         rows = await self._query(
             sql, {"db": self._settings.database, "days": days, "campaign_id": campaign_id}
@@ -378,7 +549,16 @@ class ClickHouseWarehouse:
     async def audience_observations(
         self, campaign_ids: list[str] | None, *, days: int
     ) -> list[SegmentObservation]:
-        """Aggregate delivery by every demographic dimension in one pass."""
+        """Aggregate delivery by every demographic dimension in one pass.
+
+        The aggregate table carries no demographics - a daily report from an ad
+        network has no device or age breakdown in the shape this project
+        ingests - so that source reports the campaign split rather than
+        inventing segments it cannot actually see.
+        """
+        if self._source == "daily":
+            return await self._campaign_split(campaign_ids, days=days)
+
         window = self._window_filter(days)
         campaign_filter = ""
         parameters: dict[str, Any] = {"db": self._settings.database, "days": days}
@@ -390,7 +570,7 @@ class ClickHouseWarehouse:
             "SELECT '" + dimension + "' AS dimension,"
             " toString(" + dimension + ") AS segment_key,"
             " event_type, cost, revenue"
-            " FROM {db:Identifier}.ad_events WHERE " + window + campaign_filter
+            " FROM {db:Identifier}." + self.EVENTS_TABLE + " WHERE " + window + campaign_filter
             for dimension in self.DIMENSIONS
         ]
         inner = " UNION ALL ".join(branches)
@@ -417,6 +597,24 @@ class ClickHouseWarehouse:
             for row in rows
         ]
 
+    async def _campaign_split(
+        self, campaign_ids: list[str] | None, *, days: int
+    ) -> list[SegmentObservation]:
+        """One bucket per campaign, the only split an aggregate table supports."""
+        snapshots = await self.campaign_snapshots(campaign_ids, days=days)
+        return [
+            SegmentObservation(
+                key=snapshot.campaign_name or snapshot.campaign_id,
+                dimension="campaign",
+                impressions=snapshot.impressions,
+                clicks=snapshot.clicks,
+                conversions=snapshot.conversions,
+                cost=snapshot.total_cost,
+                revenue=snapshot.total_revenue,
+            )
+            for snapshot in snapshots
+        ]
+
     async def timeseries(self, campaign_id: str | None, *, days: int) -> list[dict[str, Any]]:
         where = "WHERE " + self._window_filter(days)
         parameters: dict[str, Any] = {"db": self._settings.database, "days": days}
@@ -425,13 +623,13 @@ class ClickHouseWarehouse:
             parameters["campaign_id"] = campaign_id
 
         sql = (
-            "SELECT toDate(event_time) AS stat_date,"
-            " countIf(event_type = 'impression') AS impressions,"
-            " countIf(event_type = 'click') AS clicks,"
-            " countIf(event_type = 'conversion') AS conversions,"
-            " sumIf(cost, event_type IN ('impression', 'click')) AS cost,"
-            " sumIf(revenue, event_type = 'conversion') AS revenue"
-            " FROM {db:Identifier}.ad_events " + where + " GROUP BY stat_date ORDER BY stat_date"
+            "SELECT "
+            + self._date_expression()
+            + " AS stat_date,"
+            + self._measures()
+            + " FROM "
+            + self._delivery_relation(where)
+            + " GROUP BY stat_date ORDER BY stat_date"
         )
         rows = await self._query(sql, parameters)
         return [

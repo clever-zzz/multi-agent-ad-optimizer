@@ -6,8 +6,9 @@ isolated instances with their own settings and container.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI
@@ -44,15 +45,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _bootstrap_sqlite(container, settings)
 
     async with container.database.unit_of_work() as session:
-        reaped = await OptimizationService(container, session).reap_stale_runs(session)
+        reaper_service = OptimizationService(container)
+        reaped = await reaper_service.reap_stale_runs(session)
         await session.commit()
     if reaped:
         logger.warning("startup_reaped_stale_runs", count=reaped)
+
+    # A run whose task died without the process dying is invisible to the
+    # startup pass, so a healthy process has to keep sweeping.
+    reaper_task: asyncio.Task[None] = asyncio.create_task(
+        reaper_service.run_reaper_loop(), name="run-reaper"
+    )
 
     logger.info("application_started", environment=settings.app.environment.value)
     try:
         yield
     finally:
+        reaper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reaper_task
         await container.shutdown()
         logger.info("application_stopped")
 

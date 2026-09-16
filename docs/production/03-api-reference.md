@@ -116,7 +116,7 @@ Authorization: Bearer <access_token>
 | HTTP | `code` | 何时出现 |
 |---|---|---|
 | 401 | `unauthenticated` | 无 token / token 过期或非法 / 会话已撤销 / 账号锁定或停用 |
-| 402 | `budget_exceeded` | LLM 月度预算耗尽且 `LLM__FAIL_OPEN_TO_MOCK=false` |
+| 402 | `budget_exceeded` | LLM 月度预算耗尽。**与 `LLM__FAIL_OPEN_TO_MOCK` 无关**——该开关只决定供应商调用重试打满后是否退到 mock |
 | 403 | `permission_denied` | 权限或角色不足 |
 | 404 | `not_found` | 资源不存在 |
 | 409 | `conflict` | 状态冲突（重复 email、乐观锁失败、重复审批/重复执行已终结的动作等） |
@@ -188,7 +188,7 @@ key 按 **actor** 作用域。同一个 key + 同一个 actor 第二次调用，
 
 限流按**认证主体**（token 里的 sub）计；匿名请求按客户端 IP 计。超限返回 429 + `Retry-After`。
 
-> 令牌桶状态存在进程内存。多副本部署时实际上限是 `limit × 副本数`。需要全局上限时见 [08 限制](08-limitations-and-roadmap.md)。
+> 限流的窗口计数存在进程内存（`InMemoryRateLimiter` 是**固定窗口**实现，不是令牌桶）。多副本部署时实际上限是 `limit × 副本数`。需要全局上限时见 [08 限制](08-limitations-and-roadmap.md)。
 
 ---
 
@@ -200,7 +200,7 @@ key 按 **actor** 作用域。同一个 key + 同一个 actor 第二次调用，
 |---|---|---|
 | GET | `/healthz` | 存活探针，永远 200 |
 | GET | `/readyz` | 就绪探针，聚合依赖健康；数据库不可达时 503 |
-| GET | `/metrics` | Prometheus 文本格式，20 个指标 |
+| GET | `/metrics` | Prometheus 文本格式，21 个指标 |
 | GET | `/system/info` | 运行时配置摘要（只含可公开字段） |
 | GET | `/` | 服务标识（不在 OpenAPI 里） |
 

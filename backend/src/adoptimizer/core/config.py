@@ -130,6 +130,12 @@ class ClickHouseSettings(BaseModel):
     verify_tls: bool = True
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
     query_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Which table the read model queries. ``daily`` matches what the ingestion
+    # path can actually populate today (platform APIs return daily reports);
+    # ``events`` reads the raw event stream, which is the richer shape but needs
+    # a pipeline that does not exist yet. Defaults to ``events`` so an existing
+    # deployment's reads do not change under it.
+    metrics_source: Literal["events", "daily"] = "events"
 
 
 class SecuritySettings(BaseModel):
@@ -159,7 +165,13 @@ class SecuritySettings(BaseModel):
 
 
 class RateLimitSettings(BaseModel):
-    """Token-bucket limits applied per authenticated principal."""
+    """Fixed-window limits applied per authenticated principal.
+
+    ``burst`` is declared here and shipped in ``.env.example``, but nothing reads
+    it: ``InMemoryRateLimiter`` counts requests inside a fixed window, so there is
+    no separate burst allowance to configure. The knob stays dead until a limiter
+    that actually models bursts - the Redis-backed one on the P1 roadmap - lands.
+    """
 
     enabled: bool = True
     default_requests_per_minute: int = Field(default=300, ge=1)
@@ -201,6 +213,25 @@ class LLMSettings(BaseModel):
     # Supplied as JSON, e.g. LLM__PRICING={"qwen-plus": [0.113, 0.282]}
     pricing: dict[str, tuple[float, float]] = Field(default_factory=dict)
     fail_open_to_mock: bool = True
+
+    @field_validator("pricing", mode="before")
+    @classmethod
+    def _blank_pricing_means_no_override(cls, value: Any) -> Any:
+        """Read a blank ``LLM__PRICING`` as "keep the built-in table".
+
+        ``.env.example`` ships the key with an empty value, and pydantic-settings
+        hands a complex field the raw string to JSON-decode, so an empty value
+        arrives as ``''`` and fails as a ``dict_type`` error. That made the
+        documented ``cp .env.example .env`` quickstart die during import, before
+        a single line of the application ran. Blank is how an operator spells
+        "no override" in a dotenv file; treating it as malformed would make the
+        example file itself unbootable.
+        """
+        if value is None:
+            return {}
+        if isinstance(value, str) and not value.strip():
+            return {}
+        return value
 
     @field_validator("pricing")
     @classmethod

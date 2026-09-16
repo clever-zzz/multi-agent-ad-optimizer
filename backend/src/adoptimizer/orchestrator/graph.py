@@ -12,7 +12,8 @@ runs the same agents with the same reducers so behaviour is identical.
 from __future__ import annotations
 
 import time
-from typing import Any, Literal
+import types
+from typing import Any, Literal, get_type_hints
 
 from ..agents.audience import AudienceAgent
 from ..agents.base import AgentContext, BaseAgent, RunCancelled
@@ -24,14 +25,7 @@ from ..agents.optimize import OptimizeAgent
 from ..core.logging import get_logger
 from ..core.metrics import ACTIVE_RUNS, AGENT_RUN_DURATION_SECONDS, AGENT_RUNS_TOTAL
 from ..domain.enums import AgentName, RunStatus
-from .state import (
-    AgentState,
-    append_list,
-    max_int,
-    merge_mapping,
-    replace_list,
-    summarise_state,
-)
+from .state import AgentState, summarise_state
 
 logger = get_logger(__name__)
 
@@ -55,26 +49,30 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     HAS_CHECKPOINTER = False
 
-# Reducer table mirrors the Annotated declarations on AgentState. It is used by
-# the sequential executor so both paths merge updates identically.
-_REDUCERS: dict[str, Any] = {
-    "metrics": replace_list,
-    "daily_budgets": merge_mapping,
-    "audience_observations": replace_list,
-    "audience_insights": merge_mapping,
-    "health": merge_mapping,
-    "new_creatives": append_list,
-    "bidding_decisions": replace_list,
-    "budget_allocations": replace_list,
-    "optimization_actions": append_list,
-    "critic_findings": append_list,
-    "alerts": replace_list,
-    "alert_fingerprints": append_list,
-    "platform_checks": replace_list,
-    "tool_preflights": append_list,
-    "agent_messages": append_list,
-    "iteration": max_int,
-}
+
+def _reducers_from_state() -> dict[str, Any]:
+    """Derive the fallback executor's reducer table from ``AgentState``.
+
+    LangGraph reads the ``Annotated`` metadata itself; the sequential executor
+    needs the same mapping as a plain dict. Deriving one from the other removes
+    the hand-mirrored table, which could silently drop an accumulating channel:
+    ``_apply_update`` falls back to last-value-wins for an unlisted key, so a
+    missing entry lost data on the degraded path and nowhere else.
+    """
+    table: dict[str, Any] = {}
+    for channel, hint in get_type_hints(AgentState, include_extras=True).items():
+        for meta in getattr(hint, "__metadata__", ()):
+            # Reducers are plain functions. A typing construct such as
+            # ``list[dict[str, Any]]`` is callable too, so the test has to be
+            # narrower than ``callable``.
+            if isinstance(meta, types.FunctionType):
+                table[channel] = meta
+    return table
+
+
+# Mirrors the Annotated declarations on AgentState by construction, so the two
+# execution paths cannot disagree about how a channel merges.
+_REDUCERS: dict[str, Any] = _reducers_from_state()
 
 
 class OptimizationOrchestrator:
@@ -104,6 +102,24 @@ class OptimizationOrchestrator:
     def execution_mode(self) -> str:
         """Report which executor will handle a run."""
         return "langgraph" if self._graph is not None else "sequential"
+
+    async def forget_run(self, run_id: str) -> None:
+        """Drop a finished run's checkpoints.
+
+        ``MemorySaver`` retains every checkpoint of every thread it has seen,
+        and nothing here resumes a thread - ``run`` always invokes the graph
+        with a fresh state - so without this the checkpointer grows for the
+        lifetime of the process. Cleaning up must never fail a run that already
+        finished, and a checkpointer with no async delete (or none at all) is a
+        no-op rather than an error.
+        """
+        drop = getattr(self._checkpointer, "adelete_thread", None)
+        if drop is None:
+            return
+        try:
+            await drop(run_id)
+        except Exception as exc:  # pragma: no cover - cleanup is best effort
+            logger.warning("checkpoint_cleanup_failed", run_id=run_id, error=str(exc))
 
     def _ordered_agents(self) -> list[tuple[AgentName, BaseAgent]]:
         return [

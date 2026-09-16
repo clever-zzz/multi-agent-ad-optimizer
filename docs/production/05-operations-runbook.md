@@ -37,13 +37,14 @@ curl -s "https://ads.example.com/api/v1/ingest/schedule" -H "Authorization: Bear
 | `running` 状态的 run | 0–2 个，且 started_at 在 30 分钟内 | 有超过 30 分钟的 → §4.3 |
 | `open` 告警 | 与业务波动相符 | `critical` 级别超过 24h 未 ack → §3 |
 | `proposed` 动作 | 有人在看 | 持续堆积说明审批流程没人负责 |
+| `suppressed` 动作 | 数量与 critic 的裁决相符，偶尔翻案 | 某一类 `kind` 持续占多数 → 说明上游规则在系统性地生成矛盾提案，该去调规则而不是天天翻案；查 `GET /api/v1/runs/{run_id}/findings` |
 | `ingest/batches` 最新一条 | `created_at` 在预期窗口内，`unresolved` / `rejected` 为 0 或可解释 | 没有新批次、或 `unresolved` 持续 > 0 → §4.7 |
 | `ingest/schedule` 里每个源的 `plan.reason` | `covered` / `nominal` / `catchup`（错过一次会自愈） | `capped`（`gap_days` > 0，必须人工补数）、`lease.held` 长期为 `true`、或 `registered: false` → §4.7 |
 
 ### 1.2 每周
 
 - [ ] 检查 LLM 花费：`GET /api/v1/analytics/llm-spend`，与 `LLM__MONTHLY_BUDGET_USD` 对比；与厂商账单交叉核对一次，偏差大说明 `LLM__PRICING` 的单价该更新了
-- [ ] 检查数据库增长：`run_events`、`audit_logs`、`daily_metrics`、`llm_spend`、`ingest_batches` 五张表的行数
+- [ ] 检查数据库增长：`run_events`、`audit_logs`、`daily_metrics`、`llm_spend`、`ingest_batches`、`critic_findings` 六张表的行数
 - [ ] 跑一次保留期清理：`POST /api/v1/admin/prune?audit_days=365`
 - [ ] 确认备份可恢复（不只是"备份成功了"，要真的试过恢复）
 - [ ] 检查是否有账号该停用（离职、转岗）
@@ -199,7 +200,7 @@ kubectl -n adoptimizer exec postgres-0 -- pg_isready
 
 **`cache: unavailable`**
 
-Redis 挂了。影响：缓存失效、限流退化为进程内实现、会话校验变慢。
+Redis 挂了。影响：**LLM 响应缓存**失效（每次调用都真打到供应商，成本与延迟上升）。限流与事件总线本来就是进程内的，不受影响；会话在数据库里，也不受影响。
 
 ```bash
 docker compose logs --tail=50 redis
@@ -236,7 +237,7 @@ docker compose logs --tail=200 api
 
 ### 4.3 run 卡在 `running` 不动
 
-进程启动时的 `reap_stale_runs` 会把**上次异常退出**遗留的非终态 run 标记为 failed（阈值 30 分钟）。所以：
+进程启动时、以及之后每 10 分钟的周期任务，都会跑 `reap_stale_runs`，把**上次异常退出**或**卡死**遗留的非终态 run 标记为 failed（阈值 30 分钟，判据是最后一次事件的时间而不是创建时间，所以慢 run 不会被误杀）。所以：
 
 ```bash
 # 1. 看它到底跑了多久
@@ -248,7 +249,7 @@ curl -s ".../api/v1/runs/<RUN_ID>" -H "Authorization: Bearer $TOKEN" | python -m
 # 3a. 如果是本进程在跑 → 取消
 curl -X POST ".../api/v1/runs/<RUN_ID>/cancel" -H "Authorization: Bearer $TOKEN"
 
-# 3b. 如果执行它的进程已经没了 → 重启 API，reaper 会回收
+# 3b. 如果执行它的进程已经没了 → 周期 reaper（10 分钟）会自己回收；等不及再重启 API
 kubectl -n adoptimizer rollout restart deploy/backend
 ```
 
@@ -291,7 +292,7 @@ RATE_LIMIT__WRITE_REQUESTS_PER_MINUTE=120
 RATE_LIMIT__OPTIMIZE_RUNS_PER_HOUR=40
 ```
 
-> 令牌桶状态在**进程内**。N 个副本的实际全局上限是 `limit × N`。反过来，如果某个用户被限流而你算不出为什么，先确认请求是不是分散到了多个副本。
+> 限流的窗口计数在**进程内**（固定窗口实现）。N 个副本的实际全局上限是 `limit × N`。反过来，如果某个用户被限流而你算不出为什么，先确认请求是不是分散到了多个副本。
 
 ### 4.7 数据没进来，或进来了没落地
 
@@ -357,6 +358,7 @@ adoptimizer ingest --source platform --days 3 --dry-run
 | `daily_metrics` | 活动数 × 创意数 × 天数 | 业务数据，通常保留 |
 | `refresh_sessions` | 每次登录一行 | 过期后仍可查，无自动清理 |
 | `ingest_batches` | 每次采集尝试一行（干跑也记） | ❌ 无。行很小（十几个整数），但和 `run_events` 一样需要保留期，见 [08 §3.2](08-limitations-and-roadmap.md) |
+| `critic_findings` | 每次 run × 每迭代 × 每条裁决；`suppressed_actions` 是 JSON，**存了被抑制提案的原文**，所以单行可能比 `run_events` 大 | ❌ 无。注意 `run_id` 是 `ON DELETE SET NULL`——删 run **不会**连带删裁决，孤儿行会留下来 |
 | `ingest_watermarks` | 每个数据源**一行**，原地更新 | ✅ 不增长（上界 = `INGEST__SOURCES` 的长度） |
 | `scheduler_leases` | 每个 `ingest:<source>` **一行**，原地更新；释放时清空而**不删除**，为的是留住"上次是谁跑的、结果如何" | ✅ 不增长 |
 
@@ -405,7 +407,7 @@ COMMIT;
 | 数据 | 备份方式 | RPO 建议 |
 |---|---|---|
 | PostgreSQL | `pg_dump` 逻辑备份 + WAL 归档做 PITR | 逻辑备份每日；WAL 连续 |
-| Redis | **可以不备份**（缓存、限流、会话都可重建；用户会掉登录） | — |
+| Redis | **可以不备份**（只存 LLM 响应缓存，丢了就是重新调用一次模型；会话在 PostgreSQL 里，用户不会掉登录） | — |
 | ClickHouse（若启用） | 事件明细，通常可从上游重新灌 | 按需 |
 | 配置/Secret | 你的密钥管理系统 | 与变更同步 |
 

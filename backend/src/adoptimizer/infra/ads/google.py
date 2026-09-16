@@ -36,12 +36,16 @@ class GoogleAdsCredentials:
         refresh_token: str,
         developer_token: str,
         customer_id: str,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
         self.developer_token = developer_token
         self.customer_id = customer_id.replace("-", "")
+        # Shared with the REST client so one injected transport covers both the
+        # OAuth refresh call and every subsequent API call.
+        self.transport = transport
         self._access_token: str | None = None
         self._expires_at: float = 0.0
 
@@ -62,7 +66,7 @@ class GoogleAdsCredentials:
         if self._access_token and time.time() < self._expires_at - 60:
             return self._access_token
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, transport=self.transport) as client:
             response = await client.post(
                 TOKEN_URL,
                 data={
@@ -107,6 +111,7 @@ class GoogleAdsClient(AdsPlatformClient):
                     "developer-token": self._credentials.developer_token,
                     "Content-Type": "application/json",
                 },
+                transport=self._credentials.transport,
             )
         return self._http
 

@@ -13,6 +13,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -22,11 +23,12 @@ from ..core.container import Container
 from ..core.errors import ConflictError, NotFoundError, RunInProgressError, ValidationFailure
 from ..core.ids import new_id
 from ..core.logging import get_logger
+from ..core.metrics import ALERTS_TOTAL
 from ..domain.anomaly import Alert as DomainAlert
 from ..domain.anomaly import AlertThresholds, deduplicate, detect
 from ..domain.enums import AlertRule, AlertSeverity, RunStatus
 from ..infra.db.models import OptimizationRun, RunEvent
-from ..orchestrator.events import AgentEvent, EventSink
+from ..orchestrator.events import TERMINAL_EVENTS, AgentEvent, EventSink
 from ..orchestrator.state import (
     AgentState,
     initial_state,
@@ -41,12 +43,24 @@ logger = get_logger(__name__)
 
 REAPER_STALE_AFTER = timedelta(minutes=30)
 
+# How often a healthy process re-sweeps. The startup pass alone cannot help the
+# case that actually matters: a task that died while the process stayed up.
+REAPER_POLL_INTERVAL = timedelta(minutes=10)
+
 
 class DatabaseEventSink(EventSink):
-    """Persists run events using short-lived sessions."""
+    """Persists run events using short-lived sessions.
+
+    Also mirrors the run's ``iteration`` onto ``optimization_runs`` as each round
+    completes, so the stored row shows live progress instead of only what
+    ``mark_finished`` writes at the very end. The last value is cached per run
+    and written only when it advances, which keeps the cost at one UPDATE per
+    iteration rather than one per event.
+    """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        self._seen_iterations: dict[str, int] = {}
 
     async def persist(self, event: AgentEvent) -> None:
         async with self._session_factory() as session:
@@ -61,7 +75,21 @@ class DatabaseEventSink(EventSink):
                     created_at=event.created_at,
                 )
             )
+            await self._mirror_progress(session, event)
             await session.commit()
+
+    async def _mirror_progress(self, session: AsyncSession, event: AgentEvent) -> None:
+        """Copy the round number off the event stream and onto the run row."""
+        if event.event_type in TERMINAL_EVENTS:
+            self._seen_iterations.pop(event.run_id, None)
+            return
+        if event.event_type != "agent.completed":
+            return
+        iteration = int(event.payload.get("iteration", 0) or 0)
+        if iteration <= self._seen_iterations.get(event.run_id, 0):
+            return
+        self._seen_iterations[event.run_id] = iteration
+        await RunRepository(session).mark_progress(event.run_id, iteration)
 
 
 class OptimizationService:
@@ -331,6 +359,7 @@ class OptimizationService:
             )
 
         await self._container.events.close_run(run_id)
+        await self._container.orchestrator.forget_run(run_id)
         logger.info("run_finalised", run_id=run_id, status=status.value)
         return summary
 
@@ -358,7 +387,15 @@ class OptimizationService:
             except (KeyError, ValueError) as exc:
                 logger.warning("alert_persist_skipped", error=str(exc))
 
-        created = await repository.record_many(deduplicate(domain_alerts), run_id=run_id)
+        # Counted after the in-pass fingerprint collapse, so the series tracks
+        # distinct findings per rule rather than every duplicate the detector
+        # emitted. Cross-iteration repeats never reach here twice either --
+        # ``record_many`` upserts on ``dedup_key``.
+        deduplicated = deduplicate(domain_alerts)
+        for alert in deduplicated:
+            ALERTS_TOTAL.labels(rule=alert.rule.value, severity=alert.severity.value).inc()
+
+        created = await repository.record_many(deduplicated, run_id=run_id)
         logger.info("alerts_persisted", run_id=run_id, total=len(domain_alerts), new=created)
 
     async def _persist_generated_creatives(
@@ -437,17 +474,33 @@ class OptimizationService:
         return run
 
     async def reap_stale_runs(self, session: AsyncSession) -> int:
-        """Mark runs stuck in a non-terminal state as failed.
+        """Mark runs that stopped making progress as failed.
 
-        Runs on startup and from the worker heartbeat so a crashed process never
+        Progress is the newest ``run_events`` row for the run, falling back to
+        ``started_at`` and then ``created_at``. The durable sink already writes
+        that row on every agent step, so this needs no extra heartbeat write -
+        and unlike ``created_at`` alone it neither reaps a run that merely waited
+        in the queue, nor one that is slow but still emitting events. The old
+        predicate did both, and because ``mark_finished`` refuses to overwrite a
+        terminal status, a slow run reaped at the cutoff then lost its real
+        result on completion.
+
+        Called on startup and from ``run_reaper_loop`` so a crashed process never
         leaves the queue permanently blocked.
         """
         runs = RunRepository(session)
         cutoff = datetime.now(UTC) - REAPER_STALE_AFTER
+        last_event = (
+            select(func.max(RunEvent.created_at))
+            .where(RunEvent.run_id == OptimizationRun.id)
+            .correlate(OptimizationRun)
+            .scalar_subquery()
+        )
+        progress = func.coalesce(last_event, OptimizationRun.started_at, OptimizationRun.created_at)
         stale, _ = await runs.list(
             filters=[
                 OptimizationRun.status.in_([RunStatus.PENDING.value, RunStatus.RUNNING.value]),
-                OptimizationRun.created_at < cutoff,
+                progress < cutoff,
             ]
         )
         for run in stale:
@@ -455,9 +508,33 @@ class OptimizationService:
             run.finished_at = datetime.now(UTC)
             run.error_message = "Reaped: no progress recorded within the stale-run window"
         await session.flush()
+        for run in stale:
+            # The same teardown a normal finish gets, so a reaped run does not
+            # leave its event history and subscribers behind in this process.
+            await self._container.events.close_run(run.id)
         if stale:
             logger.warning("stale_runs_reaped", count=len(stale))
         return len(stale)
+
+    async def run_reaper_loop(self, interval: timedelta = REAPER_POLL_INTERVAL) -> None:
+        """Re-sweep for stale runs until cancelled.
+
+        The startup pass cannot help the case that matters most: a task that died
+        while the process stayed healthy. Each sweep takes its own session and
+        swallows its own errors, so one bad sweep cannot kill the loop. Replicas
+        may sweep concurrently; they write the same terminal status, so the only
+        thing they race over is ``finished_at``.
+        """
+        while True:
+            await asyncio.sleep(interval.total_seconds())
+            try:
+                async with self._container.database.unit_of_work() as session:
+                    reaped = await self.reap_stale_runs(session)
+                    await session.commit()
+                if reaped:
+                    logger.warning("periodic_reaped_stale_runs", count=reaped)
+            except Exception as exc:  # pragma: no cover - the loop must survive
+                logger.error("reaper_sweep_failed", error=str(exc))
 
     async def detect_alerts_now(
         self, session: AsyncSession, *, campaign_ids: list[str] | None = None, days: int = 7

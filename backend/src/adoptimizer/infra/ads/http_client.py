@@ -36,11 +36,17 @@ class PlatformHTTPClient:
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
         headers: dict[str, str] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
         self._max_retries = max(1, max_retries)
         self._headers = headers or {}
+        # Injectable purely so tests can assert the exact bytes a real call
+        # would send without touching the network. Production leaves it None and
+        # httpx builds its default transport, so the code path under test and
+        # the code path in production are the same one.
+        self._transport = transport
         self._client: httpx.AsyncClient | None = None
 
     async def _ensure_client(self) -> httpx.AsyncClient:
@@ -50,6 +56,7 @@ class PlatformHTTPClient:
                 timeout=httpx.Timeout(self._timeout),
                 headers={"Accept": "application/json", **self._headers},
                 follow_redirects=False,
+                transport=self._transport,
             )
         return self._client
 

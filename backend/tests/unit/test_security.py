@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import jwt
 import pytest
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from adoptimizer.core.config import SecuritySettings
@@ -406,3 +407,33 @@ class TestPasswordPolicy:
         strict = AuthService(cast("AsyncSession", None), security_settings(password_min_length=16))
         with pytest.raises(ValidationFailure, match="at least 16"):
             strict.validate_password_strength("Str0ng!Pass")
+
+
+class TestLastAdministratorLock:
+    """The last-administrator guard must lock the rows it counts.
+
+    Two administrators demoting each other concurrently would each see the other
+    still active and both succeed, leaving the control plane with nobody who can
+    sign in. The row lock is what serialises them, so pin that the statement asks
+    for it - and that it still compiles on SQLite, where ``FOR UPDATE`` does not
+    exist and must degrade to a plain read rather than fail.
+    """
+
+    def test_the_guard_statement_requests_row_locks(self) -> None:
+        compiled = str(
+            AuthService._active_admin_lock_statement().compile(dialect=postgresql.dialect())
+        )
+        assert "FOR UPDATE" in compiled
+
+    def test_sqlite_renders_it_as_a_plain_select(self) -> None:
+        compiled = str(AuthService._active_admin_lock_statement().compile(dialect=sqlite.dialect()))
+        assert "FOR UPDATE" not in compiled
+        assert "users.role" in compiled
+        assert "users.is_active" in compiled
+
+    def test_the_lock_covers_the_whole_active_admin_set(self) -> None:
+        # Locking only the *other* administrators would lock nothing in the one
+        # case that matters - a single remaining admin - so the lock statement
+        # must not carry the exclusion filter.
+        assert len(AuthService._active_admin_filters()) == 2
+        assert len(AuthService._active_admin_filters(excluding="usr_1")) == 3

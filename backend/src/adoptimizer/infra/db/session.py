@@ -52,7 +52,14 @@ class Database:
             )
         return self._session_factory
 
-    def _create_engine(self) -> AsyncEngine:
+    def _engine_kwargs(self) -> dict[str, Any]:
+        """Connection-pool arguments, split by dialect.
+
+        Extracted from ``_create_engine`` so the shape can be asserted without
+        building an engine: ``server_settings`` is a driver-specific nesting and
+        getting it wrong fails silently, so it needs a test that runs without a
+        live PostgreSQL.
+        """
         kwargs: dict[str, Any] = {"echo": self._settings.echo, "future": True}
         if not self._settings.is_sqlite:
             kwargs.update(
@@ -61,15 +68,27 @@ class Database:
                 pool_recycle=self._settings.pool_recycle_seconds,
                 pool_pre_ping=self._settings.pool_pre_ping,
             )
-        else:
-            # A single shared connection pool keeps SQLite writes serialised and
-            # avoids "database is locked" errors under concurrent requests.
+            if self._settings.statement_timeout_ms is not None:
+                # asyncpg takes server-side settings as a nested dict. A bare
+                # ``statement_timeout`` connect arg is accepted and then ignored,
+                # which is how this knob sat configured-but-inert.
+                kwargs["connect_args"] = {
+                    "server_settings": {
+                        "statement_timeout": str(self._settings.statement_timeout_ms)
+                    }
+                }
+            return kwargs
+
+        # A single shared connection pool keeps SQLite writes serialised and
+        # avoids "database is locked" errors under concurrent requests.
+        if ":memory:" in self._settings.url:
             from sqlalchemy.pool import StaticPool
 
-            if self._settings.url.endswith(":memory:") or ":memory:" in self._settings.url:
-                kwargs.update(poolclass=StaticPool, connect_args={"check_same_thread": False})
+            kwargs.update(poolclass=StaticPool, connect_args={"check_same_thread": False})
+        return kwargs
 
-        engine = create_async_engine(self._settings.url, **kwargs)
+    def _create_engine(self) -> AsyncEngine:
+        engine = create_async_engine(self._settings.url, **self._engine_kwargs())
         logger.info("database_engine_created", dialect=self._settings.dialect)
         return engine
 

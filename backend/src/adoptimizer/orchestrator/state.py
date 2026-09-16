@@ -70,7 +70,6 @@ class AgentState(TypedDict, total=False):
     critic_findings: Annotated[list[dict[str, Any]], append_list]
 
     alerts: Annotated[list[dict[str, Any]], replace_list]
-    alert_fingerprints: Annotated[list[str], append_list]
 
     # Tool-layer evidence. Both channels are written by agents that called a
     # tool, and both are what makes "the agent checked with the network" a
@@ -83,6 +82,25 @@ class AgentState(TypedDict, total=False):
     iteration: Annotated[int, max_int]
     is_complete: bool
     usage: Annotated[dict[str, Any], merge_mapping]
+
+
+# Channels that carry a reducer but that no agent ever writes, with the reason
+# each one is unwired. An empty value here is expected, not a wiring mistake.
+#
+# Listing them is what lets the guard test in
+# ``tests/unit/test_orchestrator_fallback.py`` separate "seeded elsewhere on
+# purpose" from "declared and then forgotten" -- the second failure mode is how
+# a dropped ``usage`` merge hid on the fallback path for months, because the
+# table was hand-mirrored and nothing compared it against the writers.
+#
+# A channel that appears in neither the agent write sites nor this mapping
+# fails that test. Adding one here is a deliberate act; forgetting to wire a new
+# channel is not.
+UNWIRED_BY_AGENTS: dict[str, str] = {
+    "daily_budgets": "seeded by the service from the campaign snapshot; agents read AgentContext",
+    "audience_observations": "loaded by the service from the warehouse; agents read AgentContext",
+    "usage": "folded in by the orchestrator from the gateway once the last node returns",
+}
 
 
 def initial_state(
@@ -109,7 +127,6 @@ def initial_state(
         "optimization_actions": [],
         "critic_findings": [],
         "alerts": [],
-        "alert_fingerprints": [],
         "platform_checks": [],
         "tool_preflights": [],
         "agent_messages": [],

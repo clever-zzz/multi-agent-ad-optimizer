@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
+
+import httpx
 
 from ...core.errors import ExternalServiceError
 from ...core.logging import get_logger
@@ -22,7 +25,14 @@ class MetaAdsClient(AdsPlatformClient):
 
     platform = Platform.META
 
-    def __init__(self, *, access_token: str, ad_account_id: str, app_secret: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        access_token: str,
+        ad_account_id: str,
+        app_secret: str = "",
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self._access_token = access_token
         self._ad_account_id = (
             ad_account_id
@@ -32,7 +42,7 @@ class MetaAdsClient(AdsPlatformClient):
         self._app_secret = app_secret
         self.is_configured = bool(access_token and ad_account_id)
         self._http = (
-            PlatformHTTPClient(GRAPH_BASE, timeout_seconds=30.0, max_retries=3)
+            PlatformHTTPClient(GRAPH_BASE, timeout_seconds=30.0, max_retries=3, transport=transport)
             if self.is_configured
             else None
         )
@@ -103,24 +113,26 @@ class MetaAdsClient(AdsPlatformClient):
         self, campaign_external_id: str, draft: CreativeDraft
     ) -> ExecutionResult:
         client = self._require()
+        # ``object_story_spec`` must be a JSON-encoded string. Passing the dict
+        # straight through would let httpx stringify it as a Python repr
+        # (single quotes), which Meta rejects with a 400 rather than an error we
+        # would recognise - so the encoding is explicit here.
+        spec = {
+            "page_id": campaign_external_id,
+            "link_data": {
+                "message": draft.description,
+                "link": draft.asset_urls.get("link", ""),
+                "call_to_action": {
+                    "type": _meta_cta(draft.cta_text),
+                    "value": {"link": draft.asset_urls.get("link", "")},
+                },
+            },
+        }
         payload = await client.request(
             "POST",
             "/" + GRAPH_VERSION + "/" + self._ad_account_id + "/adcreatives",
             params=self._auth_params(
-                {
-                    "name": draft.headline[:100],
-                    "object_story_spec": {
-                        "page_id": campaign_external_id,
-                        "link_data": {
-                            "message": draft.description,
-                            "link": draft.asset_urls.get("link", ""),
-                            "call_to_action": {
-                                "type": _meta_cta(draft.cta_text),
-                                "value": {"link": draft.asset_urls.get("link", "")},
-                            },
-                        },
-                    },
-                }
+                {"name": draft.headline[:100], "object_story_spec": json.dumps(spec)}
             ),
         )
         return ExecutionResult(

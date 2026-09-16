@@ -19,7 +19,7 @@
      └─────────────────┘            └───┬──────────┬───┘
                                         ▼          ▼
                                   PostgreSQL     Redis
-                                  (18 张表)   (缓存/限流/会话)
+                                  (19 张表)   (LLM 响应缓存)
 
                                         ▼
                                   ClickHouse（可选，DATA_MODE=warehouse）
@@ -67,7 +67,7 @@ docker compose ps          # 等 postgres/redis/api/frontend 全部 healthy
 | 服务 | 镜像 | 说明 |
 |---|---|---|
 | `postgres` | `postgres:16-alpine` | 主库，开启 data checksums，healthcheck 用 `pg_isready` |
-| `redis` | `redis:7-alpine` | 缓存 + 限流 + 会话，AOF 持久化 |
+| `redis` | `redis:7-alpine` | LLM 响应缓存（限流/事件总线/会话都不走 Redis），AOF 持久化 |
 | `api` | 本地构建 `Dockerfile.backend` | 入口脚本自动 `alembic upgrade head`（带重试） |
 | `frontend` | 本地构建 `Dockerfile.frontend` | nginx 提供静态包并反代 `/api` |
 | `worker` | 同 `api` | **一次性**批量优化任务，`restart: "no"`，profile `worker` |
@@ -268,7 +268,7 @@ DATABASE__URL: "postgresql+asyncpg://adoptimizer@postgres:5432/adoptimizer"
 | `REDIS__URL` | 带口令 |
 | `LLM__PROVIDER` / `LLM__API_KEY` | 用真实模型时必填；`mock` 时留空 |
 | `LLM__MONTHLY_BUDGET_USD` | 成本护栏，按实际预算设 |
-| `LLM__PRICING` | JSON，按模型给出 USD/百万 token 的 `[prompt, completion]`。内置表是国际标价，区域计费不同（中国区 DashScope 按 CNY）时必须覆盖，否则预算护栏按错单价扣减 |
+| `LLM__PRICING` | JSON，按模型给出 USD/百万 token 的 `[prompt, completion]`。内置表是国际标价，区域计费不同（中国区 DashScope 按 CNY）时必须覆盖，否则预算护栏按错单价扣减。**留空 = 不覆盖**（`.env.example` 就是空值）；只接受空字符串或合法 JSON，`LLM__PRICING` 填纯空白会在 JSON 解码阶段直接报错 |
 | `OBSERVABILITY__LOG_LEVEL` | `INFO`。排障时临时调 `DEBUG`，注意 DEBUG 会打印更多上下文 |
 | `INGEST__SOURCES` | JSON 数组，**只放真实数据源**；默认值 `["synthetic"]` 是给演示环境的 |
 | `INGEST__SCHEDULER_ENABLED` | 用 CronJob 就设 `false`（见 §3.3），靠进程内常驻循环才设 `true` |

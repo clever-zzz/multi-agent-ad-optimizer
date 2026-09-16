@@ -596,6 +596,94 @@ def creds(
     raise typer.Exit(code=exit_code)
 
 
+warehouse_app = typer.Typer(
+    help="Analytical warehouse: mirror metrics into it and check the write path."
+)
+app.add_typer(warehouse_app, name="warehouse")
+
+
+@warehouse_app.command("status")
+def warehouse_status() -> None:
+    """Report whether the configured warehouse can accept writes.
+
+    Prints which sink would be used and its health. A ``null`` sink means writes
+    go nowhere at all, which is the single most useful thing to know before
+    pointing a backfill at it.
+
+    Exits non-zero when the sink cannot accept writes, so a pre-flight check in
+    a deployment script fails rather than silently skipping the backfill.
+    """
+    from .infra.analytics import build_sink
+    from .services.warehouse_sync import WarehouseSyncService
+
+    async def _run() -> dict[str, Any]:
+        from .core.container import build_container
+
+        settings = get_settings()
+        container = await build_container(settings)
+        sink = await build_sink(settings.clickhouse)
+        try:
+            async with container.database.unit_of_work() as session:
+                return await WarehouseSyncService(session, sink).status()
+        finally:
+            await sink.close()
+            await container.shutdown()
+
+    payload = asyncio.run(_run())
+    _print(payload)
+    if not payload["available"]:
+        raise typer.Exit(code=1)
+
+
+@warehouse_app.command("sync")
+def warehouse_sync(
+    days: int = typer.Option(30, "--days", help="How many days back to mirror"),
+    campaign: str = typer.Option("", "--campaign", help="Limit the mirror to one campaign id"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run/--no-dry-run", help="Report what would move without writing it"
+    ),
+) -> None:
+    """Mirror daily metrics from the primary datastore into the warehouse.
+
+    Idempotent: the target table is a ReplacingMergeTree keyed on
+    (campaign, creative, date), so re-running a window corrects rows in place
+    instead of duplicating them. That is what makes it safe to schedule and safe
+    to re-run after a partial failure.
+
+    Run it dry first. ``--dry-run`` reports how many rows the window holds, which
+    answers "how much would this move" before a backfill touches a production
+    warehouse.
+
+    Exits non-zero when rows were found but none landed - the shape of a
+    misconfigured or unreachable warehouse.
+    """
+    from .infra.analytics import build_sink
+    from .services.warehouse_sync import WarehouseSyncService
+
+    campaign_ids = [campaign] if campaign else None
+
+    async def _run() -> dict[str, Any]:
+        from .core.container import build_container
+
+        settings = get_settings()
+        container = await build_container(settings)
+        sink = await build_sink(settings.clickhouse)
+        try:
+            async with container.database.unit_of_work() as session:
+                report = await WarehouseSyncService(session, sink).sync(
+                    days=days, campaign_ids=campaign_ids, dry_run=dry_run
+                )
+                return report.to_dict()
+        finally:
+            await sink.close()
+            await container.shutdown()
+
+    payload = asyncio.run(_run())
+    _print(payload)
+    if not payload["ok"]:
+        raise typer.Exit(code=1)
+
+
 def main() -> None:
     """Console-script entrypoint."""
     app()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import SecuritySettings
@@ -195,12 +196,40 @@ class AuthService:
         """Fetch one account or raise NotFoundError."""
         return await self._users.get_or_raise(user_id)
 
-    async def count_active_admins(self, *, excluding: str | None = None) -> int:
-        """Number of administrators that can still sign in."""
+    @staticmethod
+    def _active_admin_filters(*, excluding: str | None = None) -> list[Any]:
+        """The single definition of an administrator who can still sign in."""
         filters: list[Any] = [User.role == Role.ADMIN.value, User.is_active.is_(True)]
         if excluding:
             filters.append(User.id != excluding)
-        return await self._users.count(filters=filters)
+        return filters
+
+    async def count_active_admins(self, *, excluding: str | None = None) -> int:
+        """Number of administrators that can still sign in."""
+        return await self._users.count(filters=self._active_admin_filters(excluding=excluding))
+
+    @classmethod
+    def _active_admin_lock_statement(cls) -> Select[Any]:
+        """Select every active administrator id, locking those rows.
+
+        Counting without a lock is a read-then-write race: two administrators
+        demoting each other concurrently each see the other still active, both
+        pass the guard, and the control plane is left with nobody who can sign
+        in. Locking the whole active-admin set serialises those transactions, so
+        the loser re-reads and finds nobody else remaining. ``with_for_update()``
+        renders nothing on SQLite - development only, and it already serialises
+        writers - so the guard degrades to a plain count there.
+        """
+        return select(User.id).where(*cls._active_admin_filters()).with_for_update()
+
+    async def _refuse_if_last_admin(self, user_id: str, *, verb: str) -> None:
+        """Raise 409 unless an active administrator other than ``user_id`` remains."""
+        result = await self._users.session.execute(self._active_admin_lock_statement())
+        others = [admin_id for admin_id in result.scalars().all() if str(admin_id) != user_id]
+        if not others:
+            raise ConflictError(
+                f"Cannot {verb} the last active administrator; promote another administrator first"
+            )
 
     async def set_active(self, user_id: str, *, is_active: bool) -> User:
         """Enable or disable an account.
@@ -209,15 +238,8 @@ class AuthService:
         control plane, so it is refused until another admin exists.
         """
         user = await self._users.get_or_raise(user_id)
-        if (
-            not is_active
-            and user.role == Role.ADMIN.value
-            and (await self.count_active_admins(excluding=user.id)) == 0
-        ):
-            raise ConflictError(
-                "Cannot deactivate the last active administrator; "
-                "promote another administrator first"
-            )
+        if not is_active and user.role == Role.ADMIN.value:
+            await self._refuse_if_last_admin(user.id, verb="deactivate")
         user.is_active = is_active
         if not is_active:
             await self.logout_everywhere(user_id)
@@ -228,14 +250,8 @@ class AuthService:
         """Change an account's role, revoking its sessions so the new
         permissions take effect immediately rather than on the next login."""
         user = await self._users.get_or_raise(user_id)
-        if (
-            user.role == Role.ADMIN.value
-            and role is not Role.ADMIN
-            and (await self.count_active_admins(excluding=user.id)) == 0
-        ):
-            raise ConflictError(
-                "Cannot demote the last active administrator; promote another administrator first"
-            )
+        if user.role == Role.ADMIN.value and role is not Role.ADMIN:
+            await self._refuse_if_last_admin(user.id, verb="demote")
         user.role = role.value
         await self._users.flush()
         await self.logout_everywhere(user_id)

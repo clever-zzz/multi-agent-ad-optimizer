@@ -10,14 +10,18 @@ from sqlalchemy import Select, and_, func, select
 
 from ..core.clock import utc_today
 from ..core.ids import new_id
+from ..core.logging import get_logger
 from ..domain.enums import CampaignStatus, CreativeStatus, Platform
-from ..domain.kpi import PerformanceSnapshot
+from ..domain.kpi import PerformanceSnapshot, reconcile_delivery
+from ..infra.analytics import DailyMetricRow
 from ..infra.db.models import Campaign, Creative, DailyMetric
 from .base import BaseRepository
 
+logger = get_logger(__name__)
+
 # The measures a snapshot folds up. ``unique_reach`` is deliberately absent:
 # reach is not additive across days, so summing it would be meaningless.
-_MEASURE_COLUMNS = ("impressions", "clicks", "conversions", "cost", "revenue")
+MEASURE_COLUMNS = ("impressions", "clicks", "conversions", "cost", "revenue")
 
 
 class CampaignRepository(BaseRepository[Campaign]):
@@ -318,6 +322,38 @@ class MetricRepository(BaseRepository[DailyMetric]):
         )
         return {(row[0], row[1], row[2]) for row in (await self.session.execute(statement)).all()}
 
+    async def export_daily(
+        self, *, days: int, campaign_ids: Sequence[str] | None = None
+    ) -> list[DailyMetricRow]:
+        """Every stored slot in the window, for mirroring into the warehouse.
+
+        Unlike ``snapshots``, this deliberately does *not* merge the two
+        granularities. The warehouse stores the campaign roll-up and the
+        creative breakdown as separate rows and its own reader decides which to
+        use; collapsing them here would silently discard the creative detail on
+        the way out, and the mirror would then be a lossy copy of the source.
+        """
+        cutoff = utc_today() - timedelta(days=days - 1)
+        statement = select(DailyMetric).where(DailyMetric.stat_date >= cutoff)
+        if campaign_ids:
+            statement = statement.where(DailyMetric.campaign_id.in_(list(campaign_ids)))
+        rows = (await self.session.execute(statement)).scalars().all()
+        return [
+            DailyMetricRow(
+                campaign_id=row.campaign_id,
+                stat_date=row.stat_date,
+                impressions=int(row.impressions or 0),
+                clicks=int(row.clicks or 0),
+                conversions=int(row.conversions or 0),
+                cost=float(row.cost or 0.0),
+                revenue=float(row.revenue or 0.0),
+                creative_id=row.creative_id or "",
+                unique_reach=row.unique_reach,
+                source=row.source or "",
+            )
+            for row in rows
+        ]
+
     async def _daily_slots(
         self, cutoff: date, campaign_ids: Sequence[str] | None, *, breakdown: bool
     ) -> dict[tuple[str, date], dict[str, Any]]:
@@ -346,53 +382,87 @@ class MetricRepository(BaseRepository[DailyMetric]):
         return {
             (str(row.campaign_id), row.stat_date): {
                 "campaign_name": str(row.campaign_name or ""),
-                **{column: float(getattr(row, column) or 0.0) for column in _MEASURE_COLUMNS},
+                **{column: float(getattr(row, column) or 0.0) for column in MEASURE_COLUMNS},
             }
             for row in (await self.session.execute(statement)).all()
         }
+
+    async def merged_slots(
+        self, cutoff: date, campaign_ids: Sequence[str] | None = None
+    ) -> dict[tuple[str, date], dict[str, Any]]:
+        """Delivery per (campaign, day) from exactly one of the two granularities.
+
+        The roll-up wins a bucket that has one; the breakdown only fills buckets
+        that have no roll-up at all. Merging per bucket rather than per campaign is
+        what keeps a mixed portfolio exact - a campaign ingested only per creative
+        still contributes its delivery instead of reading as zero and disappearing
+        from whatever is being computed.
+
+        Public because every reader of this table needs the same answer, not only
+        the snapshot path. This is the primary-datastore form of the rule
+        ``ClickHouseWarehouse._delivery_relation`` applies over the mirror and
+        ``SqlAggregateWarehouse._merged_slots`` applies over its own copy.
+        """
+        slots = await self._daily_slots(cutoff, campaign_ids, breakdown=False)
+        breakdown = await self._daily_slots(cutoff, campaign_ids, breakdown=True)
+        for key, measures in breakdown.items():
+            slots.setdefault(key, measures)
+        return slots
 
     async def snapshots(
         self, campaign_ids: Sequence[str] | None = None, *, days: int = 7
     ) -> list[PerformanceSnapshot]:
         """Aggregate daily rows into per-campaign performance snapshots.
 
-        ``daily_metrics`` stores two granularities side by side: a campaign-level
-        slot with ``creative_id IS NULL`` holding the day's total, and one row per
-        creative holding the breakdown of that same total. Summing both inflates
-        every KPI, so slots are merged with the campaign-level row winning and the
-        breakdown only filling (campaign, day) buckets that have no roll-up. That
-        is the same contract ``SqlAggregateWarehouse`` implements, and merging per
-        bucket rather than per campaign is what keeps a mixed portfolio exact.
+        Delivery comes from ``merged_slots``, the one implementation of the
+        two-granularity rule on this side of the warehouse. Summing the table
+        directly would add each campaign-level roll-up to the creative breakdown of
+        that same roll-up and inflate every KPI - and this is the reader that feeds
+        ``collect_run_inputs``, so the inflated numbers are what every agent in a
+        run scores on.
         """
         cutoff = utc_today() - timedelta(days=max(1, days) - 1)
-        slots = await self._daily_slots(cutoff, campaign_ids, breakdown=False)
-        breakdown = await self._daily_slots(cutoff, campaign_ids, breakdown=True)
-        for key, measures in breakdown.items():
-            slots.setdefault(key, measures)
+        slots = await self.merged_slots(cutoff, campaign_ids)
 
         names: dict[str, str] = {}
         totals: dict[str, dict[str, float]] = {}
         for (campaign_id, _day), measures in slots.items():
             names.setdefault(campaign_id, str(measures["campaign_name"]))
-            bucket = totals.setdefault(campaign_id, dict.fromkeys(_MEASURE_COLUMNS, 0.0))
-            for column in _MEASURE_COLUMNS:
+            bucket = totals.setdefault(campaign_id, dict.fromkeys(MEASURE_COLUMNS, 0.0))
+            for column in MEASURE_COLUMNS:
                 bucket[column] += float(measures[column])
 
         snapshots: list[PerformanceSnapshot] = []
         for campaign_id in sorted(totals):
             bucket = totals[campaign_id]
-            impressions = int(bucket["impressions"])
-            clicks = min(int(bucket["clicks"]), impressions)
-            conversions = min(int(bucket["conversions"]), clicks)
+            delivery = reconcile_delivery(
+                impressions=int(bucket["impressions"]),
+                clicks=int(bucket["clicks"]),
+                conversions=int(bucket["conversions"]),
+                cost=bucket["cost"],
+                revenue=bucket["revenue"],
+            )
+            if delivery.repaired:
+                # Several feeds may assert different columns of one slot, so an
+                # inverted funnel can reach storage without any single record
+                # having been invalid. The repair is right, but it is not free
+                # information: it means two sources disagree about the same day.
+                logger.warning(
+                    "funnel_reconciled",
+                    reader="metric_repository",
+                    campaign_id=campaign_id,
+                    clicks=int(bucket["clicks"]),
+                    impressions=delivery.impressions,
+                )
             snapshots.append(
                 PerformanceSnapshot(
                     campaign_id=campaign_id,
                     campaign_name=names.get(campaign_id, ""),
-                    impressions=impressions,
-                    clicks=clicks,
-                    conversions=conversions,
-                    total_cost=round(bucket["cost"], 4),
-                    total_revenue=round(bucket["revenue"], 4),
+                    impressions=delivery.impressions,
+                    clicks=delivery.clicks,
+                    conversions=delivery.conversions,
+                    total_cost=delivery.cost,
+                    total_revenue=delivery.revenue,
                 )
             )
         return snapshots

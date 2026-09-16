@@ -11,6 +11,7 @@ from adoptimizer.domain.kpi import (
     PerformanceSnapshot,
     health_score,
     health_status,
+    reconcile_delivery,
     snapshot_from_row,
     summarize,
 )
@@ -45,6 +46,55 @@ class TestFunnelValidation:
     def test_model_is_frozen(self) -> None:
         with pytest.raises(ValidationError):
             snap().impressions = 5  # type: ignore[misc]
+
+
+class TestReconcileDelivery:
+    """The one place a stored funnel is repaired, shared by every reader."""
+
+    def test_a_well_formed_funnel_is_untouched(self) -> None:
+        delivery = reconcile_delivery(
+            impressions=1000, clicks=40, conversions=3, cost=51.25, revenue=210.0
+        )
+
+        assert (delivery.impressions, delivery.clicks, delivery.conversions) == (1000, 40, 3)
+        assert delivery.repaired is False
+
+    def test_an_inverted_funnel_is_clamped_and_reported(self) -> None:
+        """Two feeds asserting different columns of one slot can produce this."""
+        delivery = reconcile_delivery(
+            impressions=1000, clicks=5000, conversions=1500, cost=80.0, revenue=900.0
+        )
+
+        assert delivery.impressions == 1000
+        assert delivery.clicks == 1000
+        assert delivery.conversions == 1000
+        assert delivery.repaired is True
+
+    def test_the_result_always_satisfies_the_snapshot_invariant(self) -> None:
+        """A reconciled funnel must be constructible, or the repair was pointless."""
+        delivery = reconcile_delivery(
+            impressions=7, clicks=900, conversions=400, cost=1.0, revenue=2.0
+        )
+
+        snapshot = PerformanceSnapshot(
+            campaign_id="c1",
+            impressions=delivery.impressions,
+            clicks=delivery.clicks,
+            conversions=delivery.conversions,
+            total_cost=delivery.cost,
+            total_revenue=delivery.revenue,
+        )
+
+        assert snapshot.ctr == 1.0
+
+    def test_money_is_normalised_to_the_shared_precision(self) -> None:
+        """Float accumulation noise must not make two readers disagree."""
+        delivery = reconcile_delivery(
+            impressions=1, clicks=0, conversions=0, cost=1234.567891, revenue=0.1 + 0.2
+        )
+
+        assert delivery.cost == 1234.5679
+        assert delivery.revenue == 0.3
 
 
 class TestDerivedMetrics:

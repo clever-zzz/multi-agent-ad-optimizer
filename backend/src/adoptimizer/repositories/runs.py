@@ -10,6 +10,7 @@ from sqlalchemy import Select, func, select
 
 from ..core.ids import new_id
 from ..core.logging import get_logger
+from ..core.metrics import ACTIONS_TOTAL
 from ..domain.enums import ActionStatus, RunStatus
 from ..infra.db.models import (
     BudgetAllocationRecord,
@@ -59,6 +60,23 @@ class RunRepository(BaseRepository[OptimizationRun]):
         run.started_at = datetime.now(UTC)
         await self.flush()
         return run
+
+    async def mark_progress(self, run_id: str, iteration: int) -> None:
+        """Record live iteration progress on a run that is still executing.
+
+        Without this the stored ``iteration`` only appears at ``mark_finished``,
+        so an operator watching a long run sees zero until it ends. The write is
+        refused once the run is terminal - a late progress report must not
+        resurrect a cancelled or reaped run - and refused when it would not
+        advance, which keeps it to one UPDATE per iteration.
+        """
+        run = await self.get_or_raise(run_id)
+        if RunStatus(run.status).is_terminal:
+            return
+        if iteration <= run.iteration:
+            return
+        run.iteration = iteration
+        await self.flush()
 
     async def mark_finished(
         self,
@@ -173,6 +191,12 @@ class RunRepository(BaseRepository[OptimizationRun]):
             for action in actions
         ]
         self.session.add_all(records)
+        # ``outcome`` is the status the row is being written with, so the series
+        # splits proposals from the critic's suppressed ones at the moment that
+        # distinction is decided. Execution outcomes are counted where they
+        # happen, in ``ActionService.execute``.
+        for record in records:
+            ACTIONS_TOTAL.labels(action_type=record.action_type, outcome=record.status).inc()
         return records
 
     async def add_findings(

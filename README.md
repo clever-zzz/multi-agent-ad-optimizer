@@ -18,15 +18,14 @@
 
 | 维度 | 现状 |
 |---|---|
-| 后端 | FastAPI + SQLAlchemy 2 async + Alembic，18 张表，53 个业务端点 + 4 个系统端点 |
+| 后端 | FastAPI + SQLAlchemy 2 async + Alembic，19 张表，54 个业务端点 + 4 个系统端点 |
 | 前端 | React 19 + TypeScript + Vite + Tailwind 4 运营控制台，13 个页面；`package-lock.json` 已提交，安装一律 `npm ci` |
 | 编排 | LangGraph Supervisor 图（6 智能体 + 告警迭代回环 + 提案冲突复核）；缺依赖时自动降级为等价顺序执行器 |
 | 安全治理 | Argon2id 哈希 + 可撤销 JWT 会话 + 5 角色 RBAC + 全量审计 + 人工审批门 + 首次登录强制改密 |
 | 可观测 | `/healthz` `/readyz` `/metrics` + structlog JSON + 全链路 `X-Request-ID` + SSE 运行事件回放 |
-| 测试 | 后端 1072（687 unit + 385 integration，覆盖率 88.54%，ratchet 下限 88%）+ 前端 101，CI 强制 |
+| 测试 | 后端 1273（838 unit + 435 integration，覆盖率 91.07%，ratchet 下限 88%）+ 前端 109，CI 强制 |
 | 部署 | 多阶段非 root 镜像 + compose（dev/prod）+ kustomize（HPA/PDB/NetworkPolicy/Ingress/采集 CronJob） |
 | CI | 6 个 job：`backend` / `migrations` / `frontend` / `images` / `manifests` / `workflows` |
-| 遗留 demo | `python/` `java/` `golang/` 仅作教学参考，不在生产路径上 |
 
 ---
 
@@ -136,11 +135,10 @@ deploy/
   k8s/                    kustomize：Namespace/ConfigMap/Secret 示例/PostgreSQL STS/Redis/迁移 Job/HPA/PDB/Ingress/NetworkPolicy
 scripts/                  Windows PowerShell 助手：setup / dev / check / clean
 .github/workflows/ci.yml  后端 ruff+mypy+pytest-cov，迁移 alembic upgrade/check/downgrade（Postgres 服务），前端 eslint+tsc+vitest+build，镜像构建与部署清单校验
-docs/production/          生产文档：快速开始、架构、API、部署、运维手册、安全、测试、限制
+docs/production/          生产文档：快速开始、架构、API、部署、运维手册、安全、测试、限制、升级路径
 docs/adr/                 架构决策记录
 docs/interview/           面试资料（问答集、深挖追问、速记卡、八股、STAR、简历模板）
 docs/tutorial/            入门教程（环境、Agent 基础、LangGraph、ClickHouse、部署）
-python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / goroutine），仅作教学参考，不参与生产部署
 ```
 
 ---
@@ -152,7 +150,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
    React 19 操作台 ──▶│  FastAPI  /api/v1                            │
    (TanStack Query,   │  ├ RequestContextMiddleware  (request_id)    │
     SSE 实时进度)      │  ├ SecurityHeadersMiddleware (HSTS/CSP/...)  │
-                      │  ├ RateLimitMiddleware       (令牌桶)         │
+                      │  ├ RateLimitMiddleware       (固定窗口)       │
                       │  ├ GZip / CORS / TrustedHost                 │
                       │  └ RBAC 依赖注入 (require_permission)        │
                       └───────────────┬──────────────────────────────┘
@@ -170,11 +168,11 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
                                       │ 事件总线（内存队列 / SSE 回放）
         ┌─────────────────────────────┼─────────────────────────────┐
         ▼                             ▼                             ▼
-  PostgreSQL / SQLite          Redis（缓存 + 限流）        广告平台适配器
-  14 张表 + Alembic            可关闭，降级为进程内         mock / Google / Meta / TikTok
+  PostgreSQL / SQLite          Redis（LLM 响应缓存）      广告平台适配器
+  19 张表 + Alembic            可关闭，降级为进程内         mock / Google / Meta / TikTok
                                                               │
                                                         ClickHouse（可选）
-                                                        DATA_MODE=warehouse
+                                                        CLICKHOUSE__ENABLED=true
 ```
 
 **关键不变量**：Agent 之间不直接调用，只通过共享 `AgentState` 通信；所有状态变更都写入 `audit_logs`；所有对外部广告平台的写操作都必须先经过 `optimization_actions` 的人工审批门（`SECURITY__REQUIRE_ACTION_APPROVAL=true`，默认开启）。
@@ -198,7 +196,9 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 **编排与智能体**
 - LangGraph Supervisor 图；`langgraph` 未安装或编译失败时自动降级为等价的顺序执行器，业务结果一致
 - 6 个智能体：异常监控、受众分析、创意生成、竞价优化、预算重分配、冲突复核
-- critic 在人工审批前复核全部提案：同一活动不会同时收到“暂停”与“加预算”，跨迭代重复的同一意图只保留一条；平台预检判定为阻塞的提案（`unexecutable_proposal`）直接不进审批队列，免得运营去批一个注定失败的动作；裁决先比告警严重度、再比置信度（两者量的不是同一件事），被抑制的提案仍保留在 run 摘要里，可审计、可被人工推翻
+- critic 在人工审批前复核全部提案：同一活动不会同时收到“暂停”与“加预算”，跨迭代重复的同一意图只保留一条；平台预检判定为阻塞的提案（`unexecutable_proposal`）直接不进审批队列，免得运营去批一个注定失败的动作；裁决先比告警严重度、再比置信度（两者量的不是同一件事）
+- critic **标记而不删除**：裁决落 `critic_findings` 表，被抑制的提案以 `suppressed` 状态留在 `optimization_actions` 里。运维可以 `GET /runs/{id}/findings` 查理由，也可以 approve 翻案（审计带 `overruled_critic: true`）
+- 唯一不由 critic 裁决的冲突是**反向花费意图**（同一活动同时被提议抬价与砍预算）：两者各自的参照系都成立，critic 不替运营选边，而是产出 `opposing_spend_intent` 裁决把两条都留在队列里、附上必须由人决定的理由
 - 迭代回环：仍有告警且未超 `max_iterations` 时自动再跑一轮
 - 预算分配优先走 CVXPY 凸优化，不可用时回退到贪心 LP，并在结果里标注 `solver`
 
@@ -242,7 +242,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 **可观测性**
 - `/healthz`（存活）、`/readyz`（依赖聚合，不可用时 503）、`/metrics`（Prometheus）
 - structlog JSON 结构化日志 + 全链路 `X-Request-ID`
-- 每次 LLM 调用记账（token/成本/延迟/结果），月度预算护栏，超预算按配置降级到 mock
+- 每次 LLM 调用记账（token/成本/延迟/结果），月度预算护栏：超限直接抛 `BudgetExceededError`（HTTP 402），**不受 `LLM__FAIL_OPEN_TO_MOCK` 影响**——那个开关只管供应商调用重试打满后是否退到 mock
 - 运行事件落库 `run_events`，SSE 可回放，断线重连不丢进度
 
 **前端操作台**
@@ -255,7 +255,7 @@ python/ java/ golang/     原始 demo 实现（Streamlit / Spring Boot / gorouti
 
 ## API 概览
 
-业务端点前缀 `/api/v1`，共 **53** 个；另有 **4** 个免鉴权系统端点挂在根路径（`/healthz` `/readyz` `/metrics` `/system/info`）。错误响应统一为 RFC 9457 风格的 problem document：
+业务端点前缀 `/api/v1`，共 **54** 个；另有 **4** 个免鉴权系统端点挂在根路径（`/healthz` `/readyz` `/metrics` `/system/info`）。错误响应统一为 RFC 9457 风格的 problem document：
 
 ```json
 {
@@ -312,8 +312,8 @@ make check                 # 同上，CI 顺序一致
 | Lint | `ruff check` | 0 error（E/W/F/I/N/UP/B/A/C4/SIM/TCH/RUF/S/PTH/DTZ/ASYNC/RET/ARG） |
 | 类型 | `mypy --strict` / `tsc` | 后端 0 error；前端 `strict` + `noUnusedLocals` |
 | 迁移 | `alembic upgrade head / check / downgrade base` | 可升级、可回滚，且 `alembic check` 无 autogenerate 漂移 |
-| 后端测试 | `pytest --cov` | 1072 个（687 unit + 385 integration）；分支覆盖率 88.54%，ratchet 下限 **88%**，失败即 CI 红 |
-| 前端测试 | `vitest` | 101 个；`eslint --max-warnings 0` 同时强制 0 warning |
+| 后端测试 | `pytest --cov` | 1273 个（838 unit + 435 integration）；分支覆盖率 91.07%，ratchet 下限 **88%**，失败即 CI 红 |
+| 前端测试 | `vitest` | 109 个；`eslint --max-warnings 0` 同时强制 0 warning |
 | 依赖安装 | `npm ci` | lockfile 已提交，CI 与 `setup.ps1` 一律走 `npm ci`，漂移即失败 |
 
 CI 还会构建两个容器镜像，并校验 compose 与 kustomize 清单可渲染。见 [.github/workflows/ci.yml](.github/workflows/ci.yml)（6 个 job：`backend`、`migrations`、`frontend`、`images`、`manifests`、`workflows`）。
@@ -322,19 +322,19 @@ CI 还会构建两个容器镜像，并校验 compose 与 kustomize 清单可渲
 
 ## 文档索引
 
-**生产文档** — [docs/production/](docs/production/)
+**生产文档** — [docs/production/](docs/production/README.md)
 - [01 快速开始](docs/production/01-quickstart.md) · [02 架构](docs/production/02-architecture.md) · [03 API 参考](docs/production/03-api-reference.md)
 - [04 部署](docs/production/04-deployment.md) · [05 运维手册](docs/production/05-operations-runbook.md) · [06 安全](docs/production/06-security.md)
-- [07 测试与 CI](docs/production/07-testing-and-ci.md) · [08 限制与路线图](docs/production/08-limitations-and-roadmap.md)
+- [07 测试与 CI](docs/production/07-testing-and-ci.md) · [08 限制与路线图](docs/production/08-limitations-and-roadmap.md) · [09 优化升级路径](docs/production/09-upgrade-path.md)
 
-**决策记录** — [docs/adr/](docs/adr/)
+**决策记录** — [docs/adr/](docs/adr/README.md)
 
 **面试资料**（已对齐当前落地版本）— [docs/interview/](docs/interview/README.md)
 - [问答集](docs/interview/qa-collection.md) · [深挖追问](docs/interview/hard-questions.md) · [速记卡](docs/interview/project-facts.md) · [八股](docs/interview/baguwen.md) · [STAR 话术](docs/interview/star-method.md) · [简历模板](docs/interview/resume-template.md)
 
-**历史与教学材料**（不影响生产路径）
-- [旧版 demo README（已归档，含作废的示意数字）](docs/interview/legacy-readme.md)
-- [入门教程](docs/tutorial/) · [三语言代码讲解](docs/code-walkthrough/) · [早期架构稿](docs/architecture.md) · [原始规划](docs/plan.md)
+**入门教程**（零基础，已对齐当前落地版本）— [docs/tutorial/](docs/tutorial/README.md)
+- [01 环境搭建](docs/tutorial/01-environment-setup.md) · [02 Agent 基础](docs/tutorial/02-agent-basics.md) · [03 LangGraph 入门](docs/tutorial/03-langgraph-intro.md)
+- [04 ClickHouse 实战](docs/tutorial/04-clickhouse-guide.md) · [05 部署与运行](docs/tutorial/05-deploy-guide.md)
 
 ---
 
@@ -348,8 +348,8 @@ CI 还会构建两个容器镜像，并校验 compose 与 kustomize 清单可渲
 - **LLM 默认 mock**。切到真实模型后，创意生成与受众洞察的质量取决于 prompt 与模型，需要自建评测集。
 - **智能体的写操作永远停在预检**。工具层已经接进决策路径（monitor 拉实时报表核对告警、optimize 对每条写提案做平台预检、人工执行也走同一个执行器），但 `TOOLS__ALLOW_AGENT_WRITES=false` 意味着模型自己一次都动不了真实账户——这是刻意设计，不是待补的缺口。代价是预检只能暴露参数、权限和状态层面的问题；真实平台的配额、竞价冲突要到人工执行那一刻才知道。
 - **LLM 目前不在决策路径上**。全仓只有 2 处模型调用：`creative` 生成文案（失败降级为模板）、`audience` 产出叙述性假设（当前不被下游消费）。所有涉及金额的决定都由 `domain/` 的确定性代码做出，所以换掉 mock provider 不会改变动作集合。这是刻意取舍，但不该被误读为“模型在做决策”。
-- **ClickHouse 路径**（`DATA_MODE=warehouse`）有 schema 与查询实现，但没有真实数据量的压测数据。
-- 完整清单与缓解方案见 [docs/production/08-limitations-and-roadmap.md](docs/production/08-limitations-and-roadmap.md)。
+- **ClickHouse 路径**（`DATA_MODE=warehouse`）的写入侧已就绪：`infra/analytics/` 提供 `AnalyticsSink`，`adoptimizer warehouse sync` 把运营库的日报镜像进仓库（`ReplacingMergeTree`，可安全重跑）。注意平台 API 给的是**日报而非事件流**，所以当前主路径是聚合表 `campaign_daily_metrics`（配 `CLICKHOUSE__METRICS_SOURCE=daily` 读取），`ad_events` 留给真实事件流。**未经真实数据量验证**。读路径连不上库时降级到空结果（刻意设计，避免拖垮优化循环），但会计入 `warehouse_reads_total{outcome="degraded"}` 而不再无声。见 [09 §S3](docs/production/09-upgrade-path.md)。
+- 完整清单与缓解方案见 [docs/production/08-limitations-and-roadmap.md](docs/production/08-limitations-and-roadmap.md)；**按什么顺序解决、每步怎么验收**见 [09 优化升级路径](docs/production/09-upgrade-path.md)。
 
 ---
 

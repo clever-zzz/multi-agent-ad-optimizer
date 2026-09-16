@@ -4,6 +4,10 @@ Agents score campaigns from whatever this module returns, so a wrong aggregate
 silently biases every budget decision. The SQL backend is exercised against a
 real (in-memory) database and the ClickHouse backend against a fake driver,
 which is the only way to cover its query building without a warehouse.
+
+The dashboard trend is covered here as well. It is a third reader over the same
+two-granularity table, so it has to reach the same numbers rather than merely
+plausible ones.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from adoptimizer.domain.enums import CampaignStatus, Platform
 from adoptimizer.infra import warehouse as warehouse_module
 from adoptimizer.infra.db.session import Database
 from adoptimizer.infra.warehouse import (
+    MEASURES,
     ClickHouseWarehouse,
     SqlAggregateWarehouse,
     build_warehouse,
@@ -29,6 +34,7 @@ from adoptimizer.repositories.campaigns import (
     CreativeRepository,
     MetricRepository,
 )
+from adoptimizer.services.analytics import AnalyticsService
 
 from ..conftest import make_settings
 
@@ -179,6 +185,44 @@ async def add_breakdown_only_campaign(session: Any) -> str:
     return campaign.id
 
 
+async def add_inverted_funnel_campaign(session: Any) -> str:
+    """A campaign whose stored funnel is inverted, the way two feeds can leave it.
+
+    Ingestion refuses a single record that claims more clicks than impressions,
+    but ``upsert_daily`` lets one feed assert impressions and another assert clicks
+    on the same slot, and neither record is invalid on its own. This is the shape
+    that actually reaches storage, and the one a well-formed fixture never builds.
+    """
+    campaigns = CampaignRepository(session)
+    metrics = MetricRepository(session)
+    today = utc_today()
+
+    campaign = await campaigns.create(
+        name="Inverted funnel",
+        platform=Platform.MOCK,
+        daily_budget=200.0,
+        total_budget=2000.0,
+        target_cpa=50.0,
+        target_roas=2.5,
+        start_date=today - timedelta(days=10),
+        status=CampaignStatus.ACTIVE,
+    )
+    await metrics.upsert_daily(
+        campaign_id=campaign.id,
+        stat_date=today,
+        impressions=1_000,
+        cost=1234.567891,
+    )
+    await metrics.upsert_daily(
+        campaign_id=campaign.id,
+        stat_date=today,
+        clicks=5_000,
+        conversions=1_500,
+        revenue=900.0,
+    )
+    return campaign.id
+
+
 class TestMetricRepositorySnapshots:
     """The primary-datastore reader must honour the same slot contract.
 
@@ -220,6 +264,41 @@ class TestMetricRepositorySnapshots:
             }
 
         assert measures(repository) == measures(warehouse)
+
+    async def test_an_inverted_funnel_is_repaired_identically_by_both_readers(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        """The agreement test has to feed data that makes the repair fire.
+
+        With well-formed fixtures a clamp is a no-op on both sides, so the equality
+        assertion passes even when only one reader performs it - which is how the
+        two readers drifted apart without any test noticing.
+        """
+        campaign_id = await add_inverted_funnel_campaign(session)
+
+        repository = await MetricRepository(session).snapshots(days=7)
+        warehouse = await SqlAggregateWarehouse(session).campaign_snapshots(None, days=7)
+
+        def measures(items: list[Any]) -> dict[str, tuple[Any, ...]]:
+            return {
+                item.campaign_id: (
+                    item.impressions,
+                    item.clicks,
+                    item.conversions,
+                    item.total_cost,
+                    item.total_revenue,
+                )
+                for item in items
+            }
+
+        assert measures(repository) == measures(warehouse)
+
+        repaired = next(item for item in repository if item.campaign_id == campaign_id)
+        assert repaired.impressions == 1_000
+        assert repaired.clicks == 1_000
+        assert repaired.conversions == 1_000
+        assert repaired.total_cost == 1234.5679
+        assert repaired.total_revenue == 900.0
 
     async def test_a_breakdown_only_campaign_is_still_counted(
         self, session: Any, portfolio: dict[str, str]
@@ -407,6 +486,57 @@ class TestSqlAggregateWarehouse:
         assert len(snapshots) == 3
         rows = await warehouse.timeseries(None, days=7)
         assert rows[-1]["impressions"] == 12_000 + 3_000
+
+
+class TestAnalyticsTrend:
+    """/analytics/timeseries reads the same table the agents are scored from."""
+
+    async def test_it_reports_each_day_once(self, session: Any, portfolio: dict[str, str]) -> None:
+        rows = await AnalyticsService(session).timeseries(days=7)
+
+        by_date = {row["date"]: row for row in rows}
+        today = by_date[utc_today().isoformat()]
+        # 10_000 + 2_000 from the two campaign-level slots. Adding today's two
+        # creative rows would report 22_000 impressions and 1_200 of spend - a
+        # trend line twice as tall as the delivery it describes.
+        assert today["impressions"] == 12_000
+        assert today["clicks"] == 440
+        assert today["conversions"] == 21
+        assert today["cost"] == 700.0
+        assert today["revenue"] == 1800.0
+        assert today["ctr"] == round(440 / 12_000, 6)
+        assert today["roas"] == round(1800.0 / 700.0, 4)
+
+    async def test_it_agrees_with_the_warehouse_trend(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        """Two readers over one table must not disagree about the numbers."""
+        analytics = await AnalyticsService(session).timeseries(days=7)
+        warehouse = await SqlAggregateWarehouse(session).timeseries(None, days=7)
+
+        shared = ("date", "impressions", "clicks", "conversions", "cost", "revenue")
+        assert [{key: row[key] for key in shared} for row in analytics] == [
+            {key: row[key] for key in shared} for row in warehouse
+        ]
+
+    async def test_a_breakdown_only_campaign_still_reaches_the_trend(self, session: Any) -> None:
+        """Having no roll-up row must not erase a campaign's delivery from the chart."""
+        await add_breakdown_only_campaign(session)
+
+        rows = await AnalyticsService(session).timeseries(days=7)
+
+        assert len(rows) == 2
+        assert rows[-1]["impressions"] == 3_000
+        assert rows[0]["revenue"] == 260.0
+
+    async def test_the_campaign_filter_still_applies(
+        self, session: Any, portfolio: dict[str, str]
+    ) -> None:
+        rows = await AnalyticsService(session).timeseries(days=7, campaign_id=portfolio["beta"])
+
+        assert len(rows) == 1
+        assert rows[0]["conversions"] == 1
+        assert rows[0]["cost"] == 200.0
 
 
 class FakeResult:
@@ -701,3 +831,176 @@ class TestWarehouseSelection:
         assert isinstance(warehouse, ClickHouseWarehouse)
         assert warehouse.name == "clickhouse"
         await warehouse.close()
+
+
+def daily_connected(*, fail_query: bool = False) -> tuple[ClickHouseWarehouse, FakeDriver]:
+    """A warehouse reading the aggregate table, with the driver already wired."""
+    settings = ClickHouseSettings(enabled=True, database="ad_optimizer", metrics_source="daily")
+    warehouse = ClickHouseWarehouse(settings)
+    driver = FakeDriver(fail_query=fail_query)
+    warehouse._client = driver
+    return warehouse, driver
+
+
+class TestClickHouseDailySource:
+    """The aggregate-table source, which is the one ingestion can populate today."""
+
+    async def test_events_remain_the_default_source(self) -> None:
+        """Enabling ClickHouse must not silently change what a deployment reads."""
+        warehouse = ClickHouseWarehouse(ClickHouseSettings(enabled=True))
+
+        assert warehouse.source == "events"
+        assert warehouse._table == "ad_events"
+
+    async def test_the_aggregate_table_is_summed_not_counted(self) -> None:
+        """Counting rows in a table that already holds totals undercounts by orders."""
+        warehouse, driver = daily_connected()
+
+        await warehouse.campaign_snapshots(None, days=7)
+
+        assert "campaign_daily_metrics" in driver.first_sql
+        assert "sum(impressions)" in driver.first_sql
+        # ``countIf`` does appear here, but on creative_id - the granularity probe
+        # the slot collapse needs. What must not appear is the event-type counting
+        # that only means anything over ad_events.
+        assert "countIf(event_type" not in driver.first_sql
+        assert "ad_events" not in driver.first_sql
+
+    async def test_a_rollup_bucket_is_not_summed_with_its_breakdown(self) -> None:
+        """The mirror stores both granularities, so a bare sum doubles every KPI.
+
+        ``export_daily`` copies the campaign roll-up and the creative breakdown as
+        separate rows, exactly as the primary datastore holds them. This is the
+        warehouse-side half of the double-count the two SQL readers already guard.
+        """
+        warehouse, driver = daily_connected()
+
+        await warehouse.campaign_snapshots(None, days=7)
+
+        sql = driver.first_sql
+        assert "GROUP BY campaign_id, stat_date" in sql
+        assert "countIf(creative_id = '') > 0" in sql
+        for measure in MEASURES:
+            assert "sumIf(" + measure + ", creative_id = '')" in sql
+            assert "sumIf(" + measure + ", creative_id != '')" in sql
+
+    async def test_the_rollup_preference_is_decided_per_bucket(self) -> None:
+        """One campaign must not decide the granularity for another.
+
+        Collapsing per campaign instead of per (campaign, day) would read a
+        campaign that only ever stored creative rows as zero and drop it out of the
+        report entirely - the failure the SQL-side slot merge exists to prevent.
+        """
+        warehouse, driver = daily_connected()
+
+        await warehouse.campaign_snapshots(None, days=7)
+
+        sql = driver.first_sql
+        assert sql.endswith("GROUP BY campaign_id, stat_date) GROUP BY campaign_id")
+
+    async def test_timeseries_collapses_the_granularities_per_day(self) -> None:
+        warehouse, driver = daily_connected()
+
+        await warehouse.timeseries(None, days=7)
+
+        sql = driver.last_sql
+        assert "sumIf(cost, creative_id = '')" in sql
+        assert sql.endswith(
+            "GROUP BY campaign_id, stat_date) GROUP BY stat_date ORDER BY stat_date"
+        )
+
+    async def test_creative_rows_keep_the_breakdown_granularity(self) -> None:
+        """Per-creative delivery *is* the breakdown; collapsing it would erase it."""
+        warehouse, driver = daily_connected()
+
+        await warehouse.creative_snapshots("camp_a", days=7)
+
+        assert "GROUP BY creative_id" in driver.last_sql
+        assert "GROUP BY campaign_id, stat_date" not in driver.last_sql
+
+    async def test_the_events_source_reads_the_bare_table(self) -> None:
+        """One event is one delivery at one granularity, so no collapse is needed."""
+        warehouse, driver = connected()
+
+        await warehouse.campaign_snapshots(None, days=7)
+        await warehouse.timeseries(None, days=7)
+
+        for sql, _parameters in driver.queries:
+            # One event belongs to exactly one creative, so there is no second
+            # granularity to keep apart and the collapse must stay out of the way.
+            assert "creative_id" not in sql
+            assert "GROUP BY campaign_id, stat_date" not in sql
+        assert "FROM {db:Identifier}.ad_events WHERE" in driver.first_sql
+        assert "FROM {db:Identifier}.ad_events WHERE" in driver.last_sql
+
+    async def test_the_window_filters_on_stat_date(self) -> None:
+        warehouse, driver = daily_connected()
+
+        await warehouse.campaign_snapshots(None, days=14)
+
+        assert "stat_date >= today()" in driver.first_sql
+        assert "event_time" not in driver.first_sql
+        assert driver.first_parameters == {"db": "ad_optimizer", "days": 14}
+
+    async def test_the_daily_window_counts_today_as_its_last_day(self) -> None:
+        """``days`` counts calendar days *including* today, not days before today.
+
+        Every SQL reader uses ``today - (days - 1)``. Without the subtraction this
+        reader answers a one-day request with two days of delivery, and the two
+        backends disagree about the same endpoint with nothing to show which is
+        right.
+        """
+        warehouse, driver = daily_connected()
+
+        await warehouse.campaign_snapshots(None, days=1)
+
+        assert "toIntervalDay(greatest({days:UInt16}, 1) - 1)" in driver.first_sql
+        assert driver.first_parameters["days"] == 1
+
+    async def test_a_zero_day_window_cannot_wrap_into_the_whole_table(self) -> None:
+        """The placeholder binds as UInt16, where ``0 - 1`` is 65535 days."""
+        warehouse, _driver = daily_connected()
+
+        assert "greatest({days:UInt16}, 1)" in warehouse._window_filter(0)
+
+    async def test_creative_rows_exclude_the_campaign_rollup(self) -> None:
+        """The roll-up is stored with an empty creative_id and must not be reported as one."""
+        warehouse, driver = daily_connected()
+
+        await warehouse.creative_snapshots("camp_a", days=7)
+
+        assert "creative_id != ''" in driver.last_sql
+        assert driver.last_parameters["campaign_id"] == "camp_a"
+
+    async def test_the_events_source_does_not_filter_on_creative_id(self) -> None:
+        """An event always belongs to a creative, so the guard would be noise."""
+        warehouse, driver = connected()
+
+        await warehouse.creative_snapshots("camp_a", days=7)
+
+        assert "creative_id != ''" not in driver.last_sql
+
+    async def test_audience_falls_back_to_the_campaign_split(self) -> None:
+        """A daily report carries no demographics; inventing them would be worse."""
+        warehouse, driver = daily_connected()
+
+        observations = await warehouse.audience_observations(None, days=7)
+
+        assert {item.dimension for item in observations} == {"campaign"}
+        assert all("UNION ALL" not in sql for sql, _parameters in driver.queries)
+
+    async def test_timeseries_groups_on_the_stored_date(self) -> None:
+        warehouse, driver = daily_connected()
+
+        await warehouse.timeseries(None, days=7)
+
+        assert "SELECT stat_date AS stat_date" in driver.last_sql
+        assert "toDate(event_time)" not in driver.last_sql
+        assert "ORDER BY stat_date" in driver.last_sql
+
+    async def test_the_date_expression_switches_with_the_source(self) -> None:
+        events_warehouse, _ = connected()
+        daily_warehouse, _ = daily_connected()
+
+        assert events_warehouse._date_expression() == "toDate(event_time)"
+        assert daily_warehouse._date_expression() == "stat_date"

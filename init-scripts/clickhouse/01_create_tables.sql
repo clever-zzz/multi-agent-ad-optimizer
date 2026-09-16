@@ -52,6 +52,15 @@ PARTITION BY toYYYYMM(event_time)
 ORDER BY (campaign_id, creative_id, event_time);
 
 -- 实时聚合物化视图：按campaign+creative维度统计
+--
+-- 注意：应用代码目前不读这两个视图。读路径是 ClickHouseWarehouse —— 它对 ad_events
+-- 现场聚合，或（CLICKHOUSE__METRICS_SOURCE=daily 时）读 campaign_daily_metrics。
+-- 视图留着供实时监控与人工排查。
+--
+-- total_cost 的口径必须与 ClickHouseWarehouse._measures() 一致：花费同时挂在
+-- impression 与 click 两类事件上。只算 impression 会少算花费，于是 CPA 静默偏低、
+-- ROAS 静默偏高 —— 一旦有人为了性能把读路径切到视图上，决策就会变，而且不报错。
+-- 改这里就要改 warehouse.py，反之亦然。
 CREATE MATERIALIZED VIEW IF NOT EXISTS ad_optimizer.campaign_creative_stats_mv
 ENGINE = SummingMergeTree()
 ORDER BY (campaign_id, creative_id, stat_date)
@@ -62,7 +71,7 @@ AS SELECT
     countIf(event_type = 'impression') AS impressions,
     countIf(event_type = 'click') AS clicks,
     countIf(event_type = 'conversion') AS conversions,
-    sumIf(cost, event_type = 'impression') AS total_cost,
+    sumIf(cost, event_type IN ('impression', 'click')) AS total_cost,
     sumIf(revenue, event_type = 'conversion') AS total_revenue
 FROM ad_optimizer.ad_events
 GROUP BY campaign_id, creative_id, stat_date;
@@ -77,7 +86,7 @@ AS SELECT
     countIf(event_type = 'impression') AS impressions,
     countIf(event_type = 'click') AS clicks,
     countIf(event_type = 'conversion') AS conversions,
-    sumIf(cost, event_type = 'impression') AS total_cost,
+    sumIf(cost, event_type IN ('impression', 'click')) AS total_cost,
     sumIf(revenue, event_type = 'conversion') AS total_revenue
 FROM ad_optimizer.ad_events
 GROUP BY campaign_id, stat_hour;

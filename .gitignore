@@ -18,21 +18,10 @@ env/
 .mypy_cache/
 htmlcov/
 .coverage
+.coverage.*
 
-# Java
-java/target/
-*.class
-*.jar
-*.war
-*.ear
-.idea/
-*.iml
-
-# Go
-golang/bin/
-golang/vendor/
+# Cross-language build artifacts
 *.exe
-*.test
 *.out
 
 # IDE

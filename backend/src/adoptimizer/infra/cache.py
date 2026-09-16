@@ -85,7 +85,12 @@ class InMemoryCache:
 
 
 class RedisCache:
-    """Redis-backed cache and rate-limit counter."""
+    """Redis-backed cache and rate-limit counter.
+
+    Only the cache half is wired up today (LLM response caching); ``rate_limit``
+    and the ``incr_window`` primitive behind it have no callers -- HTTP rate
+    limiting always uses ``InMemoryRateLimiter`` (see ``app.py``).
+    """
 
     def __init__(self, settings: RedisSettings) -> None:
         self._settings = settings
@@ -230,7 +235,12 @@ class CacheService:
     async def rate_limit(
         self, key: str, limit: int, window_seconds: int = 60
     ) -> tuple[bool, int, int]:
-        """Return (allowed, remaining, retry_after_seconds)."""
+        """Return (allowed, remaining, retry_after_seconds).
+
+        Currently unwired: the HTTP rate limiter is ``InMemoryRateLimiter``
+        regardless of ``REDIS__ENABLED``. Kept for the P1 roadmap item that
+        moves rate limiting to a shared Redis backend.
+        """
         count, retry_after = await self._backend.incr_window(key, window_seconds)
         remaining = max(0, limit - count)
         return count <= limit, remaining, retry_after

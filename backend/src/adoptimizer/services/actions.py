@@ -27,6 +27,7 @@ from ..core.errors import (
     ValidationFailure,
 )
 from ..core.logging import get_logger
+from ..core.metrics import ACTIONS_TOTAL
 from ..core.security import Permission, TokenClaims, require_permission
 from ..domain.enums import ActionStatus, ActionType, CampaignStatus, CreativeStatus, Platform
 from ..domain.statistics import required_sample_size
@@ -219,10 +220,16 @@ class ActionService:
             action.executed_at = datetime.now(UTC)
             if result is not None:
                 action.external_reference = result.external_reference
+            ACTIONS_TOTAL.labels(
+                action_type=action.action_type, outcome=ActionStatus.EXECUTED.value
+            ).inc()
             await self._actions.flush()
         except Exception as exc:
             action.status = ActionStatus.FAILED.value
             action.error_message = str(exc)[:2000]
+            ACTIONS_TOTAL.labels(
+                action_type=action.action_type, outcome=ActionStatus.FAILED.value
+            ).inc()
             await self._actions.flush()
             logger.error("action_execution_failed", action_id=action.id, error=str(exc))
             await self._audit.record(

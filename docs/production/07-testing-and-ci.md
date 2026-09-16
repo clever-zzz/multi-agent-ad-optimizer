@@ -8,9 +8,9 @@
               ┌────────────────────────┐
               │  端到端（浏览器 + 真实栈）│   手工，见 §6
               ├────────────────────────┤
-              │  集成测试 385 个          │   httpx ASGITransport + 临时 SQLite
+              │  集成测试 435 个          │   httpx ASGITransport + 临时 SQLite
               ├────────────────────────┤   全链路：中间件 → RBAC → service → repo → DB
-              │  单元测试 687 个          │   纯函数，零 I/O
+              │  单元测试 838 个          │   纯函数，零 I/O
               ├────────────────────────┤
               │  前端单测（vitest+jsdom）  │   lib/ 与 components/ 的纯逻辑
               └────────────────────────┘
@@ -26,7 +26,7 @@
 - `RATE_LIMIT__ENABLED=false`（避免测试之间互相限流）
 - Argon2 参数降到 `time_cost=1, memory_cost=8192`（否则每个认证测试都要付 64 MiB × 3 轮的代价）
 
-结果：**不需要 Docker、不需要网络、不需要任何外部服务**，`pytest` 直接跑完 1072 个测试（687 unit + 385 integration）。
+结果：**不需要 Docker、不需要网络、不需要任何外部服务**，`pytest` 直接跑完 1273 个测试（838 unit + 435 integration）。
 
 ---
 
@@ -37,37 +37,48 @@
 ```
 backend/tests/
   conftest.py                       fixture：settings / app / client / admin_headers / make_user / snapshot_factory
-  unit/                             纯业务规则，不碰 HTTP 也不碰数据库，687 个
+  unit/                             纯业务规则，不碰 HTTP 也不碰数据库，838 个
     test_statistics.py        (25)   A/B 显著性检验、样本量估算
-    test_kpi.py               (28)   CTR/CVR/CPA/ROAS、健康分
+    test_kpi.py               (32)   CTR/CVR/CPA/ROAS、健康分
     test_pricing.py           (25)   eCPM、竞价上限、出价推导
-    test_budget.py            (17)   预算重分配（贪心路径）
-    test_anomaly.py           (23)   阈值 + 统计异常检测、去重
+    test_budget.py            (35)   预算重分配（贪心路径 + 凸求解器）
+    test_anomaly.py           (29)   阈值 + 统计异常检测、去重
     test_scoring.py           (17)   创意评分
-    test_ingest.py            (60)   采集框架：synthetic 源确定性、平台报表源、记录契约、语义规则、活动归属、同批槽位冲突
+    test_monitor.py           (3)   监控 Agent 读上轮烧钱率：只收 burn_rate 裁决、首轮无上轮、通道被重放也不会炸
+    test_ingest.py            (63)   采集框架：synthetic 源确定性、平台报表源、记录契约、语义规则、活动归属、同批槽位冲突
     test_scheduling.py        (40)   定时拉取的窗口算术：首次/已覆盖/名义/补数/触顶五条分支、补数上界与 `gap_days`、租约与水位派生字段、结果契约
-    test_state.py             (25)   AgentState reducer 语义
+    test_state.py             (26)   AgentState reducer 语义
+    test_orchestrator_fallback.py (8) 降级执行器：reducer 黄金表锁定合并语义、两条路径产出同一个 run、累积通道真的在累积；外加"通道声明了但没人写"的静态扫描守护
+    test_metrics_wiring.py    (3)    AST 解析 `core/metrics.py` 的声明集、扫全包找发点，断言没有"声明了却从不导出"的指标；并钉住指标名清单
     test_tools.py             (57)   工具规格/注册表/执行器：拒绝路径、干跑互锁、幂等、可观测性、平台工具
-    test_optimize_tools.py    (19)   optimize 写提案预检：谁会被预检、被拒怎么办、预检预算、消息汇总
-    test_critic.py            (45)   冲突复核：暂停 vs 加预算、生命周期/创意冲突、跨迭代去重、严重度优先、不可执行抑制
-    test_security.py          (45)   Argon2、JWT、角色→权限矩阵（含 ingestor）；并反向解析前端 stores/auth.ts 与 lib/types.ts，那份矩阵副本一漂移就红
-    test_config.py            (54)   配置校验，含生产硬化拒绝路径、`INGEST__*` 七个键的环境解析与数据源命名规则
+    test_optimize_tools.py    (25)   optimize 写提案预检：谁会被预检、被拒怎么办、预检预算、消息汇总
+    test_critic.py            (55)   冲突复核：暂停 vs 加预算、生命周期/创意冲突、跨迭代去重、严重度优先、不可执行抑制
+    test_security.py          (48)   Argon2、JWT、角色→权限矩阵（含 ingestor）；并反向解析前端 stores/auth.ts 与 lib/types.ts，那份矩阵副本一漂移就红
+    test_config.py            (68)   配置校验，含生产硬化拒绝路径、`INGEST__*` 七个键的环境解析、数据源命名规则，以及"每个设置项都有示例 / 每个示例都有读取方 / 每个设置项都真的被读"三向守护
     test_logging.py           (18)   结构化日志：handler 跟随进程当下的 stdout（含已关闭与无控制台两条分支）、tty 判定、重复配置只留一个 handler、contextvar 注入
     test_llm_provider.py      (59)   OpenAI 兼容 provider：端点、鉴权、失败映射、SSE 流式增量（httpx MockTransport）
     test_llm_gateway.py       (59)   网关：预算护栏、重试退避、缓存、降级、并发信号量、指标、流式片段转发语义、按 run 归集的用量记账
-    test_cli.py               (71)   typer CLI 每条命令（副作用用桩替换），含 `adoptimizer ingest` 与 `adoptimizer scheduler`（`--once` / `--force` / `--dry-run` / 开关语义 / 退出码）
-  integration/                      走完整 HTTP 栈，385 个
+    test_ads_adapters.py      (37)   三家广告适配器的 HTTP 层直测（`httpx.MockTransport`）：端点、凭据放置、分页、错误映射
+    test_analytics_sink.py    (27)   数仓写入侧：行模型、`ReplacingMergeTree` 语义、`NullSink` 把每行报为 skipped
+    test_cli_warehouse.py     (7)    `warehouse status` / `warehouse sync` 两条命令
+    test_cli.py               (72)   typer CLI 每条命令（副作用用桩替换），含 `adoptimizer ingest` 与 `adoptimizer scheduler`（`--once` / `--force` / `--dry-run` / 开关语义 / 退出码）
+  integration/                      走完整 HTTP 栈，435 个
     test_health.py            (25)   探针、安全响应头、限流
-    test_auth_api.py          (41)   登录/刷新/登出/改密/锁定/轮换/最后一个 admin 护栏
+    test_auth_api.py          (42)   登录/刷新/登出/改密/锁定/轮换/最后一个 admin 护栏
     test_rbac_api.py          (25)   端点 × 角色权限矩阵（5 个角色全展开，参数化成大量用例）
     test_campaigns_api.py     (36)   活动与创意 CRUD、校验、审计
     test_ingest_api.py        (36)   推入口端到端：鉴权、逐条下落报告、溯源落列、干跑、批次台账、数据源状态、拉取服务、采集身份进审计
     test_scheduler_api.py     (39)   定时拉取端到端：`GET /ingest/schedule` 鉴权与只读性、首次→已覆盖、错过自愈、触顶报 `gap_days`、水位只放宽、干跑不推进、租约单飞（含插入竞争与两次重叠 tick）、常驻循环可停
-    test_optimization_flow.py (40)   完整闭环：触发 → 事件 → 动作 → 审批门 → 批量 → 幂等（含并发重放）→ 告警 → 分析 → 用量与账本对账
+    test_optimization_flow.py (47)   完整闭环：触发 → 事件 → 动作 → 审批门 → 批量 → 幂等（含并发重放）→ 告警 → 分析 → 用量与账本对账
     test_action_execution.py  (65)   执行器每条 _apply 分支、审批门、批量批准、参数解析、经工具层的人工执行
     test_tool_layer.py        (28)   端到端：能力目录/审计端点、run summary 带工具层、护栏可翻转、审计落库
+    test_run_reaper.py        (6)    陈旧 run 的回收：按最后事件时间判定、不覆盖终态
+    test_run_stream.py        (20)   SSE 事件流：序号有序、断线重连回放、心跳与回库 resync
+    test_warehouse.py         (54)   ClickHouse 读路径：降级为空结果、`daily` 源槽位塌缩、人口维度并集、campaign 过滤
+    test_warehouse_sync.py    (12)   运营库 → 仓库的镜像同步：可安全重跑、`NullSink` 语义
     test_run_stream.py        (20)   SSE 回放/续传/终止、取消、RBAC
-    test_warehouse.py         (30)   SQL 与 ClickHouse 两个后端（假驱动）：查询构造、绑定参数、降级
+    test_run_reaper.py        (6)   reaper 判据与收尾：还在出事件不误杀、静默超窗才回收、排队 run 回落 created_at、新鲜 run 放过、终态不重开、回收时关流
+    test_warehouse.py         (34)   SQL 与 ClickHouse 两个后端（假驱动）：查询构造、绑定参数、降级
 ```
 
 ### 2.2 fixture 设计
@@ -128,11 +139,21 @@ fail_under = 88
 show_missing = true
 ```
 
-**分支覆盖**，不是行覆盖。88% 是**棘轮式的下限而非目标**——`domain/` 与 `core/security.py` 接近 100%，而 `infra/ads/google.py` 这类需要真实凭据的适配器天然覆盖不到，所以整体数字被拉低。当前实测 **88.54%（1072 个测试）**，门禁设在 88%：余量刻意留得薄，一个新的大模块如果完全没测试就会把 CI 弄红，而这正是它该做的事。实测值往上爬超过 3 个点时，就把 `fail_under` 跟着提上去，别让覆盖率悄悄回落——工具层那一轮从 78% 提到 80%，采集框架那一轮从 80% 提到 85%，调度这一轮从 85% 提到 88%。三轮新增的模块都是 **100%**：采集的 `services/ingest.py`、`schemas/ingest.py`、`api/v1/ingest.py`、`repositories/ingest.py` 与 `infra/ingest/` 全部 6 个文件，调度的 `schemas/scheduling.py`、`services/scheduling.py`、`repositories/scheduling.py` 3 个文件；这一轮顺带把 `core/logging.py`（live-stdout handler）从 95.2% 补到了 **100%**。身份隔离那一轮没有新增源文件——`Role.INGESTOR` 与它的权限映射都落在既有的 `domain/enums.py` 和 `core/security.py` 里，两个文件仍是 **100%**，所以实测总量没动，门禁也就不用再抬。
+**分支覆盖**，不是行覆盖。88% 是**棘轮式的下限而非目标**——`core/security.py` 是 **100%**、`domain/` 九个文件全在 89%–100%，三家广告适配器也已经补到 92%–95%（用 `httpx.MockTransport` 直测，不再依赖真实凭据）；真正把总数拉低的是需要外部服务、或难以伪造时序的那几个文件，清单在下面。当前实测 **91.07%**，门禁设在 88%，余量 **3.07 个点**。一个新的大模块如果完全没测试就会把 CI 弄红，而这正是它该做的事。实测值往上爬超过 3 个点时，就把 `fail_under` 跟着提上去，别让覆盖率悄悄回落——工具层那一轮从 78% 提到 80%，采集框架那一轮从 80% 提到 85%，调度这一轮从 85% 提到 88%。三轮新增的模块都是 **100%**：采集的 `services/ingest.py`、`schemas/ingest.py`、`api/v1/ingest.py`、`repositories/ingest.py` 与 `infra/ingest/` 全部 6 个文件，调度的 `schemas/scheduling.py`、`services/scheduling.py`、`repositories/scheduling.py` 3 个文件；这一轮顺带把 `core/logging.py`（live-stdout handler）从 95.2% 补到了 **100%**。身份隔离那一轮没有新增源文件——`Role.INGESTOR` 与它的权限映射都落在既有的 `domain/enums.py` 和 `core/security.py` 里，两个文件仍是 **100%**，所以实测总量没动，门禁也就不用再抬。**数仓写入侧这一轮**加的是 `infra/analytics/`（`AnalyticsSink` + 行模型）、`services/warehouse_sync.py`、`warehouse status` / `warehouse sync` 两个 CLI 命令与 ClickHouse 侧的 `campaign_daily_metrics` 表，同时把三家广告适配器的 HTTP 层直测补齐（`tests/unit/test_ads_adapters.py`，37 用例）：测试数从 1144 走到 **1258**，实测从 89.30% 走到 **91.07%**。新增模块本身是 `services/warehouse_sync.py` 与 `infra/analytics/__init__.py` **100%**、`infra/analytics/models.py` **97.8%**、`infra/analytics/sink.py` **96.8%**、`infra/warehouse.py` **98.4%**。余量因此到 **3.07 个点**，正好越过上面那条“超过约 3 个点就抬门禁”的线——**下一步该把 `fail_under` 提到 90**；仓库此刻仍留在 88，这笔待办记在 `backend/pyproject.toml` 的注释里。
+
+critic 持久化这一轮加了一张表、一个端点、三个可配阈值，实测从 88.54% 走到 88.80%：`agents/critic.py` 与 `core/config.py` 都是 **100%**，但 0.8 个点的余量没到抬门禁的门槛（约 3 点），所以 `fail_under` 留在 88。
+
+局限清理这一轮没有新增源文件，改的是既有实现的正确性（checkpoint 回收、reaper 判据与周期任务、reducer 表自动派生、实时进度心跳），但顺手把一个"该测而没测"的缺口补上了：`orchestrator/graph.py` 从 **61.6%** 走到 **86.1%**。实测总量因此到 **89.30%**（1144 个测试），1.3 个点的余量仍然不到抬门禁的门槛，`fail_under` 继续留在 88。
+
+**当前最大的几个缺口**（照着补最划算）：`infra/cache.py` **34.2%**（Redis 分支要真服务，内存实现之外的路径基本没测）、`repositories/audit.py` **49.4%**、`orchestrator/events.py` **57.1%**——未覆盖的是订阅者 fan-out（含队列满时丢最旧）与带心跳上限的活流生成器，要测它们得伪造背压和跨副本时序，属于"难测"而不是"忘了测"。
+
+`orchestrator/graph.py` 已经从 **61.6%** 补到 **86.1%**：`_invoke_sequential`（降级顺序执行器）是"langgraph 挂了系统还能跑"这条承诺的唯一实现，以前整段未测，现在有 `tests/unit/test_orchestrator_fallback.py` 守着——一张 reducer 黄金表锁定每个通道的合并语义，外加"两条执行路径必须产出同一个 run"的等价性断言。这张表第一次跑就抓到一个真 bug：手抄的 `_REDUCERS` 漏登记了 `usage` 通道（该用 `merge_mapping`，实际退化成后值覆盖），而且只在降级路径暴露。表本身现在由 `_reducers_from_state()` 从 `AgentState` 的注解自动派生，手抄版本已经删掉了。
+
+`infra/ads/{google,meta,tiktok}.py` 与 `infra/ads/http_client.py` 曾经被归为“真的测不到：需要真实凭据与真实网络”（当时 52.8% / 48.8% / 53.3% / 37.5%）。**这个理由已经不成立了**：`tests/unit/test_ads_adapters.py`（37 用例）用 `httpx.MockTransport` 断言每个适配器的请求路径、请求头与请求体，并覆盖 401 / 429 / 非 JSON 等错误分支，四个文件现在是 **92.66% / 93.10% / 94.74% / 95.38%**——这也是总覆盖率从 89.30% 走到 91.07% 的主要来源。真正剩下的“要真服务才测得到”只有 `infra/cache.py` 的 Redis 分支。
 
 > ⚠️ **`concurrency = ["thread", "greenlet"]` 不是可选项，删掉它覆盖率会凭空掉 3 个点。**
 >
-> SQLAlchemy 的 asyncio 适配层用 `greenlet_spawn` 跑同步 DBAPI，驱动又在工作线程里把结果递回来。这两处切换会把 coverage 的 tracer 甩掉，而且**不会报错**——它只是把明明执行过的行记成未覆盖。本项目每一个仓储调用都要跨这条边界，所以漏记的量很大：同一套测试，配好这一项之前测出来是 84.60%，配好之后是 87.99%（当时 935 个；现在 1072 个测出 88.54%）；`services/ingest.py` 从“347-369 未覆盖”变成 100%。
+> SQLAlchemy 的 asyncio 适配层用 `greenlet_spawn` 跑同步 DBAPI，驱动又在工作线程里把结果递回来。这两处切换会把 coverage 的 tracer 甩掉，而且**不会报错**——它只是把明明执行过的行记成未覆盖。本项目每一个仓储调用都要跨这条边界，所以漏记的量很大：同一套测试，配好这一项之前测出来是 84.60%，配好之后是 87.99%（当时 935 个测试；后来 1258 个测试时测出 91.07%）；`services/ingest.py` 从“347-369 未覆盖”变成 100%。
 >
 > 症状很好认：**同一个函数里前半段有覆盖、后半段整块没有，而测试断言的恰恰是“没覆盖”那段产出的字符串**（比如报告里的 reason 文案对得上、`return report` 却显示未执行）。看到这个先查 `concurrency`，别去补根本不缺的测试。
 

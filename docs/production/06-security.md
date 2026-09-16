@@ -33,7 +33,7 @@
 | 指标数据投毒（喂假数字，让优化器去乱调真实预算） | `metrics:write` 只给 admin 与专用的 `ingestor` 机器身份（已从 optimizer 收回，泄露的采集凭据动不了活动与动作）；每行盖 `source` + `batch_id`，可回溯到断言它的那个源与那一次采集；批次台账 + 审计条目；即使数字被污染，写平台仍受人工审批门约束 | `services/ingest.py`、`api/v1/ingest.py`、`services/actions.py` |
 | XSS / 点击劫持 / MIME 嗅探 | CSP、`X-Frame-Options: DENY`、`nosniff`、Referrer/Permissions-Policy | `core/middleware.py` |
 | 中间人 | HSTS（https 请求）、ingress 强制 TLS 重定向 | `core/middleware.py`、`deploy/k8s/ingress.yaml` |
-| DoS | 令牌桶限流 + 请求体大小上限 + 请求超时 + gzip 最小尺寸 | `core/middleware.py` |
+| DoS | 固定窗口限流 + 请求体大小上限 + 请求超时 + gzip 最小尺寸 | `core/middleware.py` |
 | 依赖库漏洞 | 生产镜像按 tag 固定、CI 构建校验 | `deploy/`、`.github/workflows/ci.yml` |
 | 带病上线 | 生产环境启动即拒绝弱密钥/通配 CORS/SQLite | `core/config.py` |
 | 容器逃逸 | 非 root(10001)、只读根文件系统、drop ALL capabilities、no-new-privileges、seccomp RuntimeDefault | `deploy/` |
@@ -51,7 +51,7 @@
 | 细粒度资源级授权 | 只有角色→权限，没有"某个用户只能管某几个活动"。多租户需要额外设计 |
 | 数据加密（静态） | 依赖存储层（PostgreSQL 卷加密 / RDS 加密），应用层不做字段级加密 |
 | 广告平台凭据的密钥轮换 | 凭据从环境变量读取，轮换 = 改配置 + 重启；未接入 Vault 类系统 |
-| 速率限制的全局一致性 | 令牌桶在进程内，多副本下上限是 `limit × 副本数` |
+| 速率限制的全局一致性 | 固定窗口计数在进程内，多副本下上限是 `limit × 副本数` |
 | 审计日志的防篡改 | `audit_logs` 表可被有数据库权限的人修改；未做哈希链或 WORM 存储 |
 
 ---
@@ -168,6 +168,11 @@ Agent ──▶ optimization_actions（status=proposed）
 
 `SECURITY__REQUIRE_ACTION_APPROVAL=true` 时，未审批的动作执行返回 409 `approval_required`。这意味着即使 prompt injection 让模型输出了"把所有预算调到 100000"，它也只会变成一条等人审批的提案。
 
+同一个门也挡住了 critic 抑制掉的提案：它们以 `status=suppressed` 落库，审批队列默认不返回，
+需要 `action:approve` 权限的人显式 `?status=suppressed` 查出来再 approve 才能翻案。
+翻案**必须留痕**——审计条目带 `overruled_critic: true`，所以"谁在什么时候推翻了机器的判断"是可查的。
+批量端点只处理 `proposed`，不提供批量翻案：绕过 critic 应当是一次有意识的单条决定，而不是一次 `for` 循环。
+
 ---
 
 ## 5. 密钥管理
@@ -179,7 +184,7 @@ Agent ──▶ optimization_actions（status=proposed）
 | `SECURITY__JWT_SECRET` | 签发/校验 JWT | 轮换后所有现存 access token 失效，用户需重新登录 |
 | `SECURITY__BOOTSTRAP_ADMIN_PASSWORD` | 空库首次启动建 admin | 只在第一次生效，之后可改可删 |
 | `POSTGRES_PASSWORD` / `DATABASE__URL` | 数据库 | 需与应用同步更新 |
-| `REDIS_PASSWORD` | 缓存/限流/会话 | 同上 |
+| `REDIS_PASSWORD` | LLM 响应缓存 | 同上 |
 | `LLM__API_KEY` | 模型供应商 | 无用户影响 |
 | `GOOGLE_ADS_*` / `META_*` / `TIKTOK_*` | 广告平台 | 无用户影响 |
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+import httpx
+
 from ...core.errors import ExternalServiceError
 from ...core.logging import get_logger
 from ...domain.enums import Platform
@@ -18,16 +20,33 @@ API_VERSION = "open_api/v1.3"
 
 
 class TikTokAdsClient(AdsPlatformClient):
-    """TikTok ads adapter using an app access token."""
+    """TikTok ads adapter using an app access token.
+
+    The token travels in the ``Access-Token`` HTTP header on every call,
+    including reads. It is not a query parameter: putting it in the URL would
+    leak the credential into access logs and proxy traces.
+    """
 
     platform = Platform.TIKTOK
 
-    def __init__(self, *, access_token: str, advertiser_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        access_token: str,
+        advertiser_id: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self._access_token = access_token
         self._advertiser_id = advertiser_id
         self.is_configured = bool(access_token and advertiser_id)
         self._http = (
-            PlatformHTTPClient(TIKTOK_BASE, timeout_seconds=30.0, max_retries=3)
+            PlatformHTTPClient(
+                TIKTOK_BASE,
+                timeout_seconds=30.0,
+                max_retries=3,
+                headers=self._headers(),
+                transport=transport,
+            )
             if self.is_configured
             else None
         )
@@ -41,8 +60,9 @@ class TikTokAdsClient(AdsPlatformClient):
             )
         return self._http
 
-    def _headers(self) -> dict[str, Any]:
-        return {"Access-Token": self._access_token}
+    def _headers(self) -> dict[str, str]:
+        """Auth header sent on every request; empty when unconfigured."""
+        return {"Access-Token": self._access_token} if self._access_token else {}
 
     async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         client = self._require()
@@ -142,7 +162,6 @@ class TikTokAdsClient(AdsPlatformClient):
                 + '"]}]',
                 "start_date": start_date,
                 "end_date": end_date,
-                "Access-Token": self._access_token,
             },
         )
         rows = [self._normalise_row(row) for row in payload.get("data", {}).get("list", [])]

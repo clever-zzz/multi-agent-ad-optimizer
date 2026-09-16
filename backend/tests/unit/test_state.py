@@ -90,7 +90,7 @@ class TestSchema:
             "optimization_actions",
             "critic_findings",
             "agent_messages",
-            "alert_fingerprints",
+            "tool_preflights",
         ):
             metadata = getattr(hints[channel], "__metadata__", ())
             assert append_list in metadata, channel + " must accumulate"

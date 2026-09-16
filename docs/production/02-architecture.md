@@ -5,7 +5,7 @@
 按重要性排序，后面的取舍都为前面让路：
 
 1. **可审计** — 每一分钱预算的变化都要能回答"谁、什么时候、基于什么数据、为什么"。
-2. **可回退** — 任何一个外部依赖（LLM、Redis、ClickHouse、langgraph、CVXPY）挂掉，系统降级而不是崩溃。
+2. **可回退** — 任何一个外部依赖（LLM、Redis、ClickHouse、CVXPY）挂掉，系统降级而不是崩溃。langgraph 是核心依赖而非外部服务，但导入失败时同样有一条等价的顺序执行器兜底。
 3. **可测试** — 业务规则必须是纯函数，能在没有数据库和网络的情况下被单元测试覆盖。
 4. **可扩展** — 加一个广告平台、加一个 Agent、换一个模型供应商，都应该是加法而不是改法。
 5. **可运维** — 探针、指标、结构化日志、CLI，缺一不可。
@@ -42,8 +42,8 @@ core/           横切关注点：配置、日志、安全、错误、中间件�
 | `core/deps.py` | FastAPI 依赖：容器、会话、当前身份、权限断言 | `ClaimsDep`, `SessionDep`, `require`, `require_role` |
 | `core/security.py` | Argon2id、JWT 签发校验、角色→权限矩阵 | `TokenService`, `permissions_for` |
 | `core/errors.py` | 领域异常 → HTTP problem document 的映射 | `register_exception_handlers` |
-| `core/middleware.py` | request_id、安全响应头、令牌桶限流 | `RequestContextMiddleware` 等 |
-| `core/metrics.py` | Prometheus 指标定义（18 个） | `REGISTRY` |
+| `core/middleware.py` | request_id、安全响应头、固定窗口限流 | `RequestContextMiddleware` 等 |
+| `core/metrics.py` | Prometheus 指标定义（22 个） | `REGISTRY` |
 | `domain/kpi.py` | CTR/CVR/CPA/ROAS 计算与健康分 | `PerformanceSnapshot`, `health_score` |
 | `domain/pricing.py` | eCPM、竞价上限、出价推导 | 全部纯函数 |
 | `domain/budget.py` | 预算重分配：CVXPY 优先，贪心 LP 兜底 | `allocate` |
@@ -96,8 +96,8 @@ return "continue" if state["alerts"] else "end"
 
 | Agent | 输入 | 输出（写回 state） | 是否调用 LLM |
 |---|---|---|---|
-| **monitor** | 活动列表 + 日粒度指标窗口 | `metrics`, `health`, `alerts`, `alert_fingerprints` | 否（纯规则 + 统计） |
-| **audience** | `metrics`, 快照 | `audience_observations`, `audience_insights` | 是（洞察摘要） |
+| **monitor** | 活动列表 + 日粒度指标窗口 | `metrics`, `health`, `alerts` | 否（纯规则 + 统计） |
+| **audience** | `metrics`, 快照 | `audience_insights` | 是（洞察摘要） |
 | **creative** | `health`, 现有创意, `audience_insights` | `new_creatives` | 是（文案生成，带结构化校验） |
 | **bidding** | `metrics`, 目标 CPA/ROAS | `bidding_decisions` | 否（纯 `domain.pricing`） |
 | **optimize** | 以上全部 | `budget_allocations`, `optimization_actions`, `iteration` | 否（纯规则映射） |
@@ -115,12 +115,17 @@ return "continue" if state["alerts"] else "end"
 | `optimization_actions` | `append_list` | 跨迭代累积 |
 | `critic_findings` | `append_list` | 复核裁决累积，含被抑制提案的 id |
 | `agent_messages` | `append_list` | 完整轨迹 |
-| `alert_fingerprints` | `append_list` | 去重历史 |
+| `tool_preflights` | `append_list` | 工具预检记录累积 |
 | `metrics` / `alerts` / `bidding_decisions` / `budget_allocations` | `replace_list` | 每轮重算，取最新 |
+| `audience_observations` / `platform_checks` | `replace_list` | 同上 |
 | `health` / `audience_insights` / `daily_budgets` / `usage` | `merge_mapping` | 浅合并 |
 | `iteration` | `max_int` | 单调，重放不会回退 |
 
+共 16 个挂 reducer 的通道。其中 13 个由 Agent 写入；`daily_budgets` / `audience_observations` / `usage` 这 3 个由服务层或编排器注入（Agent 走 `AgentContext` 读，不写 state），名单显式登记在 `state.py::UNWIRED_BY_AGENTS`，并由 `tests/unit/test_orchestrator_fallback.py::TestChannelWiring` 守着——新增通道既不接线也不登记就会红。
+
 > 这两点（显式 TypedDict、真正接上 reducer）是原始 demo 的致命 bug 来源：langgraph 1.x 下传裸 `dict` 给 `StateGraph`，每个节点只能看到上一个节点的返回值；reducer 定义了却没接线，多轮迭代会互相覆盖。
+>
+> 同类的第三种失败模式是"声明了但没人写"：通道带着 reducer 却永远读到空值，看起来像 Agent 的 bug。原先的 `alert_fingerprints` 就是这种——文档曾声称它保存跨轮告警去重历史，实际从没被写过，现已删除。它也无法实现：`_route_after_critic` 正是靠 `alerts` 非空来决定要不要再跑一轮，跨轮在内存里抑制告警会让 run 在第一轮就退出；跨轮去重落在库层（`AlertRepository.upsert_from_detection` 按 `dedup_key` 刷新而非插入）。
 
 ### 3.4 降级路径
 
@@ -129,7 +134,7 @@ self._graph = self._compile() if HAS_LANGGRAPH else None
 execution_mode = "langgraph" if self._graph else "sequential"
 ```
 
-`langgraph` 未安装或图编译抛异常时，自动切到 `_invoke_sequential`：按同样顺序 await 六个 Agent，用同样的 reducer 合并状态。**业务结果一致**，只是失去 checkpoint 与可视化。`/readyz` 会如实上报当前 mode。
+`langgraph` 未安装时自动切到 `_invoke_sequential`：按同样顺序 await 六个 Agent，用同一张 reducer 表（由 `_reducers_from_state()` 从 `AgentState` 的 `Annotated` 注解自动派生）合并状态。**业务结果一致**，只是失去 checkpoint 与可视化；`/readyz` 会如实上报当前 mode，两条路径的等价性有测试守着。**图编译失败不降级**——`_compile()` 没有 try/except，编译报错会让进程起不来：图定义写错是 bug，不该被静默降级藏起来。
 
 ### 3.5 AgentContext
 
@@ -146,7 +151,7 @@ optimizer 是按规则逐条开火的：一个活动同时踩中 CPA 上限和�
 `pause_campaign` 和 `adjust_budget`——两个互斥的结果都要人去批。多迭代还会放大这个问题：
 `optimization_actions` 是累积通道，同一个 (campaign, creative, type) 意图会每轮重新出现一次，带着新的 id。
 
-critic 在 optimize 之后、路由之前跑，按固定顺序做四件事——先看**能不能执行**，再看重不重复，最后看冲不冲突：
+critic 在 optimize 之后、路由之前跑，按固定顺序做五件事——先看**能不能执行**，再看重不重复，然后看冲不冲突，最后看**方向相不相反**：
 
 | 规则 | 行为 |
 |---|---|
@@ -154,6 +159,11 @@ critic 在 optimize 之后、路由之前跑，按固定顺序做四件事——
 | `pause_overrides_spend` / `campaign_pause_resume_conflict` / `experiment_on_paused_campaign` | 活动级互斥，standing 高者胜；**平局向“停止花钱”一侧倾斜** |
 | `creative_pause_resume_conflict` / `pause_overrides_refresh` | 仅当两条提案指向同一个具体 creative_id 时才算冲突 |
 | `unexecutable_proposal` | optimize 的平台预检已经把它挡下（参数非法 / 无权限 / 平台报错），不让人去批一个必然失败的改动 |
+| `opposing_spend_intent` | 同一活动上同时出现抬价与砍预算（`direction` 一个 `increase` 一个 `decrease`）。**escalate，不抑制任何一条**：两者各自的参照系都成立，选边等于 critic 替运营发明策略 |
+
+`direction` 与 `basis` 是 `optimization_actions` 上的两个字段（迁移 `0006` 加入，均可空——暂停或换创意不移动花费，早于该版本的行也真的没有方向，回填等于编造事实）。
+有了它们，critic 才能把「抬价 + 砍预算」这种反向组合与「抬价 + 加预算」这种同向组合区分开，而不必去解析自由文本的 `reason`。
+同向的一律放过：那本来就是一个连贯意图，在这里加冲突规则会把它拆散。
 
 预检抑制只看**阻断性**拒绝：`validation_failed`、`permission_denied` 和平台自己报错（`failed`）说明提案本身有问题。
 `budget_exhausted` 和「工具层被关闭」是**部署状态**，不是提案的缺陷——护栏没开就吞掉一条本来合理的提案，
@@ -161,15 +171,29 @@ critic 在 optimize 之后、路由之前跑，按固定顺序做四件事——
 同一活动上另一条没被挡下的提案照常参与后面的 standing 比较。
 
 **standing 不等于 confidence。** 两个 Agent 报出来的 `confidence` 量的根本不是同一件事：
-`recommend_bid` 报的是“有多少投放证据支撑这个出价”，展示量过 5 万就会顶到 0.98；
+`recommend_bid` 报的是“有多少投放证据支撑这个出价”，展示量过 5 万**且观测到 ROAS > 0** 才会顶到 0.98（ROAS 为 0 时只到 0.80）；
 告警派生的提案报的是“这个异常有多严重”，critical 固定 0.9、warning 固定 0.7。
 直接比大小，一个投放数据漂亮的活动就能用 0.98 的调价把 0.9 的 critical 燃烧速度暂停挤掉——
 这是真跑出来的 bug，不是假想。所以 `_rank()` 先比 severity（critical 恒胜），
 confidence 只在同一 standing 内部做 tie-break，平局再向“停止花钱”一侧倾斜。
 
-关键设计：**抑制是打标记，不是删除**。`optimization_actions` 用 `append_list`，任何节点都不能改写历史；
-critic 只往 `critic_findings` 写裁决，真正的过滤发生在 `state.surviving_actions()`——持久化与汇总都走它。
-这样一条被抑制的提案永远不会进审批队列，但裁决理由仍然可查，运营可以不同意 critic 并手动恢复。
+**severity 恒胜也修过了头。** 早期实现里一条「刚过 critical 线」的告警可以无条件压掉任何调价提案，
+于是 1.857 与 1.875 两种几乎一样的燃烧速率会导出完全不同的动作集合——临界线附近有悬崖。
+现在 `_dominates()` 额外要求 `_urgency(action) >= CRITICAL_GAP + DOMINANCE_MARGIN`（0.5 + 0.10）：
+只有**明显**越过临界线的告警才享有主导权。配合 `domain/anomaly.py` 那侧的 `burn_rate_hysteresis`，
+「刚过线」不再拥有无限话语权。
+
+关键设计：**抑制是打标记，不是删除**，而且这个标记要能**跨过持久化边界**。
+
+图状态里 `optimization_actions` 用 `append_list`，任何节点都不能改写历史；run 内的过滤发生在 `state.surviving_actions()`。
+但图状态本身不持久（checkpointer 是 `MemorySaver`），所以 `_finalise` 会把**全部**提案落库——
+被抑制的以 `ActionStatus.SUPPRESSED` 写入 `optimization_actions`，裁决逐条写入 `critic_findings`
+（`kind` / `reason` / `kept_action_id` / `suppressed_action_ids` / `suppressed_actions` 原文 / `escalate`）。
+run summary 里除条数外还有 `critic_findings_by_kind`，说明是**哪条规则**在做抑制。
+
+于是运维真的可以：`GET /api/v1/runs/{run_id}/findings` 查理由 → 对 `suppressed` 的提案 `POST /actions/{id}/approve` 翻案 →
+审计条目带 `overruled_critic: true`。审批队列（`GET /actions` 不带 status）默认不返回 `suppressed`，
+需要显式 `?status=suppressed`；批量端点只处理 `proposed`，不提供批量翻案——翻案应当是一次有意识的单条决定。
 
 critic 不调用 LLM、不发明动作、不执行任何东西；完全确定性，同输入同输出。
 
@@ -265,7 +289,7 @@ POST /api/v1/runs
 - **派发始终发生**；请求体里的 `background` 只决定调用方是否等待完成（同步模式用于 CLI 和测试）。
 - 事件写入两处：`run_events` 表（持久、可回放）+ `EventBus` 内存队列（低延迟 SSE）。
 - `GET /runs/{id}/stream` 是 SSE：先回放已落库的历史事件，再订阅实时队列，客户端断线重连不丢进度。
-- 进程启动时 `reap_stale_runs` 把上次异常退出遗留的 `running` 状态 run 标记为 `failed`，避免僵尸。
+- 进程启动时、以及 lifespan 里的周期任务 `run_reaper_loop`（默认 10 分钟一扫），都会跑 `reap_stale_runs`，把异常退出遗留的 `running` 状态 run 标记为 `failed`，避免僵尸。判据是"最后一次事件的时间"（`COALESCE(max(run_events.created_at), started_at, created_at)`）而不是创建时间，所以慢但还在推进的 run 不会被误杀。
 
 ### 4.1 为什么必须 `--workers 1`
 
@@ -280,7 +304,7 @@ POST /api/v1/runs
 
 ## 5. 数据模型
 
-18 张表，全部使用**应用层生成的字符串主键**（`core/ids.py::new_id`，带类型前缀如 `camp_`/`run_`/`act_`）。这样 id 可以在 insert 之前生成、可以安全对外暴露、跨库迁移不会撞序列。
+19 张表，全部使用**应用层生成的字符串主键**（`core/ids.py::new_id`，带类型前缀如 `camp_`/`run_`/`act_`）。这样 id 可以在 insert 之前生成、可以安全对外暴露、跨库迁移不会撞序列。
 
 | 表 | 用途 | 关键约束 |
 |---|---|---|
@@ -295,6 +319,7 @@ POST /api/v1/runs
 | `optimization_runs` | 一次闭环执行 | status 索引；`(idempotency_key, requested_by)` **唯一索引** `uq_run_idempotency`——并发重放由插入仲裁，不是先查后插 |
 | `run_events` | 追加式事件流 | `(run_id, seq)` 唯一，支撑 SSE 回放 |
 | `optimization_actions` | Agent 提案，人审批门 | FK→runs `ON DELETE SET NULL`（run 删了动作还在，可审计） |
+| `critic_findings` | critic 的每一条复核裁决：被抑制的提案连理由一起落库 | FK→runs `ON DELETE SET NULL`；`(run_id, kind)` 复合索引 `ix_finding_run_kind`；`escalate=true` 表示交人裁决、不抑制任何提案 |
 | `alerts` | 监控告警 | `dedup_key` 索引；`(status, detected_at)` 复合索引 |
 | `budget_allocations` | 预算重分配提案 | 记录 `solver`（`cvxpy` / `greedy_lp`） |
 | `ab_tests` | 创意实验 | MDE、所需样本量、traffic_split、result JSON |
@@ -326,7 +351,20 @@ PostgreSQL 与 SQLite 都支持部分索引，ORM 侧通过 `postgresql_where` /
 
 按槽位而不是按活动合并，是为了让混合 portfolio 也精确：存了汇总行的活动贡献汇总值，只有明细的活动照样贡献它的投放量，而不是读成 0、然后从优化里悄悄消失。
 
-ClickHouse 后端没有这个问题——它读的是原始事件流 `ad_events`，只有一种粒度。
+ClickHouse 的 `events` 源没有这个问题——它读的是原始事件流 `ad_events`，只有一种粒度。
+
+**`daily` 源不一样，它照样会翻倍。** `campaign_daily_metrics` 是 `daily_metrics` 的镜像，而 `adoptimizer warehouse sync` 刻意**不做槽位合并**地搬运每一个槽位——在搬运时合并等于把创意明细丢掉，镜像就成了有损副本。于是两种粒度在仓库里并存，活动级汇总行的 `creative_id` 是空串（`String` 列没有 NULL 语义）。`ClickHouseWarehouse._delivery_relation()` 因此把同一条规则写成 SQL：先按 `(campaign_id, stat_date)` 塌缩成一行，每个度量取
+
+```sql
+if(countIf(creative_id = '') > 0,
+   sumIf(cost, creative_id = ''),     -- 这个桶有汇总行，用它
+   sumIf(cost, creative_id != ''))    -- 没有，用明细之和兜底
+   AS cost
+```
+
+外层再对塌缩后的行 `sum()`。按桶而不是按活动判定，理由和主库完全一样：只有明细没有汇总行的活动，不能因此从报表里消失。
+
+同一条规则现在有四个实现——`MetricRepository.merged_slots()`、`SqlAggregateWarehouse._merged_slots()`、`ClickHouseWarehouse._delivery_relation()`，以及读同一张表的看板趋势 `AnalyticsService.timeseries()`。它们靠"两条路径必须逐项相等"的一致性测试锁住，而不是靠人记住。
 
 ### 5.2 数据入口：出处、缺列与"对不上账就不返回"
 
@@ -381,7 +419,7 @@ ClickHouse 后端没有这个问题——它读的是原始事件流 `ad_events`
 ```
 Agent ──▶ LLMGateway ──▶ provider (mock | openai | azure_openai | openai_compatible)
               │
-              ├─ tenacity 重试（指数退避，仅对可重试错误）
+              ├─ 手写重试（retry_base_delay_seconds × 2^(n-1)，封顶 8s，**无 jitter**；仅对 ExternalServiceError）
               ├─ 并发信号量（LLM__CONCURRENCY）
               ├─ 超时（LLM__TIMEOUT_SECONDS）
               ├─ 流式增量（LLM__STREAM=true 时改走 SSE，片段交给 on_delta）
@@ -391,7 +429,7 @@ Agent ──▶ LLMGateway ──▶ provider (mock | openai | azure_openai | op
                         │
                         ├─ 单价：LLM__PRICING 覆盖 llm/base.py 的 DEFAULT_PRICING
                         └─ 月度预算护栏（LLM__MONTHLY_BUDGET_USD）
-                             超预算 → fail_open_to_mock ? 降级 mock : 直接失败
+                             超预算 → BudgetExceededError(402)，与 fail_open_to_mock 无关
 ```
 
 `mock` provider 是**确定性**的：同样的输入永远得到同样的输出，不联网、不花钱。这是整个测试套件能跑得快且稳定的原因。
@@ -410,7 +448,7 @@ Agent ──▶ LLMGateway ──▶ provider (mock | openai | azure_openai | op
 CORSMiddleware            # 最外层，预检请求不该被后面任何一层拦
   TrustedHostMiddleware   # 仅当 trusted_hosts != ["*"] 时挂载
   GZipMiddleware          # minimum_size=1024
-  RateLimitMiddleware     # 令牌桶；/healthz /readyz /metrics /system/info 豁免
+  RateLimitMiddleware     # 固定窗口计数；/healthz /readyz /metrics /system/info 豁免
   SecurityHeadersMiddleware
   RequestContextMiddleware # 生成/透传 X-Request-ID，绑定到日志上下文
     └─ 路由
@@ -434,20 +472,25 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains   # 仅 https
 
 ### 7.2 可观测性
 
-**20 个 Prometheus 指标**，覆盖六个层面：
+**21 个 Prometheus 指标**，覆盖七个层面：
 
 | 层面 | 指标 |
 |---|---|
 | HTTP | `http_requests_total`, `http_request_duration_seconds` |
-| Agent | `agent_runs_total`, `agent_run_duration_seconds`, `agent_step_total`, `agent_step_duration_seconds`, `active_runs`, `queue_depth` |
+| Agent | `agent_runs_total`, `agent_run_duration_seconds`, `agent_step_total`, `agent_step_duration_seconds`, `active_runs` |
 | LLM | `llm_calls_total`, `llm_latency_seconds`, `llm_tokens_total`, `llm_spend_usd_total` |
 | 业务/基础设施 | `alerts_total`, `actions_total`, `cache_ops_total`, `db_query_duration_seconds` |
 | 数据入口 | `ingest_records_total{source,outcome}`, `ingest_batches_total{source,mode}` |
 | 数据调度 | `ingest_ticks_total{source,outcome}`, `ingest_lag_days{source}` |
+| 数据仓库 | `warehouse_reads_total{backend,outcome}`, `warehouse_writes_total{table,outcome}` |
 
 `ingest_records_total` 的 `outcome` 是固定八个值（`created`/`updated`/`rejected`/`unresolved` 各带一个 `dry_` 前缀），干跑不会被算成真实写入。`source` 由 `schemas/ingest.py::SOURCE_PATTERN` 约束成小写短名（与 `core/config.py::SOURCE_NAME_PATTERN` 是同一个常量），因此它作为标签不会把序列基数撑开。
 
 `ingest_ticks_total` 的 `outcome` 四个值里，`ran` / `skipped` / `lost_lease` **都是健康的**（拉了、已覆盖、别人正在拉），只有 `failed` 该叫人。数据陈旧因此不靠这个计数器告警，而靠 `ingest_lag_days`：窗口被上界卡住时 tick 会一直成功，数据却越落越远。**完全没有序列**表示这个源从未被拉过，用 `absent()` 报。
+
+> **指标和状态通道有同一个坑：声明了但没人发。** 带标签的 Counter 在第一次使用前**不导出任何序列** —— 所以一个死指标不会读成 0，而是根本不出现，跟"什么都没发生"长得一模一样。
+> 2026-09-16 审计发现三个：`alerts_raised_total`、`optimization_actions_total` 从未被 `.inc()`（现已接线：告警在 `services/optimization.py::_persist_alerts` 按指纹折叠后计数，动作在 `repositories/runs.py::add_actions` 按落库状态计数、在 `services/actions.py::execute` 按执行结果计数）；`job_queue_depth` 描述的是本项目**不存在**的后台队列（ADR-0002 用进程内派发），已删除。
+> `tests/unit/test_metrics_wiring.py` 用 AST 解析 `core/metrics.py` 拿到声明集，再扫全包找发点，同时钉住指标名清单 —— 所以指标数（21）不会在文档不知情的情况下漂移。
 
 日志用 structlog，JSON 输出，`X-Request-ID` 与 `run_id` 通过 contextvar 绑定到每条记录，可以按请求或按 run 完整串联。
 

@@ -39,6 +39,7 @@ COMMANDS = (
     "healthcheck",
     "token",
     "creds",
+    "warehouse",
 )
 
 

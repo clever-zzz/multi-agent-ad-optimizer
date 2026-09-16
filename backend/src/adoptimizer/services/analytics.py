@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import Select, func, select
@@ -16,12 +16,11 @@ from ..domain.kpi import PerformanceSnapshot, health_score, health_status, summa
 from ..infra.db.models import (
     Alert,
     Campaign,
-    DailyMetric,
     LLMSpendRecord,
     OptimizationAction,
     OptimizationRun,
 )
-from ..repositories.campaigns import MetricRepository
+from ..repositories.campaigns import MEASURE_COLUMNS, MetricRepository
 
 logger = get_logger(__name__)
 
@@ -73,35 +72,34 @@ class AnalyticsService:
     async def timeseries(
         self, *, days: int = 30, campaign_id: str | None = None
     ) -> list[dict[str, Any]]:
-        """Daily delivery trend with derived rates."""
-        cutoff = utc_today() - timedelta(days=max(1, days) - 1)
-        statement: Select[Any] = (
-            select(
-                DailyMetric.stat_date,
-                func.sum(DailyMetric.impressions).label("impressions"),
-                func.sum(DailyMetric.clicks).label("clicks"),
-                func.sum(DailyMetric.conversions).label("conversions"),
-                func.sum(DailyMetric.cost).label("cost"),
-                func.sum(DailyMetric.revenue).label("revenue"),
-            )
-            .where(DailyMetric.stat_date >= cutoff)
-            .group_by(DailyMetric.stat_date)
-            .order_by(DailyMetric.stat_date.asc())
-        )
-        if campaign_id:
-            statement = statement.where(DailyMetric.campaign_id == campaign_id)
+        """Daily delivery trend with derived rates.
 
-        rows = (await self._session.execute(statement)).all()
+        Folded from ``MetricRepository.merged_slots`` rather than summed straight
+        off the table. ``daily_metrics`` keeps a campaign-level roll-up and the
+        creative breakdown of that same roll-up side by side, so a bare SUM reports
+        every day at twice its real size - and a trend line is precisely where a
+        reader trusts a number that merely looks plausible.
+        """
+        cutoff = utc_today() - timedelta(days=max(1, days) - 1)
+        slots = await self._metrics.merged_slots(cutoff, [campaign_id] if campaign_id else None)
+
+        per_day: dict[date, dict[str, float]] = {}
+        for (_campaign_id, day), measures in slots.items():
+            bucket = per_day.setdefault(day, dict.fromkeys(MEASURE_COLUMNS, 0.0))
+            for column in MEASURE_COLUMNS:
+                bucket[column] += float(measures[column])
+
         series: list[dict[str, Any]] = []
-        for row in rows:
-            impressions = int(row.impressions or 0)
-            clicks = int(row.clicks or 0)
-            conversions = int(row.conversions or 0)
-            cost = float(row.cost or 0.0)
-            revenue = float(row.revenue or 0.0)
+        for day in sorted(per_day):
+            measures = per_day[day]
+            impressions = int(measures["impressions"])
+            clicks = int(measures["clicks"])
+            conversions = int(measures["conversions"])
+            cost = float(measures["cost"])
+            revenue = float(measures["revenue"])
             series.append(
                 {
-                    "date": row.stat_date.isoformat(),
+                    "date": day.isoformat(),
                     "impressions": impressions,
                     "clicks": clicks,
                     "conversions": conversions,
