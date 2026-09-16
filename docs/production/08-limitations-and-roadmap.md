@@ -91,9 +91,11 @@ adoptimizer warehouse sync --days 30            # 真正镜像
 - `ad_events` —— 真实事件流，写入器已就绪，等事件流接入；
 - `campaign_daily_metrics`（**新增**，`init-scripts/clickhouse/02_daily_metrics.sql`）—— 日报聚合，**今天就能灌**，是当前主路径。
 
-读侧新增 `CLICKHOUSE__METRICS_SOURCE=events|daily`（默认 `events`，不让已有部署的读取行为在脚下改变）。
+读侧新增 `CLICKHOUSE__METRICS_SOURCE=events|daily`（默认 `daily`，即唯一有写入者的那一张表；`events` 暂无生产写入者，显式选中时后端会告警而不是静默读空）。三个开关必须配对：`DATA_MODE=warehouse` + `CLICKHOUSE__ENABLED=true` + `CLICKHOUSE__METRICS_SOURCE=daily`，少任何一个都会静默退回主库聚合。
 
 **镜像把双粒度也一起带过去了，这一点必须点名。** `MetricRepository.export_daily` 刻意**不做槽位合并**——搬运时合并等于把创意明细丢掉，镜像就成了有损副本，回填也就失去意义。于是 `campaign_daily_metrics` 里同样并存着活动级汇总行（`creative_id` 是**空串**，因为 `String` 列没有 NULL 语义）与创意明细行，`daily` 源的读取器必须自己再塌缩一次：`ClickHouseWarehouse._delivery_relation()` 先按 `(campaign_id, stat_date)` 收敛成一行，汇总行优先、明细兜底，外层才 `sum()`。漏掉这一步每个 KPI 都翻倍且不报错，和主库当年那个坑是同一个。详见 `docs/production/02-architecture.md` §5.1 与 `docs/tutorial/04-clickhouse-guide.md` §6.3。
+
+**还有第二种重复：版本重复。** `campaign_daily_metrics` 是 `ReplacingMergeTree`，而"替换"只在后台 merge 时发生；sync 又是文档明确支持重跑的 30 天窗口镜像，所以从第二次运行起窗口内每行都有多个版本。读侧因此统一加 `FINAL`（`ClickHouseWarehouse._relation`）收敛到每个键的最新版本。漏掉它，impressions/cost/revenue 会按重放次数放大，而 ROAS 因分子分母同比放大看起来仍然正常——放大后的数字会直接进 Agent 的预算与出价打分。
 
 **仍未验证的点**：高基数维度下的查询延迟、`audience_observations` 的真实数据来源与口径、物化视图是否需要、以及在目标量级（建议先定 1 亿行）下的 P95。
 

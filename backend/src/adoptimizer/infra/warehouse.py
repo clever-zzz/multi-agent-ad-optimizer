@@ -305,16 +305,20 @@ class ClickHouseWarehouse:
 
     Two sources are supported, chosen by ``CLICKHOUSE__METRICS_SOURCE``:
 
-    * ``events`` (default) reads the raw ``ad_events`` stream. This is the
-      richer shape - it carries device, country and gender, so audience
-      breakdowns are real rather than a fallback.
-    * ``daily`` reads ``campaign_daily_metrics``, the aggregate table the
-      ingestion path can populate today. Demographics are absent there by
-      construction, so ``audience_observations`` degrades to the campaign split
-      and says so.
+    * ``daily`` (default) reads ``campaign_daily_metrics``, the aggregate table
+      ``warehouse sync`` populates from the primary datastore's daily reports.
+      Demographics are absent there by construction, so ``audience_observations``
+      degrades to the campaign split and says so.
+    * ``events`` reads the raw ``ad_events`` stream. This is the richer shape -
+      it carries device, country and gender, so audience breakdowns are real
+      rather than a fallback - but nothing in this build writes that table, so
+      configuring it warns instead of reading empty in silence.
 
-    The default stays ``events`` so that turning this on does not silently
-    change what an existing deployment reads.
+    The default is the source that has a writer. Defaulting to ``events`` reads
+    like the conservative choice - "do not change what an existing deployment
+    reads" - but there is nothing to preserve: a table no code path fills always
+    answers empty, and the deliberate fallback to the primary datastore hides
+    that from the operator.
     """
 
     name = "clickhouse"
@@ -389,6 +393,33 @@ class ClickHouseWarehouse:
             " countIf(event_type = 'conversion') AS conversions,"
             " sumIf(cost, event_type IN ('impression', 'click')) AS cost,"
             " sumIf(revenue, event_type = 'conversion') AS revenue"
+        )
+
+    def warn_if_source_has_no_writer(self) -> None:
+        """Say so out loud when the configured source is a table nothing fills.
+
+        ``ad_events`` is the richer shape and the reason ``metrics_source`` exists
+        at all, but no production code path writes it: ``warehouse sync`` mirrors
+        the primary datastore's daily reports into ``campaign_daily_metrics``, and
+        the platform APIs return daily reports rather than a stream of individual
+        deliveries. An operator who opts into ``events`` therefore reads an empty
+        table, and an empty read falls back to the primary datastore by design -
+        so without this the misconfiguration shows up only as a counter on
+        ``warehouse_reads_total{outcome="empty"}`` and reports that quietly come
+        from somewhere else.
+        """
+        if self._source != "events":
+            return
+        logger.warning(
+            "clickhouse_events_source_has_no_writer",
+            table=self.EVENTS_TABLE,
+            hint=(
+                "nothing in this build writes ad_events; warehouse sync mirrors daily "
+                "reports into campaign_daily_metrics, so reads come back empty and "
+                "reports fall back to the primary datastore. Set "
+                "CLICKHOUSE__METRICS_SOURCE=daily, or keep events only once an event "
+                "pipeline writes that table."
+            ),
         )
 
     async def connect(self) -> bool:
@@ -702,6 +733,7 @@ async def build_warehouse(session: AsyncSession) -> MetricsWarehouse:
     if settings.enabled:
         warehouse = ClickHouseWarehouse(settings)
         if await warehouse.connect():
+            warehouse.warn_if_source_has_no_writer()
             return warehouse
         logger.warning("clickhouse_enabled_but_unreachable_falling_back_to_sql")
     return SqlAggregateWarehouse(session)

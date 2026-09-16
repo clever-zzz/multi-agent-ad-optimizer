@@ -30,6 +30,21 @@ x-backend-env: &backend-env
   LLM__API_KEY: ${LLM__API_KEY:-}
   LLM__MONTHLY_BUDGET_USD: ${LLM__MONTHLY_BUDGET_USD:-200}
   DATA_MODE: ${DATA_MODE:-mock}
+  # Warehouse reachability. --profile analytics starts ClickHouse on the
+  # internal network, but a container the backend was never told about is a
+  # container it does not read: enabled stays false and reports keep coming
+  # from the primary datastore. That is the exact misconfiguration the
+  # analytics profile looks like it prevents, and the fallback hides it.
+  CLICKHOUSE__ENABLED: ${CLICKHOUSE__ENABLED:-false}
+  CLICKHOUSE__HOST: ${CLICKHOUSE__HOST:-clickhouse}
+  CLICKHOUSE__HTTP_PORT: ${CLICKHOUSE__HTTP_PORT:-8123}
+  CLICKHOUSE__NATIVE_PORT: ${CLICKHOUSE__NATIVE_PORT:-9000}
+  CLICKHOUSE__USER: ${CLICKHOUSE_USER:-default}
+  CLICKHOUSE__PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+  CLICKHOUSE__DATABASE: ${CLICKHOUSE_DATABASE:-ad_optimizer}
+  # daily is the only source with a writer in this build; events warns at
+  # start-up. See docs/tutorial/04-clickhouse-guide.md section 2.3.
+  CLICKHOUSE__METRICS_SOURCE: ${CLICKHOUSE__METRICS_SOURCE:-daily}
   OBSERVABILITY__LOG_LEVEL: ${OBSERVABILITY__LOG_LEVEL:-INFO}
   OBSERVABILITY__JSON_LOGS: ${OBSERVABILITY__JSON_LOGS:-true}
   OPTIMIZATION__USE_CONVEX_SOLVER: ${OPTIMIZATION__USE_CONVEX_SOLVER:-true}

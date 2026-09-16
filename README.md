@@ -348,7 +348,7 @@ CI 还会构建两个容器镜像，并校验 compose 与 kustomize 清单可渲
 - **LLM 默认 mock**。切到真实模型后，创意生成与受众洞察的质量取决于 prompt 与模型，需要自建评测集。
 - **智能体的写操作永远停在预检**。工具层已经接进决策路径（monitor 拉实时报表核对告警、optimize 对每条写提案做平台预检、人工执行也走同一个执行器），但 `TOOLS__ALLOW_AGENT_WRITES=false` 意味着模型自己一次都动不了真实账户——这是刻意设计，不是待补的缺口。代价是预检只能暴露参数、权限和状态层面的问题；真实平台的配额、竞价冲突要到人工执行那一刻才知道。
 - **LLM 目前不在决策路径上**。全仓只有 2 处模型调用：`creative` 生成文案（失败降级为模板）、`audience` 产出叙述性假设（当前不被下游消费）。所有涉及金额的决定都由 `domain/` 的确定性代码做出，所以换掉 mock provider 不会改变动作集合。这是刻意取舍，但不该被误读为“模型在做决策”。
-- **ClickHouse 路径**（`DATA_MODE=warehouse`）的写入侧已就绪：`infra/analytics/` 提供 `AnalyticsSink`，`adoptimizer warehouse sync` 把运营库的日报镜像进仓库（`ReplacingMergeTree`，可安全重跑）。注意平台 API 给的是**日报而非事件流**，所以当前主路径是聚合表 `campaign_daily_metrics`（配 `CLICKHOUSE__METRICS_SOURCE=daily` 读取），`ad_events` 留给真实事件流。**未经真实数据量验证**。读路径连不上库时降级到空结果（刻意设计，避免拖垮优化循环），但会计入 `warehouse_reads_total{outcome="degraded"}` 而不再无声。见 [09 §S3](docs/production/09-upgrade-path.md)。
+- **ClickHouse 路径**（`DATA_MODE=warehouse`）的写入侧已就绪：`infra/analytics/` 提供 `AnalyticsSink`，`adoptimizer warehouse sync` 把运营库的日报镜像进仓库（`ReplacingMergeTree`，可安全重跑）。注意平台 API 给的是**日报而非事件流**，所以当前主路径是聚合表 `campaign_daily_metrics`（`CLICKHOUSE__METRICS_SOURCE` 的默认值就是 `daily`，与写入侧对齐；`events` 需显式开启，且因为暂无生产写入者会在启动时打 `clickhouse_events_source_has_no_writer` 告警而不是静默读空），`ad_events` 留给真实事件流。读侧对该表统一加 `FINAL`：`ReplacingMergeTree` 的替换只发生在后台 merge，而 sync 是文档支持重跑的 30 天窗口镜像，不收敛版本就会把同一次投放按重放次数累加——ROAS 因分子分母同比放大而看起来正常，所以不会有任何告警。**未经真实数据量验证**。读路径连不上库时降级到空结果（刻意设计，避免拖垮优化循环），但会计入 `warehouse_reads_total{outcome="degraded"}` 而不再无声。见 [09 §S3](docs/production/09-upgrade-path.md)。
 - 完整清单与缓解方案见 [docs/production/08-limitations-and-roadmap.md](docs/production/08-limitations-and-roadmap.md)；**按什么顺序解决、每步怎么验收**见 [09 优化升级路径](docs/production/09-upgrade-path.md)。
 
 ---

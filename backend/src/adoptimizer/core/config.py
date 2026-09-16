@@ -130,12 +130,15 @@ class ClickHouseSettings(BaseModel):
     verify_tls: bool = True
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
     query_timeout_seconds: float = Field(default=30.0, gt=0)
-    # Which table the read model queries. ``daily`` matches what the ingestion
-    # path can actually populate today (platform APIs return daily reports);
-    # ``events`` reads the raw event stream, which is the richer shape but needs
-    # a pipeline that does not exist yet. Defaults to ``events`` so an existing
-    # deployment's reads do not change under it.
-    metrics_source: Literal["events", "daily"] = "events"
+    # Which table the read model queries. ``daily`` reads ``campaign_daily_metrics``,
+    # the table ``warehouse sync`` mirrors the primary datastore's daily reports
+    # into - the only source with a writer in this build, because platform APIs
+    # hand back daily reports rather than an event stream. ``events`` reads the
+    # raw ``ad_events`` table: the richer shape, carrying device, country and
+    # gender, but nothing populates it yet, so selecting it means reading a table
+    # that stays empty and falling back to the primary datastore. Selecting it is
+    # an explicit opt-in and ``build_warehouse`` warns when it is configured.
+    metrics_source: Literal["events", "daily"] = "daily"
 
 
 class SecuritySettings(BaseModel):

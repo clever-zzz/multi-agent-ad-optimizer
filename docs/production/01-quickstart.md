@@ -202,9 +202,39 @@ docker compose -f deploy/compose/docker-compose.yml ps      # 等到全部 healt
 # 带后台 worker（arq）
 docker compose -f deploy/compose/docker-compose.yml --profile worker up -d
 
-# 带 ClickHouse 分析仓库（DATA_MODE=warehouse）
+# 带 ClickHouse 分析仓库（只是把容器起起来，后端还不会读它，见下）
 docker compose -f deploy/compose/docker-compose.yml --profile analytics up -d
 ```
+
+### 让报表真的走仓库
+
+`--profile analytics` 只负责启动 ClickHouse 容器。读取路径由三个开关决定，**少拨一个都会静默地继续从主库出数**，而且 `/readyz` 照样是绿的：
+
+| 开关 | 它决定什么 | 走仓库要设成 |
+|---|---|---|
+| `DATA_MODE` | 报表读仓库，还是读主库的 SQL 聚合降级 | `warehouse` |
+| `CLICKHOUSE__ENABLED` | 仓库用 ClickHouse，还是 `SqlAggregateWarehouse` | `true` |
+| `CLICKHOUSE__METRICS_SOURCE` | 读仓库里的哪张表 | `daily`（默认值，也是当前唯一有写入方的） |
+
+三个都写进 `deploy/compose/.env`，再重建 api：
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d --force-recreate api
+```
+
+`CLICKHOUSE__HOST` 的默认值已经是 `clickhouse`（compose 内部网络），不用改。
+
+数据不会自己出现，得搬一次：
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml exec api adoptimizer warehouse status
+docker compose -f deploy/compose/docker-compose.yml exec api adoptimizer warehouse sync --days 30 --dry-run
+docker compose -f deploy/compose/docker-compose.yml exec api adoptimizer warehouse sync --days 30
+```
+
+`status` 在写入侧不通时退出码非零，可以直接放进部署脚本当预检。`sync` 对同一个窗口**可以反复重跑** —— 目标表是 `ReplacingMergeTree`，读取侧带 `FINAL`，重放修正的是同一行而不是追加一份副本，所以漏一天补一天就行。
+
+> 启动日志里出现 `clickhouse_events_source_has_no_writer`，说明 `metrics_source` 被配成了 `events`。那张表更富（带设备、国家、性别），但当前构建里没有任何代码往里写，于是读到空、按设计回退主库 —— 表现是"一切正常"，报表其实不在走仓库。原理与排查见 [ClickHouse 指南](../tutorial/04-clickhouse-guide.md) 第 2.3 节。
 
 停止并清数据：
 

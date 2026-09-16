@@ -41,12 +41,14 @@ ClickHouse 在 `deploy/compose/docker-compose.yml` 里被放在 **`analytics` pr
 
 ```yaml
 clickhouse:
-  image: clickhouse/clickhouse-server:24.3
+  image: clickhouse/clickhouse-server:24.8-alpine
   profiles: ["analytics"]
   volumes:
     - clickhouse-data:/var/lib/clickhouse
     - ../../init-scripts/clickhouse:/docker-entrypoint-initdb.d:ro
 ```
+
+> 这个服务**不发布端口**，只挂在内部 `backend` 网络上。后端通过 `CLICKHOUSE__HOST=clickhouse` 找它，见 2.2 前面那段环境变量。
 
 启动：
 
@@ -57,14 +59,22 @@ docker compose --profile analytics up -d
 docker compose ps           # 等到 clickhouse 变 healthy
 ```
 
-初始化 SQL 挂载到容器的 `/docker-entrypoint-initdb.d`，**首次启动**会执行 `init-scripts/clickhouse/01_create_tables.sql` 自动建库建表。
+初始化 SQL 挂载到容器的 `/docker-entrypoint-initdb.d`，**首次启动**会按文件名顺序执行 `init-scripts/clickhouse/` 下的脚本：`01_create_tables.sql` 建事件表、主数据表与两个物化视图，`02_daily_metrics.sql` 建日报聚合表 `campaign_daily_metrics`。
 
-然后让后端改走仓库路径（改 `backend/.env`）：
+> 注意「首次启动」：初始化脚本只在数据目录为空时跑。已经起过一次的卷不会重新执行，新加的表要用 `docker compose exec clickhouse clickhouse-client --multiquery < init-scripts/clickhouse/02_daily_metrics.sql` 之类的方式手动补，或者 `down -v` 重来。
+
+然后让后端改走仓库路径。**三个开关要一起拨**，少一个都不会真的走仓库：
 
 ```
-CLICKHOUSE__ENABLED=true
-DATA_MODE=warehouse
+DATA_MODE=warehouse                 # 报表读仓库，而不是主库的 SQL 聚合降级
+CLICKHOUSE__ENABLED=true            # 仓库用 ClickHouse，而不是 SqlAggregateWarehouse
+CLICKHOUSE__METRICS_SOURCE=daily    # 读仓库里的哪张表（默认值，写出来是为了自解释）
 ```
+
+- **本机跑后端**：改 `backend/.env`，另外还要给 `CLICKHOUSE__HOST=localhost`（默认值就是它）。
+- **compose 里跑后端**：改 `deploy/compose/.env`。`docker-compose.yml` 的 `x-backend-env` 会把 `CLICKHOUSE__*` 透传给 `api` / `worker`，`CLICKHOUSE__HOST` 的默认值已经是 `clickhouse`，所以只需要把 `DATA_MODE` 和 `CLICKHOUSE__ENABLED` 拨过去。
+
+`CLICKHOUSE__METRICS_SOURCE` 只有两个取值。`daily` 读 `campaign_daily_metrics`，那是 `warehouse sync` 的落点，也是**当前唯一有写入方的表**；`events` 读原始事件流 `ad_events`，形状更富（带 device/country/gender），但这个构建里没有任何代码往里写，所以配它会在启动时告警 —— 原因见 2.3。
 
 ### 2.1 验证服务
 
@@ -76,13 +86,16 @@ curl "http://localhost:8123/ping"
 
 期望返回 `Ok.`。
 
-在容器内用客户端：
+在容器内用客户端（compose 里不发布端口，所以本机那条 `curl localhost:8123` 只在你单独跑了 ClickHouse 容器时成立）：
 
 ```bash
-docker exec -it <clickhouse容器名> clickhouse-client --query "SELECT version()"
-```
+docker compose -f deploy/compose/docker-compose.yml exec clickhouse \
+  clickhouse-client --query "SELECT version()"
 
-> 容器名取决于 compose 项目名，用 `docker compose ps` 查。
+# 顺手确认后端到仓库的网络是通的，这比本机 curl 更接近真实读取路径
+docker compose -f deploy/compose/docker-compose.yml exec api \
+  python -c "import urllib.request as u; print(u.urlopen('http://clickhouse:8123/ping').read())"
+```
 
 ### 2.2 确认后端真的用上了
 
@@ -91,6 +104,21 @@ docker exec -it <clickhouse容器名> clickhouse-client --query "SELECT version(
 - `clickhouse_connected` —— 连上了，走仓库路径
 - `clickhouse_unavailable` —— 驱动没装（需要 `pip install -e ".[clickhouse]"`）
 - `clickhouse_enabled_but_unreachable_falling_back_to_sql` —— 配了但连不上，**自动回退**到 SQL 聚合路径
+- `clickhouse_events_source_has_no_writer` —— 连上了，但 `metrics_source` 配的是 `events`，见 2.3
+
+再确认数据真的搬进去了：
+
+```bash
+adoptimizer warehouse status                    # 写入侧通不通；不通时退出码非零
+adoptimizer warehouse sync --days 30 --dry-run  # 先看这个窗口有多少行
+adoptimizer warehouse sync --days 30            # 真搬。可反复重跑，见 4.2
+```
+
+### 2.3 为什么"连上了"还不算配对了
+
+降级机制在这里会反过来咬人。读 ClickHouse 读到空结果时，后端**按设计**回退到主库，所以把 `metrics_source` 配成一张没有写入方的表，表现是"一切正常"：`/readyz` 绿、报表有数、没有异常 —— 数字其实一直来自主库，而你以为在读仓库。
+
+唯一能看穿它的两个地方是启动日志里的 `clickhouse_events_source_has_no_writer`，和 Prometheus 上的 `warehouse_reads_total{outcome="empty"}` 持续为高。这也是 `build_warehouse` 在连上之后立刻调一次告警的原因：**能连上不代表配对了**。
 
 ---
 
@@ -165,9 +193,17 @@ ORDER BY (campaign_id, creative_id, event_time);
 
 **特点**：后台合并时按排序键「保留一条」，通常配合**版本列**处理**更新语义**（最终一致）。
 
-本项目中 **`campaigns`**、**`creatives`**、**`audience_profiles`** 使用 `ReplacingMergeTree(updated_at)` 或 `ReplacingMergeTree(created_at)`，适合「同一实体多次写入，保留最新快照」的场景。
+本项目中 **`campaigns`**、**`creatives`**、**`audience_profiles`** 使用 `ReplacingMergeTree(updated_at)` 或 `ReplacingMergeTree(created_at)`，适合「同一实体多次写入，保留最新快照」的场景。**`campaign_daily_metrics`**（`02_daily_metrics.sql`）用的也是 `ReplacingMergeTree(updated_at)`，排序键 `(campaign_id, creative_id, stat_date)` 刻意和主库那张表的唯一约束对齐 —— 目的就是让重放一次 backfill **就地修正**同一行，而不是追加一份副本。
 
 **注意**：查询时若未处理重复行，可能仍看到旧版本，直到合并完成；严谨场景可用 `FINAL` 或自行聚合（有性能代价）。
+
+**这句"注意"在本项目里不是理论问题，而是已经付过一次的代价。**
+
+`adoptimizer warehouse sync` 被设计成可以对同一个 30 天窗口反复重跑（漏一天补一天、失败重跑都靠这个性质），所以"同一行存在多个版本"是**常态**而不是边界情况。而 `ReplacingMergeTree` 的去重要等 ClickHouse 后台挑到那次合并，合并之前读到的就是全部版本。结果是：从第二次 sync 起，窗口内的曝光、花费、收入全部翻倍 —— 而 ROAS 是两个同样翻倍的数相除，看起来完全正常；CTR、CPA 同理。**下游没有任何一处会报错**，翻倍的总量就这么直接进了 Agent 的预算分配与出价打分。
+
+所以 `ClickHouseWarehouse` 读 `campaign_daily_metrics` 时一律带 `FINAL`（`infra/warehouse.py` 的 `_relation` 属性），把去重放在读取时而不是等后台合并。`ad_events` 是普通 `MergeTree` —— 一行就是一次投放，没有"版本"可言 —— 因此原样读，不付这份代价。两个回归测试在 `tests/integration/test_warehouse.py`：一个断言重放的窗口读出来不翻倍，另一个断言 events 源的 SQL 里**没有** `FINAL`（不该付的成本也别付）。
+
+> 因为本机通常没有 Docker，这两个测试断言的是**生成的 SQL 形状**而不是真实合并行为。它们能挡住"忘了加 `FINAL`"这类回归，挡不住"`FINAL` 语义本身理解错了"。真上 ClickHouse 时值得手工重放一次 30 天窗口对一下总花费。
 
 ### 4.3 SummingMergeTree
 
@@ -222,7 +258,7 @@ GROUP BY campaign_id;
 
 ### 6.1 表清单
 
-下表与 `init-scripts/clickhouse/01_create_tables.sql` 一致：
+下表与 `init-scripts/clickhouse/` 下的两个脚本一致：前八张来自 `01_create_tables.sql`，最后一张来自 `02_daily_metrics.sql`。
 
 | 表名 | 引擎 | 作用 |
 |---|---|---|
@@ -234,8 +270,11 @@ GROUP BY campaign_id;
 | `audience_profiles` | ReplacingMergeTree | 受众画像与预估规模 |
 | `bid_logs` | MergeTree | 竞价日志：出价、是否竞得、eCPM 等 |
 | `optimization_logs` | MergeTree | Agent/系统优化动作审计 |
+| `campaign_daily_metrics` | ReplacingMergeTree(updated_at) | **日报聚合表**：主库 `daily_metrics` 的镜像、`warehouse sync` 的落点，也是默认 `metrics_source=daily` 的读取目标（读取时带 `FINAL`，见 4.2） |
 
 **设计思路一句话**：「明细进 `ad_events`，常用报表走物化视图；配置类实体用 ReplacingMergeTree 表达最新状态。」
+
+实际跑起来的主力其实是第九张。平台 API 交回来的是**日报**而不是逐次曝光，所以 `warehouse sync` 把主库的 `daily_metrics` 镜像进 `campaign_daily_metrics`，后端默认也从这张表读；`ad_events` 是等真有事件流之后才切的形状。这一点在 6.2 会再展开。
 
 ### 6.2 两条读取路径，一个 Protocol
 
@@ -246,11 +285,13 @@ GROUP BY campaign_id;
 结构：
 
 ```
-:37   class MetricsWarehouse(Protocol)      ← 契约
-:59   class SqlAggregateWarehouse           ← 读主库的 daily_metrics 聚合表
-:256  class ClickHouseWarehouse             ← 读 ClickHouse 的 ad_events
-:474  async def build_warehouse(session)    ← 工厂，按配置与连通性选实现
+:83   class MetricsWarehouse(Protocol)      ← 契约
+:105  class SqlAggregateWarehouse           ← 读主库的 daily_metrics 聚合表
+:303  class ClickHouseWarehouse             ← 读 ClickHouse：默认 daily 源，可选 events 源
+:730  async def build_warehouse(session)    ← 工厂，按配置与连通性选实现
 ```
+
+（行号会随改动漂移，认类名比认行号可靠。）
 
 Protocol 定义了 6 个方法：
 
@@ -273,6 +314,7 @@ async def build_warehouse(session) -> MetricsWarehouse:
     if settings.enabled:
         warehouse = ClickHouseWarehouse(settings)
         if await warehouse.connect():
+            warehouse.warn_if_source_has_no_writer()
             return warehouse
         logger.warning("clickhouse_enabled_but_unreachable_falling_back_to_sql")
     return SqlAggregateWarehouse(session)
@@ -280,7 +322,9 @@ async def build_warehouse(session) -> MetricsWarehouse:
 
 三重降级：没启用 → SQL；启用了但驱动没装 → SQL；启用了但连不上 → SQL。**调用方永远不需要知道当前是哪个。**
 
-`ClickHouseWarehouse.campaign_snapshots` 的真实 SQL：
+连上之后那行 `warn_if_source_has_no_writer()` 是给降级机制打的补丁，理由和 2.3 是同一件事：降级很好用，但它同时也会**掩盖配错** —— 读到空表就静默回退主库，于是"配的源没有写入方"这种错误在功能上一切正常，只有日志和指标能看出来。所以能在连上的当场说出来，就不要留给运维去猜。
+
+`ClickHouseWarehouse.campaign_snapshots` 的真实 SQL。同一个方法按 `metrics_source` 生成两种形状，下面是 **`events` 源**（原始事件流，一行一次投放，所以"计数"就是聚合）：
 
 ```sql
 SELECT campaign_id,
@@ -294,10 +338,29 @@ WHERE event_time >= now() - toIntervalDay({days:UInt16})
 GROUP BY campaign_id
 ```
 
+而**默认的 `daily` 源**读的是已经聚合过的镜像表，三处都不一样：度量从 `countIf` 换成 `sum(...)`，`FROM` 换成 6.3 节那个塌缩子查询，表名后面带 `FINAL`（4.2）：
+
+```sql
+SELECT campaign_id, sum(impressions) AS impressions, /* ... */ sum(revenue) AS revenue
+FROM (
+  SELECT campaign_id, stat_date,
+         if(countIf(creative_id = '') > 0,
+            sumIf(cost, creative_id = ''),
+            sumIf(cost, creative_id != '')) AS cost,   /* 每个度量一份 */
+         /* ... */
+  FROM {db:Identifier}.campaign_daily_metrics FINAL
+  WHERE stat_date >= today() - toIntervalDay(greatest({days:UInt16}, 1) - 1)
+  GROUP BY campaign_id, stat_date
+)
+GROUP BY campaign_id
+```
+
+窗口谓词里那个 `- 1` 也是必须的：`stat_date` 是**日历日**，"最近 7 天含今天"只能往前推 6 天。漏掉它，仓库会对同一个请求给出比 SQL 路径多一天的数据，而两边都不报错。`greatest(..., 1)` 则是挡 `days=0`：占位符按 `UInt16` 绑定，0 减 1 会绕回 65535，读的是整张表而不是空集。
+
 注意几个工程细节：
 - **参数化查询**：`{db:Identifier}`、`{days:UInt16}`、`{ids:Array(String)}` 是 ClickHouse 的类型化参数占位符，不是字符串拼接 —— 防注入
 - **阻塞驱动移出事件循环**：`_to_thread()` 用 `asyncio.to_thread` 包了同步的 `clickhouse_connect` 调用，不阻塞 FastAPI 的事件循环
-- **查询失败返回空列表而不是抛异常**（`:300-301`），由调用方的健康检查去暴露问题
+- **查询失败返回空列表而不是抛异常**（`_query` 的 `except` 分支），由调用方的健康检查去暴露问题；同时每次读取都在 `warehouse_reads_total{backend,outcome}` 上记一笔（`ok` / `empty` / `degraded`）—— 因为"静默回退到主库"和"确实没数据"必须能被区分开，否则 2.3 那种配错永远查不出来
 
 ### 6.3 双粒度陷阱：为什么两个实现必须语义一致
 
@@ -363,7 +426,7 @@ if(countIf(creative_id = '') > 0,
 3. **避免 `SELECT *`**：列式存储下只选需要的列，收益远大于行式库
 4. **用 `countIf` / `sumIf` 一次扫描出多个指标**，而不是跑多条 SQL（见 6.2 的实例）
 5. **大结果集分页**：用 `LIMIT` + 排序键有序分页；深度分页可改用「上次最大值」游标
-6. **慎用 `FINAL`**：会强制合并语义，数据量大时成本高
+6. **慎用 `FINAL`**：会强制合并语义，数据量大时成本高 —— 但"慎用"不等于"不用"。本项目在 `campaign_daily_metrics` 上是**必须**用的（4.2）：写入侧被设计成可重放，读取侧不带 `FINAL` 就会把重放的版本全加起来，而这不报错。这笔交易是"每次查询付一点合并成本"换"数字不会翻倍"，在正确性面前没有悬念。真要省，可以改用 `argMax` 自行聚合，或把重放窗口收窄
 7. **批量写入**：小批量高频插入会造成合并压力；尽量批量
 
 ---
@@ -402,7 +465,8 @@ if(countIf(creative_id = '') > 0,
 
 - ClickHouse 是**列式 OLAP** 数据库，适合广告**事件明细 + 聚合分析**；本项目用它作**可选**的分析仓库，默认关闭。
 - 表设计用 **MergeTree / ReplacingMergeTree / SummingMergeTree** 与**物化视图**完成分层存储：明细进 `ad_events`，报表走物化视图，配置类实体用 Replacing 表达最新状态。
-- 后端通过 **`MetricsWarehouse` Protocol** 抽象两条读取路径（ClickHouse 明细聚合 / SQL 聚合表），工厂按配置与连通性选择，**连不上自动降级**，调用方不感知。
+- 后端通过 **`MetricsWarehouse` Protocol** 抽象两条读取路径（ClickHouse / 主库 SQL 聚合表），工厂按配置与连通性选择，**连不上自动降级**，调用方不感知。ClickHouse 一侧默认读 `campaign_daily_metrics`（`metrics_source=daily`），因为那是当前唯一有写入方的表；`events` 是等真有事件流之后才切的显式选项，配早了会告警。
+- **降级会掩盖配错**：读到空就回退主库，所以"配的源没有写入方"在功能上完全看不出来。这类问题只能靠启动日志和 `warehouse_reads_total` 的 `outcome` 计数兜住 —— 能连上不等于配对了。
 - **双粒度重复计数**是"聚合表"这类存储的陷阱，不是某个后端的陷阱：同一天同一笔花费同时存在活动级槽位与素材级明细，必须二选一。ClickHouse 的 `events` 源读原始事件流，只有一种粒度，天然免疫；但 `daily` 源读的是主库那张表的镜像，两种粒度一起搬过去了，所以 `_delivery_relation()` 在 SQL 里重做了同一次塌缩。
 - 与 PostgreSQL 互补而非替代：事务型数据留在主库，海量追加型事件进仓库。
 

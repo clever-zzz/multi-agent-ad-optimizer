@@ -21,7 +21,19 @@ data:
   REDIS__ENABLED: "true"
   REDIS__URL: "redis://redis:6379/0"
   REDIS__CACHE_TTL_SECONDS: "300"
+  # ---- Analytical warehouse ----
+  # Off by default, and flipping ENABLED alone is not enough: DATA_MODE below
+  # must also be "warehouse", or reports keep coming from the primary datastore
+  # while /readyz still reports clickhouse_enabled=true. The password belongs in
+  # adoptimizer-secrets, not here. Set METRICS_SOURCE to "daily": it is the only
+  # source with a writer, because `adoptimizer warehouse sync` mirrors daily
+  # reports into campaign_daily_metrics and nothing writes ad_events.
   CLICKHOUSE__ENABLED: "false"
+  CLICKHOUSE__HOST: "clickhouse"
+  CLICKHOUSE__HTTP_PORT: "8123"
+  CLICKHOUSE__NATIVE_PORT: "9000"
+  CLICKHOUSE__DATABASE: "ad_optimizer"
+  CLICKHOUSE__METRICS_SOURCE: "daily"
   SECURITY__JWT_ALGORITHM: "HS256"
   SECURITY__ACCESS_TOKEN_TTL_MINUTES: "15"
   SECURITY__REFRESH_TOKEN_TTL_DAYS: "7"

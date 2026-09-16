@@ -175,7 +175,8 @@ S5 可与其他阶段并行
 - `services/warehouse_sync.py` — `WarehouseSyncService`：从主库 `daily_metrics` 读 → 写仓库。**用镜像而不是双写**：主库是事务性的、权威的，仓库是最终一致的分析副本；在同一个事务里写两边，会让仓库故障要么阻塞采集、要么逼采集回滚，而这份数据仓库随时能从主库重新推导。
 - `init-scripts/clickhouse/02_daily_metrics.sql` — 新表，`ReplacingMergeTree` 按 (campaign, creative, date) 去重，**这是重跑安全的前提**，也是部分失败后操作员敢直接重跑的原因。
 - CLI：`adoptimizer warehouse status`（可用性预检）与 `adoptimizer warehouse sync [--days N] [--campaign ID] [--dry-run]`。
-- 读侧：`ClickHouseWarehouse` 新增 `CLICKHOUSE__METRICS_SOURCE=events|daily`（**默认仍是 `events`**，不让已有部署的读取行为在脚下改变）。`daily` 模式下 `audience_observations` 如实回退到 campaign 维度，而不是编造看不见的人口细分。
+- 读侧对该表统一加 `FINAL`（`ClickHouseWarehouse._relation`）：`ReplacingMergeTree` 只在后台 merge 时替换旧版本，而 sync 支持重跑，不收敛就会把重放留下的多个版本一起 `sum()` 进去。
+- 读侧：`ClickHouseWarehouse` 新增 `CLICKHOUSE__METRICS_SOURCE=events|daily`（**默认 `daily`**，即与写入侧对齐的那一张表；`events` 目前没有生产写入者，显式选中时 `build_warehouse` 会打 `clickhouse_events_source_has_no_writer` 告警而不是静默读空。默认值曾经选 `events`，理由是"不让已有部署的读取行为在脚下改变"，但没有东西可保留：一张没有写入者的表永远回答空，而刻意的降级又会把这件事藏起来）。`daily` 模式下 `audience_observations` 如实回退到 campaign 维度，而不是编造看不见的人口细分。
 
 **仍未完成**：真实数据量压测（需要真实数据）、`/admin/prune` 扩展（= P1-6）。
 

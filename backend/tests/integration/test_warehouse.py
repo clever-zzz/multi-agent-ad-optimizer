@@ -624,8 +624,12 @@ class FakeDriver:
 def connected(
     *, fail_query: bool = False, fail_command: bool = False
 ) -> tuple[ClickHouseWarehouse, FakeDriver]:
-    """A warehouse whose driver is already wired up, skipping connect()."""
-    settings = ClickHouseSettings(enabled=True, database="ad_optimizer")
+    """A warehouse on the events source, with the driver already wired up.
+
+    The source is pinned rather than inherited: everything in this class asserts
+    the shape of event-stream reads, and ``daily`` is now the configured default.
+    """
+    settings = ClickHouseSettings(enabled=True, database="ad_optimizer", metrics_source="events")
     warehouse = ClickHouseWarehouse(settings)
     driver = FakeDriver(fail_query=fail_query, fail_command=fail_command)
     warehouse._client = driver
@@ -786,6 +790,40 @@ class TestClickHouseWarehouse:
         assert warehouse._client is None
 
 
+class RecordingLogger:
+    """Records structured log calls instead of emitting them.
+
+    ``structlog.testing.capture_logs`` is the obvious tool and is not a safe one
+    here, for the reason ``test_llm_gateway`` documents: ``configure_logging``
+    installs a fresh processor list on every app-factory run while loggers are
+    cached on first use, so a capture can come back silently empty under a
+    full-suite run and turn a "did not warn" assertion into a vacuous pass.
+    Swapping the module attribute has no such coupling.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict[str, Any]]] = []
+
+    def debug(self, event: str, **fields: Any) -> None:
+        self.events.append(("debug", event, fields))
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.events.append(("info", event, fields))
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.events.append(("warning", event, fields))
+
+    def error(self, event: str, **fields: Any) -> None:
+        self.events.append(("error", event, fields))
+
+    def matching(self, level: str, event: str) -> list[dict[str, Any]]:
+        return [
+            fields
+            for seen_level, seen_event, fields in self.events
+            if seen_level == level and seen_event == event
+        ]
+
+
 class TestWarehouseSelection:
     async def test_sql_is_used_when_clickhouse_is_disabled(
         self, session: Any, monkeypatch: pytest.MonkeyPatch
@@ -832,6 +870,60 @@ class TestWarehouseSelection:
         assert warehouse.name == "clickhouse"
         await warehouse.close()
 
+    async def test_an_events_source_says_that_nothing_writes_it(
+        self, session: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The richer source has no writer yet, so wiring it up must not be silent.
+
+        Reading ``ad_events`` answers empty, and an empty answer falls back to the
+        primary datastore by design - which is precisely the quiet failure an
+        operator cannot distinguish from "no delivery in this window".
+        """
+        settings = make_settings(
+            "sqlite+aiosqlite:///:memory:",
+            clickhouse=ClickHouseSettings(enabled=True, metrics_source="events"),
+        )
+        monkeypatch.setattr(warehouse_module, "get_settings", lambda: settings)
+        recorder = RecordingLogger()
+        monkeypatch.setattr(warehouse_module, "logger", recorder)
+
+        async def always_connects(self: ClickHouseWarehouse) -> bool:
+            self._client = FakeDriver()
+            return True
+
+        monkeypatch.setattr(ClickHouseWarehouse, "connect", always_connects)
+
+        warehouse = await build_warehouse(session)
+
+        assert isinstance(warehouse, ClickHouseWarehouse)
+        warned = recorder.matching("warning", "clickhouse_events_source_has_no_writer")
+        assert len(warned) == 1
+        assert warned[0]["table"] == "ad_events"
+        await warehouse.close()
+
+    async def test_the_default_source_is_not_news(
+        self, session: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``daily`` has a writer, so a warning here would only train people to ignore it."""
+        settings = make_settings(
+            "sqlite+aiosqlite:///:memory:", clickhouse=ClickHouseSettings(enabled=True)
+        )
+        monkeypatch.setattr(warehouse_module, "get_settings", lambda: settings)
+        recorder = RecordingLogger()
+        monkeypatch.setattr(warehouse_module, "logger", recorder)
+
+        async def always_connects(self: ClickHouseWarehouse) -> bool:
+            self._client = FakeDriver()
+            return True
+
+        monkeypatch.setattr(ClickHouseWarehouse, "connect", always_connects)
+
+        warehouse = await build_warehouse(session)
+
+        assert isinstance(warehouse, ClickHouseWarehouse)
+        assert recorder.matching("warning", "clickhouse_events_source_has_no_writer") == []
+        await warehouse.close()
+
 
 def daily_connected(*, fail_query: bool = False) -> tuple[ClickHouseWarehouse, FakeDriver]:
     """A warehouse reading the aggregate table, with the driver already wired."""
@@ -845,9 +937,24 @@ def daily_connected(*, fail_query: bool = False) -> tuple[ClickHouseWarehouse, F
 class TestClickHouseDailySource:
     """The aggregate-table source, which is the one ingestion can populate today."""
 
-    async def test_events_remain_the_default_source(self) -> None:
-        """Enabling ClickHouse must not silently change what a deployment reads."""
+    async def test_the_source_with_a_writer_is_the_default(self) -> None:
+        """Defaulting to a table nothing writes would read empty and hide it.
+
+        ``events`` looks like the safe default - "do not change what an existing
+        deployment reads" - but no production code path writes ``ad_events``, so
+        all it preserves is an empty result plus the quiet fallback to the
+        primary datastore that follows it.
+        """
         warehouse = ClickHouseWarehouse(ClickHouseSettings(enabled=True))
+
+        assert warehouse.source == "daily"
+        assert warehouse._table == "campaign_daily_metrics"
+
+    async def test_the_events_source_stays_reachable_as_an_opt_in(self) -> None:
+        """The richer shape must not be lost, only stopped from being the default."""
+        settings = ClickHouseSettings(enabled=True, metrics_source="events")
+
+        warehouse = ClickHouseWarehouse(settings)
 
         assert warehouse.source == "events"
         assert warehouse._table == "ad_events"
