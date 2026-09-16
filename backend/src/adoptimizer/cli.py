@@ -22,6 +22,13 @@ from .core.clock import utc_today
 from .core.config import IngestSettings, Settings, get_settings, load_environment
 from .core.logging import configure_logging, get_logger
 
+# Upper bound for every day-window option. Ten years is past any real telemetry
+# window and far short of what ``timedelta`` accepts, so a typo such as
+# ``--days 1000000000`` is refused by the parser with a usage message instead of
+# surfacing much later as a bare ``OverflowError`` from inside a repository.
+MAX_WINDOW_DAYS = 3650
+
+
 app = typer.Typer(
     name="adoptimizer",
     help="Operate the multi-agent advertising optimization platform.",
@@ -143,7 +150,9 @@ def seed(force: bool = typer.Option(False, help="Seed even if campaigns already 
 @app.command()
 def ingest(
     source: str = typer.Option("synthetic", "--source", help="Registered feed to pull from"),
-    days: int = typer.Option(7, "--days", help="Window length in days, ending today"),
+    days: int = typer.Option(
+        7, "--days", min=1, max=MAX_WINDOW_DAYS, help="Window length in days, ending today"
+    ),
     start: str = typer.Option("", "--start", help="Window start YYYY-MM-DD, overrides --days"),
     end: str = typer.Option("", "--end", help="Window end YYYY-MM-DD, defaults to today"),
     dry_run: bool = typer.Option(
@@ -326,7 +335,7 @@ def scheduler(
 def run_optimization(
     campaign_ids: list[str] = typer.Option(None, "--campaign", help="Restrict to these campaigns"),
     max_iterations: int = typer.Option(2, help="Iteration cap"),
-    window_days: int = typer.Option(7, help="Telemetry window"),
+    window_days: int = typer.Option(7, min=1, max=MAX_WINDOW_DAYS, help="Telemetry window"),
     wait: bool = typer.Option(True, help="Block until the run finishes"),
 ) -> None:
     """Execute one optimization loop and print the summary."""
@@ -637,7 +646,9 @@ def warehouse_status() -> None:
 
 @warehouse_app.command("sync")
 def warehouse_sync(
-    days: int = typer.Option(30, "--days", help="How many days back to mirror"),
+    days: int = typer.Option(
+        30, "--days", min=1, max=MAX_WINDOW_DAYS, help="How many days back to mirror"
+    ),
     campaign: str = typer.Option("", "--campaign", help="Limit the mirror to one campaign id"),
     dry_run: bool = typer.Option(
         False, "--dry-run/--no-dry-run", help="Report what would move without writing it"

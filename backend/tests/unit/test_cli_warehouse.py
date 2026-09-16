@@ -185,3 +185,20 @@ class TestWarehouseSync:
         body = payload(result.output)
         assert body["candidates"] == 0
         assert sink.rows == []
+
+    @pytest.mark.parametrize("days", ["0", "-5", "1000000000", "9999999999999"])
+    def test_an_unusable_window_is_refused_by_the_parser(
+        self, cli_env: Path, sink: AvailableSink, days: str
+    ) -> None:
+        """A scheduled job gets ``--days`` wrong more often than anything else.
+
+        A huge value used to travel all the way to ``timedelta`` and surface as a
+        bare ``OverflowError``; zero used to be clamped into a one-day mirror that
+        then reported an empty warehouse. Exit code 2 is the parser's usage error,
+        which is the shape a deploy script can branch on without reading a log.
+        """
+        result = runner.invoke(app, ["warehouse", "sync", "--days", days, "--dry-run"])
+
+        assert result.exit_code == 2, result.output
+        assert "--days" in result.output
+        assert sink.rows == []

@@ -333,7 +333,7 @@ class MetricRepository(BaseRepository[DailyMetric]):
         use; collapsing them here would silently discard the creative detail on
         the way out, and the mirror would then be a lossy copy of the source.
         """
-        cutoff = utc_today() - timedelta(days=days - 1)
+        cutoff = utc_today() - timedelta(days=max(1, days) - 1)
         statement = select(DailyMetric).where(DailyMetric.stat_date >= cutoff)
         if campaign_ids:
             statement = statement.where(DailyMetric.campaign_id.in_(list(campaign_ids)))

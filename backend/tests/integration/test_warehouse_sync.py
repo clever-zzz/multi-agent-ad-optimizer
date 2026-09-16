@@ -167,6 +167,21 @@ class TestExportDaily:
         assert rollup.impressions == 10_000
         assert rollup.cost == 500.0
 
+    @pytest.mark.parametrize("days", [0, -1, -365])
+    async def test_a_non_positive_window_reads_as_one_day(
+        self, session: Any, seeded: dict[str, str], days: int
+    ) -> None:
+        """``days - 1`` feeds a timedelta, and a zero window puts the cutoff tomorrow.
+
+        That used to return no rows, which the sync command then reports as an
+        empty warehouse - the one thing it must never say over a populated table.
+        Clamped here like ``snapshots`` and ``AnalyticsService.timeseries``, so two
+        readers of the same table cannot disagree about what a window means.
+        """
+        rows = await MetricRepository(session).export_daily(days=days)
+
+        assert len(rows) == 2
+
 
 class TestWarehouseSync:
     async def test_a_sync_mirrors_every_row(self, session: Any, seeded: dict[str, str]) -> None:
