@@ -78,6 +78,18 @@ class DatabaseEventSink(EventSink):
             await self._mirror_progress(session, event)
             await session.commit()
 
+    async def forget(self, run_id: str) -> None:
+        """Drop the run's cached progress when it is torn down, however it ended.
+
+        ``_mirror_progress`` already drops the entry when a terminal event flows
+        through, which covers every run that finished. It cannot cover one whose
+        task died before publishing anything terminal - precisely the run the
+        reaper exists to mark failed - so without this the entry would sit in the
+        dict for the life of the process. Small, but monotonic, and the reaper
+        already knows the run is gone.
+        """
+        self._seen_iterations.pop(run_id, None)
+
     async def _mirror_progress(self, session: AsyncSession, event: AgentEvent) -> None:
         """Copy the round number off the event stream and onto the run row."""
         if event.event_type in TERMINAL_EVENTS:

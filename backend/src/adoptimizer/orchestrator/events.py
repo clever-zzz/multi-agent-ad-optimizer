@@ -53,11 +53,18 @@ class EventSink(Protocol):
 
     async def persist(self, event: AgentEvent) -> None: ...
 
+    async def forget(self, run_id: str) -> None:
+        """Release whatever the sink caches for a run once that run is over."""
+        ...
+
 
 class NullEventSink:
     """Sink used when persistence is disabled, for example in unit tests."""
 
     async def persist(self, event: AgentEvent) -> None:
+        return None
+
+    async def forget(self, run_id: str) -> None:
         return None
 
 
@@ -191,12 +198,27 @@ class EventBus:
             self.unsubscribe(subscriber_id)
 
     async def close_run(self, run_id: str) -> None:
-        """Signal every subscriber of a run that no more events will arrive."""
+        """Signal every subscriber of a run that no more events will arrive.
+
+        Also tells the sink to drop the run. A sink keeps per-run state the bus
+        cannot see, and the only state it can clear by itself is the one a
+        terminal event carries - so a task that died before publishing anything
+        terminal keeps its entry for the life of the process. That is exactly the
+        run the reaper marks failed, and the reaper already calls this method,
+        which is why the forwarding lives here rather than at each call site.
+
+        A sink that fails to forget is logged, not raised: the run is already
+        over and a leaked cache entry must not turn teardown into an error.
+        """
         for subscriber_id, queue in list(self._subscribers.items()):
             if subscriber_id.startswith(run_id + ":"):
                 queue.put_nowait(None)
         self._history.pop(run_id, None)
         self._counters.pop(run_id, None)
+        try:
+            await self._sink.forget(run_id)
+        except Exception as exc:
+            logger.error("event_sink_forget_failed", run_id=run_id, error=str(exc))
 
 
 TERMINAL_EVENTS = frozenset({"run.succeeded", "run.failed", "run.cancelled"})

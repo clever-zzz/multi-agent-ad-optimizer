@@ -21,8 +21,12 @@ from adoptimizer.core.config import DatabaseSettings
 from adoptimizer.domain.enums import RunStatus
 from adoptimizer.infra.db.models import OptimizationRun, RunEvent
 from adoptimizer.infra.db.session import Database
-from adoptimizer.orchestrator.events import EventBus
-from adoptimizer.services.optimization import REAPER_STALE_AFTER, OptimizationService
+from adoptimizer.orchestrator.events import AgentEvent, EventBus
+from adoptimizer.services.optimization import (
+    REAPER_STALE_AFTER,
+    DatabaseEventSink,
+    OptimizationService,
+)
 
 STALE = REAPER_STALE_AFTER + timedelta(minutes=30)
 
@@ -173,3 +177,57 @@ class TestTeardown:
 
         assert queue.get_nowait() is None
         assert bus.replay("run_orphan") == []
+
+    async def test_reaping_tells_the_sink_to_forget_the_run(
+        self, database: Database, bus: EventBus, service: OptimizationService
+    ) -> None:
+        """The sink's cache is exactly what a terminal event would have cleared.
+
+        A run whose task died never publishes one - that is the run the reaper
+        exists for - so the reaper's teardown is the only thing left that can
+        free the entry. The event is backdated because the sink writes it as a
+        ``run_events`` row, and a fresh row is the progress signal that would
+        otherwise keep the run alive.
+        """
+        sink = DatabaseEventSink(database.session_factory)
+        bus.set_sink(sink)
+        await _add_run(database, "run_orphan", status=RunStatus.RUNNING, age=STALE)
+        await sink.persist(
+            AgentEvent(
+                run_id="run_orphan",
+                seq=1,
+                agent="monitor",
+                event_type="agent.completed",
+                payload={"iteration": 3},
+                created_at=datetime.now(UTC) - STALE,
+            )
+        )
+        assert sink._seen_iterations == {"run_orphan": 3}
+
+        async with database.unit_of_work() as session:
+            assert await service.reap_stale_runs(session) == 1
+            await session.commit()
+
+        assert sink._seen_iterations == {}
+
+    async def test_a_sink_that_cannot_forget_does_not_break_teardown(
+        self, database: Database, bus: EventBus, service: OptimizationService
+    ) -> None:
+        """Teardown must survive a sink that fails, since the run is already over."""
+
+        class ExplodingSink:
+            async def persist(self, event: AgentEvent) -> None:
+                return None
+
+            async def forget(self, run_id: str) -> None:
+                raise RuntimeError("the sink is having a day")
+
+        bus.set_sink(ExplodingSink())
+        await _add_run(database, "run_orphan", status=RunStatus.RUNNING, age=STALE)
+
+        async with database.unit_of_work() as session:
+            assert await service.reap_stale_runs(session) == 1
+            await session.commit()
+
+        status, _ = await _status_of(database, "run_orphan")
+        assert status == RunStatus.FAILED.value
