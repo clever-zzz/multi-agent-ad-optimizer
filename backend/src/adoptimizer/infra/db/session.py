@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import Session
 
 from ...core.config import DatabaseSettings, get_settings
 from ...core.errors import DependencyUnavailableError
@@ -21,6 +22,63 @@ from ...core.logging import get_logger
 from .base import Base
 
 logger = get_logger(__name__)
+
+# ``Session.info`` key under which a session carries its queued hooks. Lives on
+# the session rather than in a module-level registry so it cannot outlive the
+# transaction it belongs to, and so concurrent requests never share a queue.
+AFTER_COMMIT_HOOKS = "adoptimizer.after_commit_hooks"
+
+
+def after_commit(session: AsyncSession, hook: Callable[[], None]) -> None:
+    """Queue ``hook`` to run only if this session's transaction really commits.
+
+    Anything reporting what landed in the database has to be told *after* the
+    commit. Counting beforehand is the natural way to write it - the values are
+    already on hand, right where the row is built - and it is wrong in the one
+    case that matters. ``add_actions`` used to increment
+    ``optimization_actions_total`` as it staged the rows, so a run that died on a
+    constraint or a dropped connection still reported the proposals it never
+    wrote. Nothing downstream can detect that: the series carries no run id to
+    reconcile against, so the counter is simply too high by an amount nobody can
+    recover afterwards, and it is the number an operator compares against the
+    actions table.
+
+    Hooks are drained by the ``after_commit`` listener below, which fires no
+    matter who called ``commit()`` - the unit of work, a route handler or a CLI
+    command. A rollback drops the queue instead.
+    """
+    hooks: list[Callable[[], None]] = session.info.setdefault(AFTER_COMMIT_HOOKS, [])
+    hooks.append(hook)
+
+
+@event.listens_for(Session, "after_commit")
+def _run_after_commit_hooks(session: Session) -> None:
+    """Drain what ``after_commit`` queued, now that the rows are durable.
+
+    Bound to the class rather than per session: a session here is created per
+    unit of work, so per-session listeners would be a leak by construction, and
+    a class-level one costs a single dict pop on sessions that queued nothing.
+    """
+    hooks = session.info.pop(AFTER_COMMIT_HOOKS, None)
+    for hook in hooks or ():
+        try:
+            hook()
+        except Exception as exc:
+            # The transaction is already committed. Nothing raised here may undo
+            # it, and a broken hook must not turn a successful write into a 500 -
+            # so it is logged and the drain continues with the remaining hooks.
+            logger.error("after_commit_hook_failed", error=str(exc))
+
+
+@event.listens_for(Session, "after_rollback")
+def _drop_after_commit_hooks(session: Session) -> None:
+    """Discard the queue: the rows those hooks describe never landed.
+
+    Without this a session that rolls back and is then reused would fire the
+    stale hooks at its next commit, reporting writes from the abandoned attempt -
+    the original bug, deferred by one transaction instead of removed.
+    """
+    session.info.pop(AFTER_COMMIT_HOOKS, None)
 
 
 class Database:

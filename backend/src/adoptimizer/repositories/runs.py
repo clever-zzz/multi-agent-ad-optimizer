@@ -19,6 +19,7 @@ from ..infra.db.models import (
     OptimizationRun,
     RunEvent,
 )
+from ..infra.db.session import after_commit
 from ..orchestrator.events import AgentEvent
 from .base import BaseRepository
 
@@ -195,8 +196,18 @@ class RunRepository(BaseRepository[OptimizationRun]):
         # splits proposals from the critic's suppressed ones at the moment that
         # distinction is decided. Execution outcomes are counted where they
         # happen, in ``ActionService.execute``.
-        for record in records:
-            ACTIONS_TOTAL.labels(action_type=record.action_type, outcome=record.status).inc()
+        #
+        # Queued rather than counted here, because ``add_all`` only stages: the
+        # caller owns the commit, and a rolled-back run wrote no proposals. The
+        # pairs are snapshotted now - ``record.status`` is mutable and the hook
+        # runs after the flush that could have changed it.
+        proposed = [(record.action_type, record.status) for record in records]
+
+        def count_proposed() -> None:
+            for action_type, outcome in proposed:
+                ACTIONS_TOTAL.labels(action_type=action_type, outcome=outcome).inc()
+
+        after_commit(self.session, count_proposed)
         return records
 
     async def add_findings(

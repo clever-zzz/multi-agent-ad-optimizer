@@ -23,6 +23,7 @@ from adoptimizer.core.errors import (
     NotFoundError,
     PermissionDeniedError,
 )
+from adoptimizer.core.metrics import REGISTRY
 from adoptimizer.core.security import Role, TokenClaims
 from adoptimizer.domain.enums import (
     ActionStatus,
@@ -1198,3 +1199,78 @@ class TestExecutionGoesThroughTheToolLayer:
         assert adapter.calls == []
         assert executed.status == ActionStatus.EXECUTED.value
         assert local.daily_budget == 900.0
+
+
+def actions_total(action_type: ActionType, outcome: ActionStatus) -> float:
+    """One series of the action counter, always read as a delta.
+
+    The registry is process-global and other tests in this file execute and
+    fail actions too, so an absolute assertion would depend on test order.
+    """
+    return (
+        REGISTRY.get_sample_value(
+            "optimization_actions_total",
+            {"action_type": action_type.value, "outcome": outcome.value},
+        )
+        or 0.0
+    )
+
+
+class TestExecutionCounters:
+    """``executed`` claims a committed row, ``failed`` claims an attempt.
+
+    Both were incremented wherever the value happened to be on hand, which put
+    ``executed`` on the wrong side of the commit: a service that dies between
+    the platform call and the caller's commit reported an execution that no row
+    in the actions table backs up. ``failed`` stays immediate on purpose - that
+    branch re-raises, the transaction rolls back, and the attempt genuinely
+    happened whether or not the row recording it survives.
+    """
+
+    async def test_the_executed_counter_waits_for_the_commit(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+    ) -> None:
+        action = await approved_budget_action(session, campaign, security)
+        service = build_service(session, adapter=adapter, security=security)
+        before = actions_total(ActionType.ADJUST_BUDGET, ActionStatus.EXECUTED)
+
+        await service.execute(action.id, claims=make_claims())
+
+        assert actions_total(ActionType.ADJUST_BUDGET, ActionStatus.EXECUTED) == before, (
+            "the executed row is still staged"
+        )
+        await session.commit()
+        assert actions_total(ActionType.ADJUST_BUDGET, ActionStatus.EXECUTED) == before + 1
+
+    async def test_the_failed_counter_outlives_the_rollback_of_its_own_row(
+        self,
+        session: Any,
+        campaign: Campaign,
+        adapter: MockAdsClient,
+        security: SecuritySettings,
+    ) -> None:
+        """Deferring this one would lose real failures, so it must not be."""
+        action = await add_action(
+            session,
+            campaign.id,
+            ActionType.ADJUST_BUDGET,
+            after_value="n/a",
+            action_id="act_unusable_counter",
+            run_id=RUN_ID,
+        )
+        service = build_service(session, adapter=adapter, security=security)
+        await service.approve(action.id, claims=make_claims())
+        before = actions_total(ActionType.ADJUST_BUDGET, ActionStatus.FAILED)
+
+        with pytest.raises(ConflictError):
+            await service.execute(action.id, claims=make_claims())
+
+        assert actions_total(ActionType.ADJUST_BUDGET, ActionStatus.FAILED) == before + 1
+        await session.rollback()
+        assert actions_total(ActionType.ADJUST_BUDGET, ActionStatus.FAILED) == before + 1, (
+            "losing the row must not lose the count of the attempt"
+        )

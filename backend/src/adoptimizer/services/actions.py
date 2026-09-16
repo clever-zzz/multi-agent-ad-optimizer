@@ -33,6 +33,7 @@ from ..domain.enums import ActionStatus, ActionType, CampaignStatus, CreativeSta
 from ..domain.statistics import required_sample_size
 from ..infra.ads.base import AdsPlatformClient, ExecutionResult
 from ..infra.db.models import Campaign, Creative, OptimizationAction
+from ..infra.db.session import after_commit
 from ..repositories.audit import ABTestRepository
 from ..repositories.campaigns import CampaignRepository, CreativeRepository
 from ..repositories.runs import ActionRepository
@@ -220,13 +221,25 @@ class ActionService:
             action.executed_at = datetime.now(UTC)
             if result is not None:
                 action.external_reference = result.external_reference
-            ACTIONS_TOTAL.labels(
-                action_type=action.action_type, outcome=ActionStatus.EXECUTED.value
-            ).inc()
+            # Deferred to the commit, unlike the failure below: an ``executed``
+            # count is a claim that the row saying so is in the database, and the
+            # caller still owns that commit.
+            action_type = action.action_type
+            after_commit(
+                self._session,
+                lambda: ACTIONS_TOTAL.labels(
+                    action_type=action_type, outcome=ActionStatus.EXECUTED.value
+                ).inc(),
+            )
             await self._actions.flush()
         except Exception as exc:
             action.status = ActionStatus.FAILED.value
             action.error_message = str(exc)[:2000]
+            # Counted immediately, and deliberately not deferred. This branch
+            # re-raises, so on the single-action route the transaction rolls back
+            # and an after-commit hook would never fire - real failures would go
+            # uncounted. The attempt happened whether or not the row survives, and
+            # ``failed`` is the series that says the platform refused us.
             ACTIONS_TOTAL.labels(
                 action_type=action.action_type, outcome=ActionStatus.FAILED.value
             ).inc()
