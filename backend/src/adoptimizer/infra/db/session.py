@@ -81,6 +81,36 @@ def _drop_after_commit_hooks(session: Session) -> None:
     session.info.pop(AFTER_COMMIT_HOOKS, None)
 
 
+def _statement_timeout_connect_args(driver: str, timeout_ms: int) -> dict[str, Any]:
+    """Spell ``statement_timeout`` the way the driver in the URL understands it.
+
+    There is no portable form. asyncpg takes server-side settings as a nested
+    dict, and a bare ``statement_timeout`` connect arg is accepted and then
+    ignored - which is how this knob sat configured-but-inert. psycopg hands
+    server settings to libpq through ``options``, in milliseconds like the rest
+    of PostgreSQL.
+
+    A driver named here but not handled gets nothing rather than a guess:
+    an argument the DBAPI does not accept makes ``create_async_engine`` raise a
+    TypeError at startup whose message points at the driver and not at this
+    line, which is a worse failure than a knob that does not apply. The warning
+    names what was dropped so the configuration is not silently inert again.
+
+    An empty driver means the URL said ``postgresql://`` and left the choice to
+    SQLAlchemy, which for the async engine resolves to asyncpg.
+    """
+    if driver in ("", "asyncpg"):
+        return {"server_settings": {"statement_timeout": str(timeout_ms)}}
+    if driver == "psycopg":
+        return {"options": "-c statement_timeout=" + str(timeout_ms)}
+    logger.warning(
+        "statement_timeout_unsupported_driver",
+        driver=driver,
+        statement_timeout_ms=timeout_ms,
+    )
+    return {}
+
+
 class Database:
     """Owns the engine and session factory for the process."""
 
@@ -127,14 +157,11 @@ class Database:
                 pool_pre_ping=self._settings.pool_pre_ping,
             )
             if self._settings.statement_timeout_ms is not None:
-                # asyncpg takes server-side settings as a nested dict. A bare
-                # ``statement_timeout`` connect arg is accepted and then ignored,
-                # which is how this knob sat configured-but-inert.
-                kwargs["connect_args"] = {
-                    "server_settings": {
-                        "statement_timeout": str(self._settings.statement_timeout_ms)
-                    }
-                }
+                connect_args = _statement_timeout_connect_args(
+                    self._settings.driver, self._settings.statement_timeout_ms
+                )
+                if connect_args:
+                    kwargs["connect_args"] = connect_args
             return kwargs
 
         # A single shared connection pool keeps SQLite writes serialised and

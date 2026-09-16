@@ -103,6 +103,19 @@ class DatabaseSettings(BaseModel):
         scheme = self.url.split(":", 1)[0]
         return scheme.split("+", 1)[0]
 
+    @property
+    def driver(self) -> str:
+        """The DBAPI driver named in the URL, empty when the URL leaves it to SQLAlchemy.
+
+        ``postgresql+asyncpg://`` -> ``asyncpg``, ``postgresql+psycopg://`` ->
+        ``psycopg``, ``postgresql://`` -> ``""``. ``dialect`` deliberately hides
+        this so probes compare a stable value; a driver-specific connect argument
+        is the one place that has to know, because there is no portable spelling
+        of things like ``statement_timeout``.
+        """
+        scheme = self.url.split(":", 1)[0]
+        return scheme.split("+", 1)[1] if "+" in scheme else ""
+
 
 class RedisSettings(BaseModel):
     """Cache, rate limiting and the background job broker."""

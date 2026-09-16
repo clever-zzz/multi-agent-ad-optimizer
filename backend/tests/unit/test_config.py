@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -168,6 +169,22 @@ class TestEnvironment:
         assert env.is_production_like is expected
 
 
+class RecordingLogger:
+    """Records structured log calls instead of emitting them.
+
+    ``structlog.testing.capture_logs`` is the obvious tool and is unsafe here for
+    the reason ``test_warehouse`` documents: a capture can come back empty under a
+    full-suite run, which turns a "did it warn" assertion into a vacuous pass.
+    Swapping the module attribute has no such coupling.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.warnings.append((event, fields))
+
+
 class TestDatabaseSettings:
     @pytest.mark.parametrize(
         ("url", "dialect", "is_sqlite"),
@@ -180,6 +197,19 @@ class TestDatabaseSettings:
         cfg = DatabaseSettings(url=url)
         assert cfg.dialect == dialect
         assert cfg.is_sqlite is is_sqlite
+
+    @pytest.mark.parametrize(
+        ("url", "driver"),
+        [
+            ("postgresql+asyncpg://u:p@h:5432/db", "asyncpg"),
+            ("postgresql+psycopg://u:p@h:5432/db", "psycopg"),
+            ("postgresql://u:p@h:5432/db", ""),
+            ("sqlite+aiosqlite:///./x.db", "aiosqlite"),
+        ],
+    )
+    def test_driver_detection(self, url: str, driver: str) -> None:
+        """Hidden by ``dialect`` on purpose, so connect args can read it."""
+        assert DatabaseSettings(url=url).driver == driver
 
     def test_statement_timeout_reaches_the_driver(self) -> None:
         """asyncpg wants it nested under ``server_settings``.
@@ -206,6 +236,51 @@ class TestDatabaseSettings:
         cfg = DatabaseSettings(url="sqlite+aiosqlite:///:memory:", statement_timeout_ms=15_000)
         kwargs = Database(cfg)._engine_kwargs()
         assert kwargs["connect_args"] == {"check_same_thread": False}
+
+    def test_psycopg_receives_the_libpq_spelling(self) -> None:
+        """``server_settings`` is asyncpg-only; psycopg hands it to libpq via ``options``.
+
+        Passing the asyncpg spelling to psycopg would make ``create_async_engine``
+        raise a TypeError whose message blames the driver rather than this setting,
+        so the service would not start and nothing would point at the cause.
+        """
+        from adoptimizer.infra.db.session import Database
+
+        cfg = DatabaseSettings(
+            url="postgresql+psycopg://adoptimizer:secret@db:5432/adoptimizer",
+            statement_timeout_ms=15_000,
+        )
+        assert Database(cfg)._engine_kwargs()["connect_args"] == {
+            "options": "-c statement_timeout=15000"
+        }
+
+    def test_an_unknown_driver_drops_the_setting_and_says_so(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unhandled driver loses the knob, and the log says so.
+
+        Dropping a timeout is the recoverable failure here - a startup TypeError
+        is not - so the argument is withheld rather than guessed at, and named in
+        a warning so the setting cannot go silently inert the way the asyncpg
+        spelling did before it was fixed.
+        """
+        from adoptimizer.infra.db import session as session_module
+        from adoptimizer.infra.db.session import Database
+
+        recorder = RecordingLogger()
+        monkeypatch.setattr(session_module, "logger", recorder)
+        cfg = DatabaseSettings(
+            url="postgresql+aiopg://adoptimizer:secret@db:5432/adoptimizer",
+            statement_timeout_ms=15_000,
+        )
+
+        assert "connect_args" not in Database(cfg)._engine_kwargs()
+        assert recorder.warnings == [
+            (
+                "statement_timeout_unsupported_driver",
+                {"driver": "aiopg", "statement_timeout_ms": 15_000},
+            )
+        ]
 
 
 class TestProductionHardening:
