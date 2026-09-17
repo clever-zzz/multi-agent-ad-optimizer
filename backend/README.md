@@ -87,7 +87,7 @@ The container image installs `[postgres,analytics,worker]`.
 ## Tests and quality gates
 
 ```bash
-.venv/Scripts/pytest --cov          # 1302 tests, branch coverage floor 88%
+.venv/Scripts/pytest --cov          # 1302 tests, branch coverage floor 90%
 .venv/Scripts/ruff format --check src tests
 .venv/Scripts/ruff check src tests
 .venv/Scripts/mypy src              # strict

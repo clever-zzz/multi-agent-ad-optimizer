@@ -168,6 +168,7 @@ skip_covered = false
 # thin: a large untested module, or a refactor that quietly drops a test file,
 # should turn CI red rather than slide down over three releases.
 # Raise it whenever the measured total climbs more than ~3 points above it.
-# Headroom is now 3.2 points, so that threshold has been reached and a bump to
-# 90 is due; it stays at 88 here so raising the gate remains a deliberate act.
-fail_under = 88
+# This is that raise: 88 -> 90, taken once the measured total passed 91% and
+# the headroom reached 3.2 points. The 1.2 points left over absorb a small
+# refactor and nothing more.
+fail_under = 90

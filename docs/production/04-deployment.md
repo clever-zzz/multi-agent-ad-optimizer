@@ -355,7 +355,7 @@ nginx 运行时变量：
 
 | 阶段 | 内容 |
 |---|---|
-| backend | `ruff format --check` → `ruff check` → `mypy src`（strict）→ `pytest --cov`（覆盖率 <88% 即失败） |
+| backend | `ruff format --check` → `ruff check` → `mypy src`（strict）→ `pytest --cov`（覆盖率 <90% 即失败） |
 | frontend | `eslint --max-warnings 0` → `tsc` → `vitest run` → `vite build` |
 | images | push 时构建两个镜像（验证 Dockerfile 可用） |
 | manifests | `docker compose config` 与 `kustomize build` 渲染校验 |

@@ -104,7 +104,7 @@ cd backend
 .venv/bin/pytest                                      # macOS/Linux
 
 pytest -q                                             # 简短输出
-pytest --cov                                          # 带覆盖率（<88% 失败）
+pytest --cov                                          # 带覆盖率（<90% 失败）
 pytest tests/unit -q                                  # 只跑单元测试
 pytest tests/integration/test_optimization_flow.py -q # 只跑一个文件
 pytest -k "last_admin" -q                             # 按名字筛
@@ -135,11 +135,11 @@ concurrency = ["thread", "greenlet"]
 omit = ["*/migrations/*"]
 
 [tool.coverage.report]
-fail_under = 88
+fail_under = 90
 show_missing = true
 ```
 
-**分支覆盖**，不是行覆盖。88% 是**棘轮式的下限而非目标**——`core/security.py` 是 **100%**、`domain/` 九个文件全在 89%–100%，三家广告适配器也已经补到 92%–95%（用 `httpx.MockTransport` 直测，不再依赖真实凭据）；真正把总数拉低的是需要外部服务、或难以伪造时序的那几个文件，清单在下面。当前实测 **91.2%**，门禁设在 88%，余量 **3.2 个点**。一个新的大模块如果完全没测试就会把 CI 弄红，而这正是它该做的事。实测值往上爬超过 3 个点时，就把 `fail_under` 跟着提上去，别让覆盖率悄悄回落——工具层那一轮从 78% 提到 80%，采集框架那一轮从 80% 提到 85%，调度这一轮从 85% 提到 88%。三轮新增的模块都是 **100%**：采集的 `services/ingest.py`、`schemas/ingest.py`、`api/v1/ingest.py`、`repositories/ingest.py` 与 `infra/ingest/` 全部 6 个文件，调度的 `schemas/scheduling.py`、`services/scheduling.py`、`repositories/scheduling.py` 3 个文件；这一轮顺带把 `core/logging.py`（live-stdout handler）从 95.2% 补到了 **100%**。身份隔离那一轮没有新增源文件——`Role.INGESTOR` 与它的权限映射都落在既有的 `domain/enums.py` 和 `core/security.py` 里，两个文件仍是 **100%**，所以实测总量没动，门禁也就不用再抬。**数仓写入侧这一轮**加的是 `infra/analytics/`（`AnalyticsSink` + 行模型）、`services/warehouse_sync.py`、`warehouse status` / `warehouse sync` 两个 CLI 命令与 ClickHouse 侧的 `campaign_daily_metrics` 表，同时把三家广告适配器的 HTTP 层直测补齐（`tests/unit/test_ads_adapters.py`，37 用例）：测试数从 1144 走到 **1258**，实测从 89.30% 走到 **91.07%**（此后又补到 **1302** 个、**91.2%**）。新增模块本身是 `services/warehouse_sync.py` 与 `infra/analytics/__init__.py` **100%**、`infra/analytics/models.py` **97.8%**、`infra/analytics/sink.py` **96.8%**、`infra/warehouse.py` **98.4%**。余量因此到 **3.07 个点**，正好越过上面那条“超过约 3 个点就抬门禁”的线——**下一步该把 `fail_under` 提到 90**；仓库此刻仍留在 88，这笔待办记在 `backend/pyproject.toml` 的注释里。
+**分支覆盖**，不是行覆盖。90% 是**棘轮式的下限而非目标**——`core/security.py` 是 **100%**、`domain/` 九个文件全在 89%–100%，三家广告适配器也已经补到 92%–95%（用 `httpx.MockTransport` 直测，不再依赖真实凭据）；真正把总数拉低的是需要外部服务、或难以伪造时序的那几个文件，清单在下面。当前实测 **91.2%**，门禁设在 90%，余量 **1.2 个点**。一个新的大模块如果完全没测试就会把 CI 弄红，而这正是它该做的事。实测值往上爬超过 3 个点时，就把 `fail_under` 跟着提上去，别让覆盖率悄悄回落——工具层那一轮从 78% 提到 80%，采集框架那一轮从 80% 提到 85%，调度这一轮从 85% 提到 88%，数仓写入这一轮从 88% 提到 90%。三轮新增的模块都是 **100%**：采集的 `services/ingest.py`、`schemas/ingest.py`、`api/v1/ingest.py`、`repositories/ingest.py` 与 `infra/ingest/` 全部 6 个文件，调度的 `schemas/scheduling.py`、`services/scheduling.py`、`repositories/scheduling.py` 3 个文件；这一轮顺带把 `core/logging.py`（live-stdout handler）从 95.2% 补到了 **100%**。身份隔离那一轮没有新增源文件——`Role.INGESTOR` 与它的权限映射都落在既有的 `domain/enums.py` 和 `core/security.py` 里，两个文件仍是 **100%**，所以实测总量没动，门禁也就不用再抬。**数仓写入侧这一轮**加的是 `infra/analytics/`（`AnalyticsSink` + 行模型）、`services/warehouse_sync.py`、`warehouse status` / `warehouse sync` 两个 CLI 命令与 ClickHouse 侧的 `campaign_daily_metrics` 表，同时把三家广告适配器的 HTTP 层直测补齐（`tests/unit/test_ads_adapters.py`，37 用例）：测试数从 1144 走到 **1258**，实测从 89.30% 走到 **91.07%**（此后又补到 **1302** 个、**91.2%**）。新增模块本身是 `services/warehouse_sync.py` 与 `infra/analytics/__init__.py` **100%**、`infra/analytics/models.py` **97.8%**、`infra/analytics/sink.py` **96.8%**、`infra/warehouse.py` **98.4%**。余量因此到 **3.07 个点**，正好越过上面那条“超过约 3 个点就抬门禁”的线，`fail_under` 也就跟着从 88 提到了 **90**——这笔待办已经结掉，余量重新压回 **1.2 个点**。
 
 critic 持久化这一轮加了一张表、一个端点、三个可配阈值，实测从 88.54% 走到 88.80%：`agents/critic.py` 与 `core/config.py` 都是 **100%**，但 0.8 个点的余量没到抬门禁的门槛（约 3 点），所以 `fail_under` 留在 88。
 

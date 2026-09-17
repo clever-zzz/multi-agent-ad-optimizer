@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2%2B-green)](https://github.com/langchain-ai/langgraph)
-[![coverage](https://img.shields.io/badge/coverage-%E2%89%A588%25-success)](backend/pyproject.toml)
+[![coverage](https://img.shields.io/badge/coverage-%E2%89%A590%25-success)](backend/pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-purple)](LICENSE)
 
 一个把 **6 个 LLM/规则混合智能体** 编排成闭环的广告投放优化系统：拉取投放数据 → 监控异常 → 分析受众 → 生成创意 → 调整竞价 → 重分配预算 → 冲突复核，产出**可审计的变更提案**，由人审批后才落到广告平台。
@@ -23,7 +23,7 @@
 | 编排 | LangGraph Supervisor 图（6 智能体 + 告警迭代回环 + 提案冲突复核）；缺依赖时自动降级为等价顺序执行器 |
 | 安全治理 | Argon2id 哈希 + 可撤销 JWT 会话 + 5 角色 RBAC + 全量审计 + 人工审批门 + 首次登录强制改密 |
 | 可观测 | `/healthz` `/readyz` `/metrics` + structlog JSON + 全链路 `X-Request-ID` + SSE 运行事件回放 |
-| 测试 | 后端 1302（855 unit + 447 integration，分支覆盖率 91.2%，ratchet 下限 88%）+ 前端 109，CI 强制 |
+| 测试 | 后端 1302（855 unit + 447 integration，分支覆盖率 91.2%，ratchet 下限 90%）+ 前端 109，CI 强制 |
 | 部署 | 多阶段非 root 镜像 + compose（dev/prod）+ kustomize（HPA/PDB/NetworkPolicy/Ingress/采集 CronJob） |
 | CI | 6 个 job：`backend` / `migrations` / `frontend` / `images` / `manifests` / `workflows` |
 
@@ -311,7 +311,7 @@ make check                 # 同上，CI 顺序一致
 | Lint | `ruff check` | 0 error（E/W/F/I/N/UP/B/A/C4/SIM/TCH/RUF/S/PTH/DTZ/ASYNC/RET/ARG） |
 | 类型 | `mypy --strict` / `tsc` | 后端 0 error；前端 `strict` + `noUnusedLocals` |
 | 迁移 | `alembic upgrade head / check / downgrade base` | 可升级、可回滚，且 `alembic check` 无 autogenerate 漂移 |
-| 后端测试 | `pytest --cov` | 1302 个（855 unit + 447 integration）；分支覆盖率 91.2%，ratchet 下限 **88%**，失败即 CI 红 |
+| 后端测试 | `pytest --cov` | 1302 个（855 unit + 447 integration）；分支覆盖率 91.2%，ratchet 下限 **90%**，失败即 CI 红 |
 | 前端测试 | `vitest` | 109 个；`eslint --max-warnings 0` 同时强制 0 warning |
 | 依赖安装 | `npm ci` | lockfile 已提交，CI 与 `setup.ps1` 一律走 `npm ci`，漂移即失败 |
 
