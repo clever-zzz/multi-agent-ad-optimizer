@@ -200,7 +200,8 @@ jobs:
   images:
     name: Container images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # One retry per image below, so the ceiling has to fit two builds.
+    timeout-minutes: 45
     needs: [backend, frontend, migrations]
     # Only build images on the default branch and on tags; PRs just prove the
     # Dockerfiles parse.
@@ -213,7 +214,30 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Docker Hub's anonymous token endpoint drops connections often enough
+      # that a build with nothing wrong with it goes red: run 35186539655 lost
+      # the frontend image to `failed to fetch oauth token: ... connection
+      # reset by peer`, and the identical build passed once it was re-run.
+      # Each image therefore gets one retry, and the gate at the end of the job
+      # turns "failed twice" back into a real failure, so a broken Dockerfile
+      # still cannot slip through. Actions has no way to reference another
+      # step's `with:` block, so each retry repeats its own - keep the pairs
+      # in sync.
       - name: Build backend image
+        id: backend-image
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.backend
+          push: false
+          tags: ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Build backend image (retry)
+        id: backend-image-retry
+        if: steps.backend-image.outcome == 'failure'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -224,6 +248,8 @@ jobs:
           cache-to: type=gha,scope=backend,mode=max
 
       - name: Build frontend image
+        id: frontend-image
+        continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -234,6 +260,31 @@ jobs:
           tags: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,scope=frontend,mode=max
+
+      - name: Build frontend image (retry)
+        id: frontend-image-retry
+        if: steps.frontend-image.outcome == 'failure'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.frontend
+          push: false
+          build-args: |
+            VITE_API_BASE_URL=/api/v1
+          tags: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      # A retry that also fails is a real failure, not a flake.
+      - name: Fail the job if an image failed to build twice
+        if: >-
+          (steps.backend-image.outcome == 'failure' &&
+          steps.backend-image-retry.outcome == 'failure') ||
+          (steps.frontend-image.outcome == 'failure' &&
+          steps.frontend-image-retry.outcome == 'failure')
+        run: |
+          echo "::error::an image failed to build on both attempts - see the build steps above"
+          exit 1
 
   manifests:
     name: Deployment manifests
