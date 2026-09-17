@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from adoptimizer.cli import app
@@ -197,8 +199,20 @@ class TestWarehouseSync:
         then reported an empty warehouse. Exit code 2 is the parser's usage error,
         which is the shape a deploy script can branch on without reading a log.
         """
-        result = runner.invoke(app, ["warehouse", "sync", "--days", days, "--dry-run"])
+        args = ["warehouse", "sync", "--days", days, "--dry-run"]
+        result = runner.invoke(app, args)
 
         assert result.exit_code == 2, result.output
-        assert "--days" in result.output
         assert sink.rows == []
+
+        # Read the parser's verdict, not the printed one. typer hands usage
+        # errors to rich, whose option highlighter splits "--days" into two
+        # separately styled runs whenever colour is on, so the literal
+        # "--days" is absent from the captured text on a colour-capable CI
+        # runner while present on a plain developer console. format_message()
+        # is the string the renderer is handed, before any styling or
+        # wrapping; exit_code is what the runner turns into the status above.
+        with pytest.raises(typer.BadParameter) as excinfo:
+            get_command(app).main(args, prog_name="adoptimizer", standalone_mode=False)
+        assert excinfo.value.exit_code == 2
+        assert "--days" in excinfo.value.format_message()
