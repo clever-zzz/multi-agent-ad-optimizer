@@ -23,7 +23,7 @@
 | 编排 | LangGraph Supervisor 图（6 智能体 + 告警迭代回环 + 提案冲突复核）；缺依赖时自动降级为等价顺序执行器 |
 | 安全治理 | Argon2id 哈希 + 可撤销 JWT 会话 + 5 角色 RBAC + 全量审计 + 人工审批门 + 首次登录强制改密 |
 | 可观测 | `/healthz` `/readyz` `/metrics` + structlog JSON + 全链路 `X-Request-ID` + SSE 运行事件回放 |
-| 测试 | 后端 1273（838 unit + 435 integration，覆盖率 91.07%，ratchet 下限 88%）+ 前端 109，CI 强制 |
+| 测试 | 后端 1302（855 unit + 447 integration，分支覆盖率 91.2%，ratchet 下限 88%）+ 前端 109，CI 强制 |
 | 部署 | 多阶段非 root 镜像 + compose（dev/prod）+ kustomize（HPA/PDB/NetworkPolicy/Ingress/采集 CronJob） |
 | CI | 6 个 job：`backend` / `migrations` / `frontend` / `images` / `manifests` / `workflows` |
 
@@ -137,7 +137,6 @@ scripts/                  Windows PowerShell 助手：setup / dev / check / clea
 .github/workflows/ci.yml  后端 ruff+mypy+pytest-cov，迁移 alembic upgrade/check/downgrade（Postgres 服务），前端 eslint+tsc+vitest+build，镜像构建与部署清单校验
 docs/production/          生产文档：快速开始、架构、API、部署、运维手册、安全、测试、限制、升级路径
 docs/adr/                 架构决策记录
-docs/interview/           面试资料（问答集、深挖追问、速记卡、八股、STAR、简历模板）
 docs/tutorial/            入门教程（环境、Agent 基础、LangGraph、ClickHouse、部署）
 ```
 
@@ -312,7 +311,7 @@ make check                 # 同上，CI 顺序一致
 | Lint | `ruff check` | 0 error（E/W/F/I/N/UP/B/A/C4/SIM/TCH/RUF/S/PTH/DTZ/ASYNC/RET/ARG） |
 | 类型 | `mypy --strict` / `tsc` | 后端 0 error；前端 `strict` + `noUnusedLocals` |
 | 迁移 | `alembic upgrade head / check / downgrade base` | 可升级、可回滚，且 `alembic check` 无 autogenerate 漂移 |
-| 后端测试 | `pytest --cov` | 1273 个（838 unit + 435 integration）；分支覆盖率 91.07%，ratchet 下限 **88%**，失败即 CI 红 |
+| 后端测试 | `pytest --cov` | 1302 个（855 unit + 447 integration）；分支覆盖率 91.2%，ratchet 下限 **88%**，失败即 CI 红 |
 | 前端测试 | `vitest` | 109 个；`eslint --max-warnings 0` 同时强制 0 warning |
 | 依赖安装 | `npm ci` | lockfile 已提交，CI 与 `setup.ps1` 一律走 `npm ci`，漂移即失败 |
 
@@ -328,9 +327,6 @@ CI 还会构建两个容器镜像，并校验 compose 与 kustomize 清单可渲
 - [07 测试与 CI](docs/production/07-testing-and-ci.md) · [08 限制与路线图](docs/production/08-limitations-and-roadmap.md) · [09 优化升级路径](docs/production/09-upgrade-path.md)
 
 **决策记录** — [docs/adr/](docs/adr/README.md)
-
-**面试资料**（已对齐当前落地版本）— [docs/interview/](docs/interview/README.md)
-- [问答集](docs/interview/qa-collection.md) · [深挖追问](docs/interview/hard-questions.md) · [速记卡](docs/interview/project-facts.md) · [八股](docs/interview/baguwen.md) · [STAR 话术](docs/interview/star-method.md) · [简历模板](docs/interview/resume-template.md)
 
 **入门教程**（零基础，已对齐当前落地版本）— [docs/tutorial/](docs/tutorial/README.md)
 - [01 环境搭建](docs/tutorial/01-environment-setup.md) · [02 Agent 基础](docs/tutorial/02-agent-basics.md) · [03 LangGraph 入门](docs/tutorial/03-langgraph-intro.md)

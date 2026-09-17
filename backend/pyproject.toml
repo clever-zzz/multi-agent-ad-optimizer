@@ -9,7 +9,7 @@ description = "Production-grade multi-agent advertising optimization platform"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "Ad Optimizer Team" }]
+authors = [{ name = "clever-zzz" }]
 keywords = ["advertising", "multi-agent", "langgraph", "fastapi", "rtb"]
 
 dependencies = [
@@ -31,9 +31,7 @@ dependencies = [
   "pyjwt>=2.9",
   "argon2-cffi>=23.1",
   "prometheus-client>=0.21",
-  "sse-starlette>=2.1",
   "redis>=5.2",
-  "python-multipart>=0.0.12",
   "langgraph>=0.2",
   "langchain-core>=0.3",
   "typer>=0.15",
@@ -43,13 +41,11 @@ dependencies = [
 postgres = ["asyncpg>=0.30"]
 analytics = ["cvxpy>=1.5"]
 clickhouse = ["clickhouse-connect>=0.7"]
-openai = ["langchain-openai>=0.2"]
 worker = ["arq>=0.26"]
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "pytest-cov>=6.0",
-  "respx>=0.21",
   "ruff>=0.8",
   "mypy>=1.13",
 ]
@@ -125,7 +121,7 @@ exclude = ["migrations/"]
 # symbols as Any: cvxpy ships annotations that omit atoms which exist at runtime
 # (cp.sum, cp.error.SolverError), so following them produces attr-defined noise
 # for correct code.
-module = ["clickhouse_connect.*", "cvxpy", "cvxpy.*", "arq.*", "langchain_openai.*"]
+module = ["clickhouse_connect.*", "cvxpy", "cvxpy.*", "arq.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
@@ -167,11 +163,11 @@ omit = ["*/migrations/*"]
 precision = 1
 show_missing = true
 skip_covered = false
-# A ratchet, not a target. It sits just under the measured total (91.07% as of
-# the warehouse-write-path round, 1258 tests), and the headroom is meant to stay
+# A ratchet, not a target. It sits just under the measured total (91.2% as of
+# the security-hardening round, 1302 tests), and the headroom is meant to stay
 # thin: a large untested module, or a refactor that quietly drops a test file,
 # should turn CI red rather than slide down over three releases.
 # Raise it whenever the measured total climbs more than ~3 points above it.
-# Headroom is now 3.07 points, so that threshold has been reached and a bump to
+# Headroom is now 3.2 points, so that threshold has been reached and a bump to
 # 90 is due; it stays at 88 here so raising the gate remains a deliberate act.
 fail_under = 88

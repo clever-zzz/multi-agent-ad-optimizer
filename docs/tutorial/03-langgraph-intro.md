@@ -119,7 +119,6 @@ dependencies = [
 [project.optional-dependencies]
 analytics    = ["cvxpy>=1.5"]
 clickhouse   = ["clickhouse-connect>=0.7"]
-openai       = ["langchain-openai>=0.2"]
 ```
 
 安装（在 `backend/` 目录下）：

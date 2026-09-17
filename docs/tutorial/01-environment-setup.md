@@ -169,10 +169,11 @@ cp .env.example .env
 | extras | 内容 | 作用 |
 |---|---|---|
 | 核心 | `fastapi` `uvicorn` `pydantic` `pydantic-settings` `sqlalchemy[asyncio]` `typer` `langgraph>=0.2` `langchain-core>=0.3` | Web 框架、配置、ORM、CLI、Agent 编排 |
-| `dev` | `pytest` `ruff` `mypy` `alembic` 等 | 测试、格式化、静态检查、迁移 |
+| `dev` | `pytest` `pytest-asyncio` `pytest-cov` `ruff` `mypy` | 测试、格式化、静态检查（`alembic` 属核心依赖，装核心就有） |
 | `analytics` | `cvxpy>=1.5` | 预算分配的凸优化求解器 |
 | `clickhouse` | `clickhouse-connect>=0.7` | **可选**，只有 `CLICKHOUSE__ENABLED=true` 才需要 |
-| `openai` | `langchain-openai>=0.2` | **可选**，只有接真实 LLM 才需要 |
+
+> 接真实 LLM **不需要额外装 SDK**：`LLM__PROVIDER` 切到 `openai` / `azure_openai` / `openai_compatible` 后，`llm/openai_provider.py` 直接用 `httpx` 调 OpenAI 兼容的 HTTP 接口，核心依赖里已经带了 `httpx`。
 
 安装报错最常见的原因是**网络**或**Python 版本过低**。国内可加镜像：
 

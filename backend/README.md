@@ -79,16 +79,15 @@ framework and no I/O, which is why it is fully unit-testable.
 | `analytics` | cvxpy | You want the convex budget solver instead of the greedy fallback |
 | `postgres` | asyncpg | `DATABASE__URL` points at PostgreSQL |
 | `clickhouse` | clickhouse-connect | `DATA_MODE=warehouse` |
-| `openai` | langchain-openai | `LLM__PROVIDER` is a hosted model |
 | `worker` | arq | Reserved for the queue-based dispatcher (see ADR-0002) |
-| `dev` | pytest, ruff, mypy, respx | Development and CI |
+| `dev` | pytest, ruff, mypy | Development and CI |
 
 The container image installs `[postgres,analytics,worker]`.
 
 ## Tests and quality gates
 
 ```bash
-.venv/Scripts/pytest --cov          # 1072 tests, branch coverage floor 88%
+.venv/Scripts/pytest --cov          # 1302 tests, branch coverage floor 88%
 .venv/Scripts/ruff format --check src tests
 .venv/Scripts/ruff check src tests
 .venv/Scripts/mypy src              # strict

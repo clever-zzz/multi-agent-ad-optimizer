@@ -71,7 +71,7 @@ S5 可与其他阶段并行
 - **锚点**：
   - 被测代码 `backend/src/adoptimizer/infra/ads/{google,meta,tiktok}.py`
   - 参考写法 `backend/tests/unit/test_llm_provider.py:44`（已用 `MockTransport` 的先例）
-  - `respx>=0.21` **已在 dev 依赖里但零使用**——要么用起来，要么从 `pyproject.toml` 移除，不要留着一个不用又暗示"测过了"的依赖
+  - `respx>=0.21` **已在 dev 依赖里但零使用**——要么用起来，要么从 `pyproject.toml` 移除，不要留着一个不用又暗示"测过了"的依赖（**结论：已移除**，测试统一走 `httpx.MockTransport`）
 - **出口条件**：三个适配器每个公开方法至少一条 happy path + 一条错误分支断言；`pytest --cov` 不低于 88% 门槛。
 - **风险**：低。纯新增测试，不动生产代码。
 

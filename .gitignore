@@ -61,3 +61,10 @@ docker-data/
 # Logs
 *.log
 logs/
+
+# Local-only docs (backed up outside the repo, never published)
+docs/interview/
+
+# Agent scratch logs
+.pytest_out.txt
+.cov_out.txt
